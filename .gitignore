@@ -1,0 +1,61 @@
+# ── Game material: never in this repository. Players supply their own disc. ──
+game_files/
+Game Data/
+*.iso
+*.xiso
+*.xbe
+*.xbx
+*.ssx
+*.big
+*.loc
+*.mpc
+hdd/
+TDATA/
+UDATA/
+# Xbox BIOS / boot ROM / EEPROM / HDD images used by emulators
+*.bin
+*.qcow2
+*.toml
+
+# Translated game code: generated from your own XBE (docs/building.md)
+port/src/recomp/gen/
+port/src/recomp/gen.*/
+port/src/recomp/recomp_funcs.h
+xboxrecomp/src/game/
+xboxrecomp/tools/disasm/output/
+xboxrecomp/tools/func_id/output/
+xboxrecomp/tools/recomp/output/
+xboxrecomp/tools/abi_analysis/output/
+xboxrecomp/tools/split/output/
+xboxrecomp_output/
+
+# Builds, packages, runs, logs, captures
+build/
+dist/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+*.ilk
+*.exp
+*.log
+*.bmp
+xbox_kernel.log
+# The game's F12 screenshots land beside the exe. Anchored: on Windows git
+# ignores case, and a bare "Screenshots/" also swallowed docs/screenshots/.
+/Screenshots/
+/port/build/Screenshots/
+# Settings (SSX Tricky.ini) and other local configuration
+*.ini
+
+# Python caches and editor files
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

@@ -1,0 +1,24 @@
+name: Idea
+description: Suggest an improvement or a new option.
+labels: [idea]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        OpenTricky's first goal is to look and play like the Xbox. Extras are welcome, but they must be optional and stay off by default.
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: What should change, and why would it make the game better?
+    validations:
+      required: true
+  - type: textarea
+    id: xbox
+    attributes:
+      label: How does the Xbox do it?
+      description: If it is about how the game looks or plays, how does the original console behave? A video link helps.
+  - type: input
+    id: version
+    attributes:
+      label: Version you are using

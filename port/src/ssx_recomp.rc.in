@@ -1,0 +1,12 @@
+/* Resources for the game executable: the application icon, used
+ * by Explorer, the launcher and the game window, and the manifest that turns
+ * on themed controls and per-monitor DPI awareness.
+ *
+ * CMake makes ssx_recomp.rc from this file in the build directory.
+ * The icon is generated there too, from the player's own game files
+ * (tools/make_icon.py); without them it is ssx_recomp.ico, an original icon
+ * drawn for this fork. No picture of the game is ever stored in the repository. */
+#include <windows.h>
+
+1 ICON "@SSX_APP_ICON@"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "@SSX_MANIFEST@"

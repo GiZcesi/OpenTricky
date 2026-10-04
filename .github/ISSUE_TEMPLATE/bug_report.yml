@@ -1,0 +1,62 @@
+name: Bug report
+description: Something crashes, looks wrong, sounds wrong or doesn't work.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing OpenTricky! Please check [Known issues](https://github.com/GiZcesi/OpenTricky#known-issues) first.
+        **Never attach your disc image, game files or a link to them.**
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release name (for example 0.1.0-unstable), or the build date shown in SETTINGS → ADVANCED → About.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. Say where in the game (menu, track, mode).
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      placeholder: |
+        1. Single Event → Race → Garibaldi
+        2. Fall at the first jump
+        3. ...
+  - type: dropdown
+    id: often
+    attributes:
+      label: How often?
+      options: [Every time, Often, Sometimes, Once]
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings
+      description: Resolution, screen shape, field of view, frame rate limit, smooth edges, soft shadows, draw distance, "Look like the Xbox". You can paste your `SSX Tricky.ini`; remove the disc image path if it shows your name.
+    validations:
+      required: true
+  - type: input
+    id: pc
+    attributes:
+      label: PC
+      placeholder: Windows 11, RTX 4070 Super, i7-12700, 1440p 165 Hz monitor, Xbox controller
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: In the launcher, turn on SETTINGS → ADVANCED → Log file, make the problem happen again, then drag `SSX Tricky.log` here.
+  - type: textarea
+    id: shots
+    attributes:
+      label: Screenshots
+      description: Press F12 in the game; the pictures are in the Screenshots folder next to the game.
