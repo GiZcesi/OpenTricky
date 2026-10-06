@@ -14,6 +14,7 @@
   <img alt="Graphics: Direct3D 11" src="https://img.shields.io/badge/graphics-Direct3D%2011-blue">
   <a href="LICENSE"><img alt="License: GPL-3.0-only" src="https://img.shields.io/badge/license-GPL--3.0--only-green"></a>
   <a href="https://discord.gg/r38sThsqnj"><img alt="Discord" src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white"></a>
+  <a href="https://ko-fi.com/giz_music/"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-buy%20me%20a%20coffee-FF5E5B?logo=ko-fi&logoColor=white"></a>
 </p>
 
 <p align="center"><b>Join the <a href="https://discord.gg/r38sThsqnj">OpenTricky Discord</a></b> for help, screenshots and news about the next builds.</p>
