@@ -46,7 +46,7 @@
             </div>
         </div>
 
-        <!-- Without one (N1 / N2 / N3): the disc panel. -->
+        <!-- Without one: the disc panel. -->
         <div class="news discp" data-if="!have_disc" data-class-bad="disc_state == 'bad'">
             <div class="k">{{disc_kicker}}</div>
             <h3>{{disc_head}}</h3>

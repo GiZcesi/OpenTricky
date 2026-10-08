@@ -31,8 +31,8 @@
                                  * middle of the "select / previous / options" text: the Duke's
                                  * glyph body there is about 1.5 texels higher, its shadow below */
 
-/* The PS2 game's own buttons (MODE_PS2): built in unless CMake has
- * -DSSX_PS2_BUTTONS=OFF, which leaves their pictures out; "ps2" is then auto
+/* The PS2 button style (MODE_PS2): built in unless CMake has
+ * -DSSX_PS2_BUTTONS=OFF, which leaves its pictures out; "ps2" is then auto
  * (and the launcher only announces that choice). */
 #ifdef SSX_PS2_BUTTONS_READY
 #define PS2_ORIGINAL_READY 1
@@ -144,7 +144,7 @@ static int g_icons_loaded;
  * (hudtrick hud1): the pad at the atlas' corner, the markers in the free rows
  * under it (the Duke's place, texels 0-179). Pictures already 4x, pasted
  * texel for texel, never resampled:
- *   - MODE_PS2: the PS2 pictures (resources "PS2_LESSON_*",
+ *   - MODE_PS2: the PS2-style pictures (resources "PS2_LESSON_*",
  *     port/assets/btnicons/ps2/); the pad is the PS2 atlas' own box
  *     (0,0) 256 x 126, the origin of the PS2 lesson's marker positions;
  *   - MODE_PS and MODE_MODERN: a DualShock 4 / Xbox One drawing in its own
@@ -237,7 +237,7 @@ int btnicons_on(void)
             else if (!_stricmp(e, "debug")) g_mode = MODE_DEBUG;
             else g_mode = MODE_MODERN;      /* "modern", "auto", or a value no longer known */
             if (!_stricmp(e, "ps2") && g_mode != MODE_PS2)
-                fprintf(stderr, "[BTNICONS] ps2: the PS2 game's buttons are not in yet, auto\n");
+                fprintf(stderr, "[BTNICONS] ps2: the PS2 button style is not in this build, auto\n");
         }
         e = getenv("XBOX_BUTTON_ICONS_LOG");
         g_log = e && e[0] == '1';

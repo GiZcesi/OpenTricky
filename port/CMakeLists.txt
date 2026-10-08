@@ -25,8 +25,8 @@ add_compile_definitions(
     NOMINMAX
 )
 
-# The PS2 game's own buttons (XBOX_BUTTON_ICONS=ps2, assets/btnicons/ps2/):
-# built in by default; OFF leaves their pictures out of the executable (a
+# The PS2 button style (XBOX_BUTTON_ICONS=ps2, assets/btnicons/ps2/):
+# built in by default; OFF leaves its pictures out of the executable (a
 # saved "ps2" then reads as auto).
 option(SSX_PS2_BUTTONS "Build the PS2 original button style (its pictures in the executable)" ON)
 if(SSX_PS2_BUTTONS)
@@ -53,7 +53,7 @@ endif()
 # Made at build time from the player's own game files, in the build directory
 # only (tools/make_icon.py: the Garibaldi track badge by default);
 # src/ssx_recomp.ico, an original icon drawn for this fork, when the game files
-# or Python are missing. Nothing of the game goes into the repository.
+# or Python are missing.
 # (Renamed from SSX_ICON_PICK so a build directory configured before keeps no stale choice.)
 set(SSX_APP_ICON_PICK "garibaldi" CACHE STRING "Icon from the game files: garibaldi, flocon, medal or logo")
 set(SSX_APP_ICON "${CMAKE_CURRENT_BINARY_DIR}/ssx_app.ico")

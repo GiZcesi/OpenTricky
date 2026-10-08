@@ -69,8 +69,8 @@ uint32_t g_riderlist_ai_n, g_riderlist_pl_n;
 /* Called by the generated code (fix_riderlist.py) when, in sub_0002F800,
  * the rider lists disagree with the race's counts (kind 0) or a guard stops the
  * walk (kind 1 = AI list short, 2 = Player list short). One stderr line per kind
- * and per race (a new race = another race object or its tick going back), so the
- * "stable" campaign sees it in run.log without a line every 6 ticks. Game thread only. */
+ * and per race (a new race = another race object or its tick going back), so a
+ * long test run sees it in the log without a line every 6 ticks. Game thread only. */
 void fork_riderlist_note(uint32_t kind, uint32_t race, uint32_t tick, uint32_t riders,
                          uint32_t ai_exp, uint32_t pl_exp, uint32_t at)
 {

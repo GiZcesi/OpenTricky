@@ -1226,7 +1226,7 @@ void d3d8_HostToast(const wchar_t *text)
  * left the window unclosable -- WM_CLOSE used to set a flag nothing read. */
 void d3d8_HostExit(void)
 {
-    d3d8_sync_report();                 /* bilan [PACING] */
+    d3d8_sync_report();                 /* [PACING] summary */
     fflush(stdout);
     fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 0);

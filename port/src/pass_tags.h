@@ -142,12 +142,12 @@ typedef struct pass_tag_event {
     uint32_t type;              /* enum pass_tag_type */
     uint32_t view;              /* 0..5, PASS_TAG_VIEW_NONE otherwise */
     uint32_t group;             /* pass group 0..0x17 */
-    uint32_t ortho;             /* vue ortho (FOV == 0) */
+    uint32_t ortho;             /* ortho view (FOV == 0) */
     uint32_t handler_va;        /* GROUP: handler [[rec]] of the 1st record */
     uint32_t extra;             /* FRAME_BEGIN: reflection; GROUP_END: number of records;
                                  * FRAME_END: number of records kept in the frame;
                                  * ORTHO: flag (7th argument) */
-    float    ortho_args[6];     /* ORTHO : gauche, haut, largeur, hauteur, near, far */
+    float    ortho_args[6];     /* ORTHO: left, top, width, height, near, far */
     uint32_t thread;            /* Windows id of the owner thread */
 } pass_tag_event;
 

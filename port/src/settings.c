@@ -172,7 +172,7 @@ static const SettingDef k_reg[SETTINGS_COUNT] = {
 
     /* ── GRAPHICS ── */
     [S_HD_TEXTURES] = { "Graphics", "HdTextures", T_GRAPHICS, "TEXTURES", "HD textures",
-        "Uses the HD textures of your HD pack folder (made by the community, not included).",
+        "Uses the HD textures of your HD pack folder.",
         BOOL_("0"), "XBOX_HD_TEXTURES", SETTING_PC, P("0", "0", "0") },
     [S_HD_PACK_FOLDER] = { "Graphics", "HdPackFolder", T_GRAPHICS, "TEXTURES", "HD pack folder",
         "The folder of your HD texture pack; a relative path is relative to the game's folder.",

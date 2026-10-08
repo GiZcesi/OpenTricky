@@ -70,6 +70,7 @@ A new launcher, the original PS2 controls, wide screens handled from the HUD to 
 - At the start of a race, the picture can briefly look doubled or shifted with some settings. We're looking into it: tell us your settings.
 - During the opening logo video, the first press of Start (Enter on the keyboard) is sometimes ignored: press it again. Very rarely it ignores more presses: let the video play to the end, or restart the game.
 - **Performance**: frame rate drops when riders collide; Snowdream runs slower than other tracks.
+- **Above 60 FPS, the controls answer one game step later** (about 17 ms). Set *Frame rate limit* to *60* for the Xbox's exact timing.
 - Only Xbox-style (XInput) controllers are supported natively, so *Button style: Auto* shows Xbox buttons.
 - With the PlayStation button styles, the replay help still calls the Select button *BACK*.
 - **Steam Deck and Linux** (Proton): not tested yet, the *Steam Deck* preset included.

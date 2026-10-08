@@ -107,7 +107,7 @@ static void grab_mask_text(int slot, char *out, size_t n)
 
 enum { SEC_NONE, SEC_BOOL, SEC_GRAB, SEC_ANALOG };      /* IS_BOOL, IS_BOOLGRAB, IS_ANALOG */
 
-/* The PS2 game's two button maps, written here by hand: every line that
+/* The two PS2 button maps, written here by hand: every line that
  * differs from the Xbox files apart from the grab slots (k_slot_ps2) and the
  * renamed buttons (Cross / Select are the Xbox A / Back bits). Each rule
  * gives the Xbox text it expects and the PS2 function in the Xbox tokens
@@ -323,19 +323,19 @@ static void glyph_table(int ps2)
             ps2 ? "PS2 (L1 R1 L2 R2)" : "original");
 }
 
-/* ── The PS2 game's own buttons (XBOX_BUTTON_ICONS=ps2) ─────────────
+/* ── The PS2 button style (XBOX_BUTTON_ICONS=ps2) ───────────────────
  *
  * nv2a_btnicons.c fills the UV rectangle of each button shape of the trick
- * and race HUDs (97-113, measured in game) with the PS2 game's picture,
+ * and race HUDs (97-113, measured in game) with the PS2-style picture,
  * stretched; hook_shapes_000EF960 (below), right after the game has filled
  * the HUD's shapes, gives those shapes the size that shows the picture at the
- * PS2 game's size (btnicons_ps2_shape), which undoes the stretch. A shape is
+ * PS2 size (btnicons_ps2_shape), which undoes the stretch. A shape is
  * drawn at its size wherever it is used (lessons, trick text, UBER panel,
  * replay help, dialogs, race HUD), so this one change is global. Only a
  * shape at the game's own size and UVs is changed. The trick text's glyph
- * layout takes the PS2 game's (dx, dy, advance). */
+ * layout takes the PS2 values (dx, dy, advance). */
 /* 0x1AA880 rows in order ({char, scale, dx, dy, advance, shape}), each with
- * the PS2 game's dx, dy, advance for the same button. */
+ * the PS2 dx, dy, advance for the same button. */
 static const struct { uint32_t ch, shape; int32_t dx, dy, adv; } k_ps2_layout[GLYPHS] = {
     { '@', 105, 4, -8, 32 }, { '!', 106, 4, -8, 32 },          /* L2 R2 */
     { '%',  99, 3,  0, 26 }, { '^', 100, 3,  0, 26 },          /* Square Triangle */
@@ -395,7 +395,7 @@ static void shapes_ps2(uint32_t mgr)
  * draws shape 96 (the pad) at its shape size, then a gold marker on the
  * button the demo presses: the title's table 0x1AA6C8, 12 rows {float dx,
  * float dy, u32 shape, u32 button mask}, positions from the pad's corner.
- * With the style's own pad (nv2a_btnicons.c: the PS2 game's, or a
+ * With the style's own pad (nv2a_btnicons.c: the PS2 style's, or a
  * DualShock 4 or Xbox One drawing), the shapes show its pictures and the rows take its
  * positions for the same button (btnicons_lesson_mark; L1 = White, R1 =
  * Black, L2 = LT, R2 = RT, as the PS2 layout puts them; the PS2 Select /
@@ -514,7 +514,7 @@ void sub_000EF960(void);    /* HUD shapes: size and UVs of shapes 0-139 (thiscal
  *   - modern and PlayStation: the bumpers (shapes 103 White = LB / L1, 104
  *     Black = RB / R1) wide and low, the size that shows the squeezed region
  *     of their glyph (nv2a_btnicons.h, BTNICONS_BUMPER_*) unstretched;
- *   - ps2: shapes 97-113 at the PS2 game's sizes, and its glyph layout
+ *   - ps2: shapes 97-113 at the PS2 sizes, and its glyph layout
  *     (shapes_ps2 above);
  *   - ps2, playstation and modern: the trick tutorial's pad and markers
  *     (lesson_pad above). */

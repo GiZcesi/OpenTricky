@@ -286,7 +286,7 @@ static void pages_report(void)
     fprintf(stderr, " (%u ranges)\n", shown);
 }
 
-/* ── statistiques ─────────────────────────────────────────────── */
+/* ── statistics ───────────────────────────────────────────────── */
 
 static void report(int force)
 {
@@ -1058,7 +1058,7 @@ void fps_cap_init(void)
     e = getenv("XBOX_FPS_CAP_DUP"); s.dup = e ? atoi(e) : 0;     /* test, see hook_AB610 */
     e = getenv("XBOX_FPS_INTERP_DUMP"); s_dump_at = e ? atoi(e) : 0;
     e = getenv("XBOX_FPS_INTERP"); I.on = e && *e ? e[0] == '1' : 1;     /* default 1 when cap != 60 */
-    e = getenv("XBOX_FPS_INTERP_SYNTH"); I.synth = e && e[0] == '1';   /* test DUP : alpha = k / (DUP + 1) */
+    e = getenv("XBOX_FPS_INTERP_SYNTH"); I.synth = e && e[0] == '1';   /* DUP test: alpha = k / (DUP + 1) */
     e = getenv("XBOX_FPS_INTERP_LOG");
     if (e && *e) { I.log = atoi(e); e = strchr(e, '@'); I.log_from = e ? (uint32_t)atoi(e + 1) : 0; }
     e = getenv("XBOX_FPS_CAP_STALL");

@@ -26,8 +26,8 @@ extern "C" {
 
 enum {
     GP_G0, GP_G1, GP_G2, GP_G3, GP_G4, GP_G5, GP_G6,    /* 3D draws per group */
-    GP_PERSP7,          /* draws groupes >= 7 en perspective (brume, lens flare) */
-    GP_HUD,             /* draws groupes >= 7 ortho (HUD / menus) */
+    GP_PERSP7,          /* draws of groups >= 7 in perspective (fog, lens flare) */
+    GP_HUD,             /* draws of groups >= 7, ortho (HUD / menus) */
     GP_OTHER,           /* draws without a phase (no markers, videos, 2nd thread) */
     GP_CLEAR,           /* game clears */
     GP_POST_SPLIT,      /* FRAME_END: MSAA resolve + post chain + write back */
@@ -35,7 +35,7 @@ enum {
     GP_PREVFRAME,       /* copy of the previous frame (chrome "Master") */
     GP_RESOLVE,         /* MSAA resolve at present */
     GP_BLIT,            /* copy / blit (+ DAC gamma) to the swap chain */
-    GP_SOFTSHADOW,      /* ombres douces: masque stencil, flou, application */
+    GP_SOFTSHADOW,      /* soft shadows: stencil mask, blur, apply */
     GP_N
 };
 

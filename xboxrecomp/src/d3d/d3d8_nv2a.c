@@ -133,7 +133,7 @@ static double nv_now_ms(void)
  * draw. Only the first insertion of a key is kept, as the linear search
  * returns the first entry: same result. Power-of-2 capacity, at least twice
  * the indexed table (never full). */
-typedef struct { uint64_t key; int pos1; } KIdx;            /* pos1 = position + 1, 0 = libre */
+typedef struct { uint64_t key; int pos1; } KIdx;            /* pos1 = position + 1, 0 = free */
 static int kidx_find(const KIdx *t, unsigned cap, uint64_t key)
 {
     unsigned h = (unsigned)(key ^ (key >> 29) ^ (key >> 47)) & (cap - 1);
@@ -330,7 +330,7 @@ static int cbr_ready(ID3D11Device *dev, ID3D11DeviceContext *ctx)
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         if (FAILED(ID3D11Device_CreateBuffer(dev, &bd, NULL, &g_cbr))) return 0;
-        g_cbr_off = CBR_SIZE;           /* premier Map = DISCARD */
+        g_cbr_off = CBR_SIZE;           /* first Map = DISCARD */
         ok = 1;
         fprintf(stderr, "[PUMP] constant ring active (%u KB)\n", CBR_SIZE / 1024u);
     }
@@ -831,7 +831,7 @@ static void pc_compare(ID3D11DeviceContext *ctx, float sw, float sh)
     g_pcs.draws++;
     if (nv != g_pc_n) {
         if (g_pcs.count_bad++ < 4)
-            fprintf(stderr, "[PTSCHECK] draw %llu : %u sommets GPU, %u CPU\n", g_pcs.draws, nv, g_pc_n);
+            fprintf(stderr, "[PTSCHECK] draw %llu: %u vertices GPU, %u CPU\n", g_pcs.draws, nv, g_pc_n);
         if (nv > g_pc_n) nv = g_pc_n;
     }
     ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)g_so_stage, (ID3D11Resource *)g_so_buf);
@@ -936,7 +936,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     int vi, a, g, ngrp = 0, nel = 0;
     uint16_t done = 0;
     struct { float screen[4], fog[4], flags[4], vattr[16][4], point[4], hud[4]; } params;
-    double pt = 0.0;                    /* sous-zones XBOX_PERF */
+    double pt = 0.0;                    /* XBOX_PERF sub-zones */
     int use_cbr, vsc_changed = 0;       /* constant ring */
     static int g_cbr_was;
     int points = d->topology == D3DPT_POINTLIST;

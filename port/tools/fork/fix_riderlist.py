@@ -40,7 +40,7 @@ port/src/main.c), this pass:
      Player slot does not hold a valid rider index (>= [race+0x88]), and reports
      it (kind 1 = AI side, 2 = Player side).
 fork_riderlist_note (main.c) writes one "[RIDERLIST] ..." line on stderr per
-kind and per race, so the "stable" campaign sees it in run.log.
+kind and per race, so a long test run sees it in the log.
 When the counts agree (every run measured) nothing changes: the slots filled
 are all overwritten before they are read, no report is made.
 0 = the original code (no fill, no count, no guard, no report).

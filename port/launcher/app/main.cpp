@@ -1,5 +1,5 @@
 /*
- * main.cpp -- OpenTricky.exe, the launcher (step L3).
+ * main.cpp -- OpenTricky.exe, the launcher.
  *
  * RmlUi on SDL3 + OpenGL 3. Three documents written in RML/RCSS (ui/): the
  * home page, the settings page (built from the settings registry,
@@ -811,7 +811,7 @@ void update_help(int id)
     g.help_pending = (d->flags & SETTING_PENDING) != 0;
     g.help_env = d->env ? d->env : "";
     g.help_extra = "";
-    if (id == S_HD_TEXTURES || id == S_HD_PACK_FOLDER) g.help_extra = "HD pack by Bl4ckH4nd (not included).";
+    if (id == S_HD_TEXTURES || id == S_HD_PACK_FOLDER) g.help_extra = "HD textures by Bl4ckH4nd (not included).";
     if (id == S_CHECK_UPDATES || id == S_UPDATE_CHANNEL)
         g.help_extra = "The launcher contacts GitHub (api.github.com) at most once a day for the list of OpenTricky releases. "
                        "Nothing about you or your game is sent, and nothing is installed without your click.";
@@ -1720,7 +1720,7 @@ bool build_model()
     c.BindEventCallback("go", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &a) {
         if (a.empty()) return;
         Rml::String p = a[0].Get<Rml::String>();
-        if (p == "updates") {             /* the update icon: ADVANCED > Updates (the updater itself is step L4) */
+        if (p == "updates") {             /* the update icon: ADVANCED > Updates */
             g.tab = SETTINGS_TAB_ADVANCED;
             rebuild_rows();
             g.model.DirtyVariable("tab");

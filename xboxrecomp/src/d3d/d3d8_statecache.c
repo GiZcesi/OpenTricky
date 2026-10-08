@@ -29,7 +29,7 @@ static struct {
     ID3D11Buffer *pcb[4]; UINT pfirst[4], pnum[4]; unsigned pcb_ok;
 } S;
 
-int d3d8_pump_state_on(void);           /* d3d8_nv2a.c (bascule + alternance) */
+int d3d8_pump_state_on(void);           /* d3d8_nv2a.c (switch + alternation) */
 
 static int mine(ID3D11DeviceContext *c)
 {

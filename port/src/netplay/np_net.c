@@ -78,7 +78,7 @@ static struct {
     int      have_peer, connected, bye;
     double   last_rx_ms;
     /* host: published data, served on request */
-    nn_setup setup;   int setup_load;     /* -1 = rien */
+    nn_setup setup;   int setup_load;     /* -1 = none */
     nn_seed  seed;    int seed_seq;
     nn_go    go;      int go_load;
     int      guest_ready_load;            /* REQ_GO received for this load */
@@ -99,7 +99,7 @@ static struct {
 
 /* ── Race (game thread only) ── */
 static struct {
-    uint32_t race;              /* objet course courant */
+    uint32_t race;              /* current race object */
     int      load;              /* load number (1, 2, ...) */
     int      seed_seq;          /* calls of 0x2E040 */
     int      solo;              /* no peer for this load */
@@ -331,7 +331,7 @@ static int nn_wait(int (*cond)(void), void (*resend)(void), const char *what)
     }
 }
 
-/* ── Chargement : roster et [0x1DEC9C] (0xAC9B0, avant l'original) ── */
+/* ── Loading: roster and [0x1DEC9C] (0xAC9B0, before the original) ── */
 static int c_setup(void)
 {
     int r;
@@ -403,10 +403,10 @@ static void nn_load_guest(void)
     }
     for (i = 0; i < s.nroster * NPCL_ROSTER_STRIDE; i++) MEM8(NN_ROSTER_VA + i) = s.roster[i];
     MEM8(NN_ROSTER_VA + s.human * NPCL_ROSTER_STRIDE + 0x7Du) = 0xFFu;   /* the host = driven AI */
-    MEM8(NN_ROSTER_VA + s.slot * NPCL_ROSTER_STRIDE + 0x7Du) = 0x00u;    /* moi = port 0 */
+    MEM8(NN_ROSTER_VA + s.slot * NPCL_ROSTER_STRIDE + 0x7Du) = 0x00u;    /* me = port 0 */
     MEM32(NN_ROSTER_N) = s.nroster;
     MEM32(0x001DEC9Cu) = s.seed9c;
-    s_r.human = s.slot;          /* mon index */
+    s_r.human = s.slot;          /* my index */
     s_r.slot = s.human;          /* the host's copy */
     fprintf(stderr, "[NET] load %d (guest): host roster copied (%u entries), me=%u (port 0), "
             "host=%u (driven AI), [0x1DEC9C]=0x%08X, track=%u\n", s_r.load, s.nroster, s_r.human, s_r.slot,
@@ -429,7 +429,7 @@ static void hook_AC9B0(void)
     sub_000AC9B0();
 }
 
-/* ── 0x2E040 : [0x1DEC98] (avant l'original) ── */
+/* ── 0x2E040: [0x1DEC98] (before the original) ── */
 static int c_seed(void)
 {
     int r;
@@ -684,7 +684,7 @@ static void nn_log(int kind, uint32_t rider, uint32_t race, int32_t k, uint8_t f
     if (k >= 0 && k % 300 == 0) fflush(s_cfg.log);
 }
 
-/* Pair perdu ? (verrou non tenu) */
+/* Peer lost? (lock not held) */
 static int nn_peer_lost(void)
 {
     double last; int bye;

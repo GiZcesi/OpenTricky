@@ -32,7 +32,7 @@ static double g_z[PZ_N + 1], g_k[PZ_N + 1], g_last_end;
 static double g_kord[KORD];             /* ms per kernel ordinal, current window */
 static unsigned g_kcnt[KORD];
 
-/* pump : image en cours */
+/* pump: frame in progress */
 static double p_z[PZ_N], p_last;
 static unsigned p_c[PC_N], p_base[3];
 

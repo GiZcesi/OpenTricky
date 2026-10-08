@@ -2,8 +2,8 @@
  * ot_disc.h -- the launcher's pictures, lettering and sounds, read from the
  * player's own disc image at run time.
  *
- * Nothing of the game is stored in the launcher: every picture, glyph and
- * sound below is read from the .iso and decoded here, each time.
+ * Every picture, glyph and sound below is read from the .iso and decoded
+ * here, each time.
  *   data/textures/xboxload.big  tracks' loading cards (c0fb archive, RefPack, SHPX)
  *   data/fonts/title.ffn        the title font (FNTF, 4-bit atlas)
  *   data/audio/audio.big        the menus' sounds (BIGF > zbxfe.bnk, EA-XA R2)

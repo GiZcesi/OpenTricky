@@ -50,13 +50,13 @@ static struct {
     uint32_t frame;             /* current frame number (0 = before the 1st H1) */
     uint32_t event;             /* index of the event in the frame */
     int      in_frame;
-    /* triplet H2 courant */
+    /* current H2 triplet */
     int      grp_open;
     uint32_t grp_key;
     uint32_t grp_nrec;
     uint32_t frame_nrec;
     uint32_t hud_tag, hud_tag_y;  /* last HUD tags emitted in the group */
-    /* derniers arguments H3 */
+    /* last H3 arguments */
     int      ortho_valid;
     uint32_t ortho_key[7];
 } s_st;

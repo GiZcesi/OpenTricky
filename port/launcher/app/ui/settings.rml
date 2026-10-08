@@ -55,7 +55,7 @@
         </div>
 
         <div class="help" data-class-styles="tab == 3">
-            <!-- CONTROLS: the four button styles, drawn with the game's own pictures. -->
+            <!-- CONTROLS: the four button styles, each drawn with its own pictures. -->
             <div class="styles" data-if="tab == 3">
                 <div class="st" data-class-on="bstyle == 0" data-event-click="style_pick(0)"><span class="sn">AUTO</span>
                     <span class="si"><img src="icons/jc/T_X_A_Color.png"/><img src="icons/jc/T_X_B_Color.png"/><img src="icons/jc/T_X_X_Color.png"/><img src="icons/jc/T_X_Y_Color.png"/></span></div>

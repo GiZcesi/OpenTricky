@@ -20,7 +20,7 @@ extern void sub_0002E040(void);     /* Race_ResetPlayerRoster */
 
 int g_np_ghost_on = 0;
 
-static void nc_stats(const char *why);   /* plus bas */
+static void nc_stats(const char *why);   /* below */
 
 #define NG_UNSET      0xFFFFFFFFu
 #define NG_NSTATES    16u
@@ -44,7 +44,7 @@ static struct {
     int      human_replay;
     int      have_rng;
     uint32_t rng_a[6], rng_b[6];        /* RNG states at the start of state 3 */
-    int      force;                     /* forcer roster / graines / RNG */
+    int      force;                     /* force roster / seeds / RNG */
 } s_g;
 
 /* State during the race */
@@ -368,7 +368,7 @@ static int ng_load(const char *path)
     for (i = 0; i < NG_NSTATES; i++) s_g.r_start[i] = NG_UNSET;
     s_g.player_idx = NG_UNSET;
     s_g.fmax = 0;
-    /* 1re passe : bornes */
+    /* first pass: bounds */
     fseek(f, (long)hsize, SEEK_SET);
     while (fread(&rec, rsize, 1, f) == 1) {
         if (rec.race_state < NG_NSTATES && s_g.r_start[rec.race_state] == NG_UNSET)

@@ -401,7 +401,7 @@ void hook_tt_12A610(void)
         char ph = GetCurrentThreadId() != s.tid ? 'o' : (s.in_tick ? 't' : 'h');
         for (j = 0; j < c && k < 3; j++) {
             uint32_t va = rev_va((uintptr_t)fr[j]);
-            if (va >= 0x0012A4B0u && va < 0x0012A700u) continue;   /* enveloppes RNG */
+            if (va >= 0x0012A4B0u && va < 0x0012A700u) continue;   /* RNG wrappers */
             if (k && calls[k - 1] == va) continue;
             calls[k++] = va;
         }

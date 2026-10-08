@@ -124,7 +124,7 @@ typedef struct {
     uint8_t  idx;           /* index in race+0xC4[], 0xFF if unknown */
     uint8_t  kind;          /* NPCL_KIND_* (by hook) */
     uint8_t  flags;         /* NPCL_F_* */
-    uint8_t  race_state;    /* race+0x1C (octet bas) */
+    uint8_t  race_state;    /* race+0x1C (low byte) */
     uint32_t cmd;           /* command word after the original */
     float    pos[3];        /* rider+0x170 */
     float    vel[3];        /* rider+0x180 */

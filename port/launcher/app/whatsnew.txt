@@ -13,7 +13,7 @@ better: Smoother at high frame rates
 This file is the "What's new" block of the installed version, built into
 OpenTricky.exe (the launcher shows it without a network). It is the same
 block that heads the release's notes on GitHub, hidden in an HTML comment
-(checking that both match in tools/publish comes with the updates, step L4).
+(both are kept identical when a release is made).
 Format: port/launcher/app/ot_util.h.
 Replace it with the new release's block when the release notes are written.
 A "draft:" line (ignored by the launcher) marks a block that is not final

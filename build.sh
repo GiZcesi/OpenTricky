@@ -9,8 +9,8 @@
 # Run from an MSYS2 UCRT64 shell (or use build.bat, which opens one for you).
 # Result: dist/OpenTricky/ -- "OpenTricky.exe" (the launcher, with its ui/ folder
 # and THIRD-PARTY-LICENSES.txt), "SSX Tricky.exe" and the DLLs it needs.
-# Nothing from the game is ever added to the repository: the extracted files
-# (game_files/) and the translated code (port/src/recomp/gen/) are git-ignored.
+# The extracted files (game_files/) and the translated code
+# (port/src/recomp/gen/) are git-ignored.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"

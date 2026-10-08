@@ -3,8 +3,7 @@ OpenTricky -- third-party licences
 
 SSX Tricky is a trademark of Electronic Arts. OpenTricky is
 a fan project, not affiliated with or endorsed by EA; it needs your own copy
-of the game (SSX Tricky, USA, Xbox disc image). Nothing from the game's disc
-is included.
+of the game (SSX Tricky, USA, Xbox disc image).
 
 The launcher (OpenTricky.exe) is built with the software and fonts below.
 Their licences follow, in full.

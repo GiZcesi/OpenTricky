@@ -196,7 +196,7 @@ static void auto_resolution(int aspect, int fullscreen, int *w, int *h)
 
 /* ── Fork options ───────────────────────────────────────────── */
 
-/* The defaults are those of fork/main with no variable set: no SMAA, every
+/* The defaults are the program's own with no variable set: no SMAA, every
  * fidelity fix on, 8 audio buffers -- for test runs whose XBOX_FORK_INI
  * names no file. A player's defaults are the settings registry's (settings.h). */
 static void fork_defaults(LauncherConfig *c)
@@ -233,7 +233,7 @@ static const char *const k_drawdist_name[] = { "original", "far", "max" };
 static const char *const k_icons_name[] = { "auto", "modern", "playstation", "ps2" };
 #define N_ICONS 4
 #define ICONS_PS2 3
-/* The PS2 game's own buttons are built in unless CMake has
+/* The PS2 button style is built in unless CMake has
  * -DSSX_PS2_BUTTONS=OFF. In such a build that choice is only announced,
  * greyed ("coming soon"), and cannot be picked; a saved "ps2" reads as Auto
  * (PS2_ORIGINAL_READY in nv2a_btnicons.c says the same to the game). */
@@ -398,7 +398,7 @@ void launcher_fork_apply(const LauncherConfig *cfg, const char *source)
     /* the save backup copy and the frames in between above 60 */
     fork_set(line, sizeof line, "XBOX_SAVE_BACKUP", cfg->save_backup ? "1" : "0", source);
     fork_set(line, sizeof line, "XBOX_FPS_INTERP", cfg->smooth_motion ? "1" : "0", source);
-    /* Original = aucun hook. */
+    /* Original = no hook. */
     fork_set(line, sizeof line, "XBOX_DRAW_DISTANCE",
              k_drawdist_name[(cfg->draw_dist >= 0 && cfg->draw_dist <= 2) ? cfg->draw_dist : 0], source);
     /* No pack folder: nothing; "0" = off (no index read). */

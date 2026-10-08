@@ -1353,7 +1353,7 @@ static void texcache_put(uint32_t offset, uint32_t format, uint32_t sig, IDirect
  * presented frame in two (odd PresentSeq) binds every texture freshly decoded
  * from the guest bytes, bypassing the texture cache and everything the HD path added
  * to it (no lookup, no HD request, no swap, no budget); the other frames take
- * the normal path. The decode code is fork/main's. In a frozen scene
+ * the normal path. The decode code is the same. In a frozen scene
  * (pump_ident, N after the pause starts) every capture must then be identical
  * whatever its parity: with HD textures off, the cache hands out exactly the
  * guest textures. Within one fresh frame a texture is decoded once (a table
@@ -3406,7 +3406,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                 union { float f; DWORD u; } fb;
                 if (bias & 0x1000) bias -= 0x2000;
                 fb.f = (float)bias / 256.0f;
-                /* The PS2 game's buttons (XBOX_BUTTON_ICONS=ps2): their atlas
+                /* The PS2 button style (XBOX_BUTTON_ICONS=ps2): its atlas
                  * is sampled nearest neighbour, mip levels included, so that
                  * its pixels show as they are (nv2a_btnicons.h). */
                 int pt = btnicons_point(t);

@@ -19,7 +19,7 @@
 #include "np_racebench.h"
 
 extern void sub_0005BEB0(void);     /* Player: command from the pad */
-extern void sub_00048C40(void);     /* OtherRider : commande depuis l'IA */
+extern void sub_00048C40(void);     /* OtherRider: command from the AI */
 unsigned d3d8_PresentSeq(void);
 
 int g_np_cmdlog_on = 0;
@@ -129,7 +129,7 @@ static void np_open(uint32_t race)
                  s_np.nfile + 1) >= (int)sizeof path) return;
     s_np.f = fopen(path, "wb");
     if (!s_np.f) {
-        fprintf(stderr, "[NETLOG] impossible d'ouvrir %s\n", path);
+        fprintf(stderr, "[NETLOG] cannot open %s\n", path);
         return;
     }
     setvbuf(s_np.f, NULL, _IOFBF, 256 * 1024);
@@ -143,7 +143,7 @@ static void np_open(uint32_t race)
             setvbuf(s_np.st, NULL, _IOFBF, 1024 * 1024);
             fwrite(hdr, sizeof hdr, 1, s_np.st);
         } else {
-            fprintf(stderr, "[NETLOG] impossible d'ouvrir %s\n", sp);
+            fprintf(stderr, "[NETLOG] cannot open %s\n", sp);
         }
     }
     if (s_np.rec_on) {
@@ -175,7 +175,7 @@ static void np_open(uint32_t race)
     np_put32(NPCL_VERSION);
     np_put32(4u * (15u + n) + r * NPCL_ROSTER_STRIDE);  /* header size */
     np_put32((uint32_t)sizeof(npcl_record));
-    np_put32(MEM32(0x001DEC90u));                        /* piste */
+    np_put32(MEM32(0x001DEC90u));                        /* track */
     np_put32(MEM32(0x001DEC94u));                        /* game mode */
     np_put32(MEM32(0x001DEC98u));
     np_put32(MEM32(0x001DEC9Cu));

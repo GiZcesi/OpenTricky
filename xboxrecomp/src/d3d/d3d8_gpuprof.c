@@ -10,7 +10,7 @@
 
 int g_gpuprof_on;
 
-#define NF    8                 /* images en vol avant relecture */
+#define NF    8                 /* frames in flight before readback */
 #define MAXQ  8192              /* timestamps per frame (2 per bracketed piece of work) */
 #define WIN   4096              /* frames kept per window for the percentiles */
 

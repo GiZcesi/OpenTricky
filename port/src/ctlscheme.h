@@ -16,7 +16,7 @@
  * single buttons, the six pairs, the four triples, all four.
  *
  * The host serves a rewritten copy of each file (the disc and the extracted
- * files are never modified) that does what the PS2 game's own two files do,
+ * files are never modified) that does what the two PS2 control files do,
  * every action on its PS2 button, moved by position onto a modern pad:
  * Cross = A, Circle = B, Square = X, Triangle = Y, L1 = LB (White),
  * R1 = RB (Black), L2 = LT, R2 = RT, Select = Back, L3 = left stick press.

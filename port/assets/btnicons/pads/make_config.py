@@ -74,7 +74,7 @@ STYLES = {
 # the Pro preset's three own rows suffice. The three styles show the PS2
 # game's words (the same control layout).
 HIDE = ("", -2000.0, 0.0, 0, 0xE02)
-Q = 196.2 / 256 / 0.8            # the PS2 game's units -> the PS2 picture's place here
+Q = 196.2 / 256 / 0.8            # PS2 units -> the PS2-style picture's place here
 
 
 def ps2(x, y):
