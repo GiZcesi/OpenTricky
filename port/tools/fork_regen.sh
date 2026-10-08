@@ -135,6 +135,7 @@ PASSES=(
   "fork_fpu_cmp_split|$PY \"$FORK/fix_fpu_cmp_split.py\" \"$GEN\""
   "fork_std_scasb|$PY \"$FORK/fix_std_scasb.py\" \"$GEN\""
   "fork_kickwait|$PY \"$FORK/fix_kickwait.py\" \"$GEN\""
+  "fork_riderlist|$PY \"$FORK/fix_riderlist.py\" \"$GEN\""
 )
 i=0
 for p in "${PASSES[@]}"; do

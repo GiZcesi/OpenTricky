@@ -195,6 +195,9 @@ static inline float run_svf(sv_filter *sv, float in) {
  * HRTF Filter - from vp/hrtf.h
  * ============================================================ */
 
+/* Host output channels: stereo, or 5.1 (FL FR C LFE SL SR). */
+#define APU_OUT_MAX_CHANNELS    6
+
 #define HRTF_SAMPLES_PER_FRAME  NUM_SAMPLES_PER_FRAME
 #define HRTF_NUM_TAPS           31
 #define HRTF_MAX_DELAY_SAMPLES  42
@@ -497,7 +500,12 @@ struct MCPXAPUState {
 
     struct {
         McpxApuDebugMonitorPoint point;
-        int16_t frame_buf[256][2];
+        /* EP output, interleaved by speaker: [0] FL, [1] FR and, with 5.1
+         * output only, [2] C, [3] LFE, [4] SL, [5] SR (mixbins 0-5, the
+         * order the title's mixer and Windows' 5.1 layout share). With
+         * stereo output only [0] and [1] are written or read. */
+        int16_t frame_buf[256][APU_OUT_MAX_CHANNELS];
+        int channels;   /* 2 (stereo) or 6 (5.1), set once by mcpx_apu_monitor_init */
         void *stream; /* SDL_AudioStream* - stubbed */
         int queued_bytes_low, queued_bytes_high;
     } monitor;

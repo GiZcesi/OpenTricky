@@ -1,6 +1,6 @@
 /*
- * np_ghost -- ghost local rejoué depuis les commandes enregistrées (fork).
- * Voir np_ghost.h pour l'interrupteur, les hooks, l'alignement et les limites.
+ * np_ghost -- local ghost replayed from recorded commands.
+ * See np_ghost.h for the switch, the hooks, the alignment and the limits.
  */
 #ifdef _WIN32
 #include <windows.h>
@@ -27,27 +27,27 @@ static void nc_stats(const char *why);   /* plus bas */
 #define NG_ROSTER_VA  0x001DE900u
 #define NG_ROSTER_N   0x001DE8FCu
 
-/* Données lues dans le .npcl */
+/* Data read from the .npcl */
 static struct {
     uint32_t version, track, mode, seed98, seed9c, nriders, nroster;
     uint8_t  roster[NPCL_MAX_RIDERS * NPCL_ROSTER_STRIDE];
-    uint32_t player_idx;                /* index du Player enregistré */
-    uint32_t slot, human;               /* slot ghost, index de l'humain */
-    uint32_t r_start[NG_NSTATES];       /* 1er race+0x18 de chaque état */
-    uint32_t fmax;                      /* race+0x18 max enregistré */
-    uint32_t *cmd;                      /* commande par race+0x18 */
+    uint32_t player_idx;                /* index of the recorded Player */
+    uint32_t slot, human;               /* ghost slot, human's index */
+    uint32_t r_start[NG_NSTATES];       /* first race+0x18 of each state */
+    uint32_t fmax;                      /* highest race+0x18 recorded */
+    uint32_t *cmd;                      /* command per race+0x18 */
     uint8_t  *valid;
-    uint8_t  *st_at;                    /* état de course enregistré par race+0x18 */
-    uint32_t *hcmd;                     /* XBOX_GHOST_HUMAN_REPLAY : commande de l'IA */
-    float    *hsf;                      /*   enregistrée à l'index humain, et son +0x15C */
+    uint8_t  *st_at;                    /* race state recorded per race+0x18 */
+    uint32_t *hcmd;                     /* XBOX_GHOST_HUMAN_REPLAY: the AI's command */
+    float    *hsf;                      /*   recorded at the human's index, and its +0x15C */
     uint8_t  *hvalid;
     int      human_replay;
     int      have_rng;
-    uint32_t rng_a[6], rng_b[6];        /* états RNG au début de l'état 3 */
+    uint32_t rng_a[6], rng_b[6];        /* RNG states at the start of state 3 */
     int      force;                     /* forcer roster / graines / RNG */
 } s_g;
 
-/* État pendant la course */
+/* State during the race */
 static struct {
     uint32_t race, races, last_rf;
     uint32_t g_start[NG_NSTATES];
@@ -64,7 +64,7 @@ static uint32_t ng_race_ptr(void)
 
 static void ng_stats(const char *why)
 {
-    fprintf(stderr, "[GHOST] %s : course=%u commandes_rejouees=%llu replis_IA=%llu termine=%d rng_force=%d\n",
+    fprintf(stderr, "[GHOST] %s: race=%u replayed_commands=%llu ai_fallbacks=%llu done=%d rng_forced=%d\n",
             why, s_rt.races, s_rt.taken, s_rt.fallback, s_rt.done, s_rt.rng_done);
     fflush(stderr);
     nc_stats(why);
@@ -80,10 +80,10 @@ void np_ghost_before(void)
         s_rt.races++;
         for (i = 0; i < NG_NSTATES; i++) s_rt.g_start[i] = NG_UNSET;
         s_rt.rng_done = 0;
-        if (s_rt.races > 1 && !s_rt.done) { s_rt.done = 1; ng_stats("nouvel objet course, ghost termine"); }
+        if (s_rt.races > 1 && !s_rt.done) { s_rt.done = 1; ng_stats("new race object, ghost done"); }
     } else if (!s_rt.done && rf < s_rt.last_rf) {
         s_rt.done = 1;
-        ng_stats("race+0x18 recule (relecture), ghost termine");
+        ng_stats("race+0x18 went back (replay), ghost done");
     }
     s_rt.last_rf = rf;
     if (s_rt.done) return;
@@ -91,41 +91,41 @@ void np_ghost_before(void)
     st = MEM32(race + 0x1Cu);
     if (st < NG_NSTATES && s_rt.g_start[st] == NG_UNSET) {
         s_rt.g_start[st] = rf;
-        fprintf(stderr, "[GHOST] etat %u : race+0x18=%u (enregistre : %u)\n", st, rf,
+        fprintf(stderr, "[GHOST] state %u: race+0x18=%u (recorded: %u)\n", st, rf,
                 s_g.r_start[st] == NG_UNSET ? 0xFFFFFFFFu : s_g.r_start[st]);
-        ng_stats("bilan");
+        ng_stats("summary");
     }
-    if (st == 5u) { s_rt.done = 1; ng_stats("EndRace, ghost termine"); return; }
+    if (st == 5u) { s_rt.done = 1; ng_stats("EndRace, ghost done"); return; }
     if (st == 3u && !s_rt.rng_done && s_g.have_rng && s_g.force) {
         for (i = 0; i < 6; i++) {
             MEM32(NPCL_RNG_A_VA + 4u * i) = s_g.rng_a[i];
             MEM32(NPCL_RNG_B_VA + 4u * i) = s_g.rng_b[i];
         }
         s_rt.rng_done = 1;
-        fprintf(stderr, "[GHOST] etats RNG A/B forces au debut de l'etat 3 (race+0x18=%u)\n", rf);
+        fprintf(stderr, "[GHOST] RNG A/B states forced at the start of state 3 (race+0x18=%u)\n", rf);
     }
 }
 
-/* ── Corrections d'état (instantanés .npst du Player enregistré) ──
- * Au point de la demande de commande (même point que l'enregistrement), les
- * plages choisies du sous-objet Rider enregistré au tick d'origine gf sont
- * recopiées dans le ghost : tous les `period` ticks d'origine (gf % period),
- * et dès que l'écart de position dépasse `thr` (contact). Voir np_ghost.h. */
+/* ── State corrections (.npst snapshots of the recorded Player) ──
+ * When the command is requested (same point as the recording), the chosen
+ * ranges of the Rider sub-object recorded at original tick gf are copied
+ * into the ghost: every `period` original ticks (gf % period), and as soon
+ * as the position gap exceeds `thr` (contact). See np_ghost.h. */
 #define NC_MAXR 16
 static struct {
     int      on, same_ev;
-    uint32_t period;            /* ticks d'origine entre deux corrections (0 = jamais) */
-    float    thr, jump;         /* seuils : correction sur écart / saut « visible » */
+    uint32_t period;            /* original ticks between two corrections (0 = never) */
+    float    thr, jump;         /* thresholds: correction on gap / "visible" jump */
     uint32_t nr, off[NC_MAXR], len[NC_MAXR], setsz;
     uint8_t  *data;             /* (fmax+1) x setsz */
     uint8_t  *have;
-    uint32_t *ev;               /* +0x458 enregistré */
-    float    *pos;              /* +0x170 enregistré (3 floats) */
+    uint32_t *ev;               /* recorded +0x458 */
+    float    *pos;              /* recorded +0x170 (3 floats) */
     unsigned long long n_corr, n_thr, n_jump, n_skip_ev, n_nostate;
     float    err_max;
-    uint32_t race_state;         /* état de course où corriger (4 = Race) */
-    unsigned jump_ev[32];        /* sauts par état +0x458 du ghost (0..31) */
-    double   err_sum; unsigned long long err_n;   /* écart avant correction */
+    uint32_t race_state;         /* race state in which to correct (4 = Race) */
+    unsigned jump_ev[32];        /* jumps per +0x458 state of the ghost (0..31) */
+    double   err_sum; unsigned long long err_n;   /* gap before correction */
 } s_c;
 
 static int nc_add(uint32_t off, uint32_t len)
@@ -136,13 +136,13 @@ static int nc_add(uint32_t off, uint32_t len)
     return 1;
 }
 
-/* "pos" | "kin" | "kinrot" | "kinrot458" | liste "off:len,..." (hexa) */
+/* "pos" | "kin" | "kinrot" | "kinrot458" | list "off:len,..." (hex) */
 static void nc_parse(const char *e)
 {
-    if (!e || !*e || !strcmp(e, "rec")) { nc_add(0x170, 0x50); nc_add(0x454, 0x08); return; }   /* retenu */
+    if (!e || !*e || !strcmp(e, "rec")) { nc_add(0x170, 0x50); nc_add(0x454, 0x08); return; }   /* chosen default */
     if (!strcmp(e, "kinrot")) { nc_add(0x170, 0x24); nc_add(0x448, 0x10); nc_add(0x478, 0x20); return; }
     if (!strcmp(e, "pos")) { nc_add(0x170, 0x0C); return; }
-    if (!strcmp(e, "body")) { nc_add(0x170, 0x50); return; }   /* pos, vel, avancement, quaternion, direction */
+    if (!strcmp(e, "body")) { nc_add(0x170, 0x50); return; }   /* pos, vel, progress, quaternion, heading */
     if (!strcmp(e, "kin")) { nc_add(0x170, 0x24); return; }
     if (!strcmp(e, "kinrot458")) { nc_add(0x170, 0x24); nc_add(0x448, 0x14); nc_add(0x478, 0x20); return; }
     while (*e) {
@@ -163,9 +163,9 @@ static void nc_load(const char *path)
     npst_record r;
     uint8_t *blk;
     unsigned long long cnt = 0;
-    if (!f) { fprintf(stderr, "[GHOST] corrections : %s introuvable : off\n", path); return; }
+    if (!f) { fprintf(stderr, "[GHOST] corrections: %s not found: off\n", path); return; }
     if (fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != NPST_MAGIC || hdr[2] != NPST_BLOCK) {
-        fprintf(stderr, "[GHOST] corrections : %s n'est pas un .npst v1 : off\n", path); fclose(f); return;
+        fprintf(stderr, "[GHOST] corrections: %s is not a .npst v1: off\n", path); fclose(f); return;
     }
     s_c.data = calloc((size_t)n, s_c.setsz);
     s_c.have = calloc(n, 1);
@@ -187,21 +187,21 @@ static void nc_load(const char *path)
     }
     fclose(f); free(blk);
     s_c.on = cnt > 0;
-    fprintf(stderr, "[GHOST] corrections : %llu instantanes (%u plages, %u o par correction), periode %u ticks, "
-            "seuil %.0f, saut visible > %.0f, meme etat +0x458 %s\n", cnt, s_c.nr, s_c.setsz, s_c.period,
-            s_c.thr, s_c.jump, s_c.same_ev ? "exige" : "non exige");
+    fprintf(stderr, "[GHOST] corrections: %llu snapshots (%u ranges, %u B per correction), period %u ticks, "
+            "threshold %.0f, visible jump > %.0f, same +0x458 state %s\n", cnt, s_c.nr, s_c.setsz, s_c.period,
+            s_c.thr, s_c.jump, s_c.same_ev ? "required" : "not required");
 }
 
 static void nc_stats(const char *why)
 {
     if (!s_c.on) return;
-    fprintf(stderr, "[GHOST] corrections %s : appliquees=%llu (sur seuil %llu), sauts>%.0f=%llu, "
-            "ignorees etat+0x458 different=%llu, sans instantane=%llu, ecart avant correction moy=%.1f max=%.1f\n",
+    fprintf(stderr, "[GHOST] corrections %s: applied=%llu (on threshold %llu), jumps>%.0f=%llu, "
+            "skipped different +0x458 state=%llu, no snapshot=%llu, gap before correction avg=%.1f max=%.1f\n",
             why, s_c.n_corr, s_c.n_thr, s_c.jump, s_c.n_jump, s_c.n_skip_ev, s_c.n_nostate,
             s_c.err_n ? s_c.err_sum / (double)s_c.err_n : 0.0, s_c.err_max);
     {
         unsigned i;
-        fprintf(stderr, "[GHOST] sauts par etat +0x458 du ghost :");
+        fprintf(stderr, "[GHOST] jumps per +0x458 state of the ghost:");
         for (i = 0; i < 32; i++) if (s_c.jump_ev[i]) fprintf(stderr, " %u:%u", i, s_c.jump_ev[i]);
         fprintf(stderr, "\n");
     }
@@ -233,7 +233,7 @@ static void nc_apply(uint32_t rider, uint32_t gf, uint32_t st)
     if (err > s_c.jump) { uint32_t ev = MEM32(rider + 0x458u); s_c.n_jump++; s_c.jump_ev[ev < 32u ? ev : 31u]++; }
     if (err > s_c.err_max) s_c.err_max = err;
     s_c.err_sum += err; s_c.err_n++;
-    if (s_c.n_corr % 600u == 0) nc_stats("bilan");
+    if (s_c.n_corr % 600u == 0) nc_stats("summary");
 }
 
 static void nc_init(void)
@@ -245,9 +245,9 @@ static void nc_init(void)
     v = getenv("XBOX_GHOST_CORR_THR");    s_c.thr = (v && *v) ? (float)atof(v) : 20.0f;
     v = getenv("XBOX_GHOST_CORR_JUMP");   s_c.jump = (v && *v) ? (float)atof(v) : 39.4f;
     v = getenv("XBOX_GHOST_CORR_STATE");  s_c.race_state = (v && *v) ? (uint32_t)atoi(v) : 4u;
-    v = getenv("XBOX_GHOST_CORR_SAMEEV"); s_c.same_ev = v && v[0] == '1';   /* défaut 0 : mieux mesuré */
+    v = getenv("XBOX_GHOST_CORR_SAMEEV"); s_c.same_ev = v && v[0] == '1';   /* default 0: measured better */
     nc_parse(getenv("XBOX_GHOST_CORR_SET"));
-    if (!s_c.nr) { fprintf(stderr, "[GHOST] corrections : XBOX_GHOST_CORR_SET vide : off\n"); return; }
+    if (!s_c.nr) { fprintf(stderr, "[GHOST] corrections: XBOX_GHOST_CORR_SET empty: off\n"); return; }
     nc_load(e);
 }
 
@@ -267,8 +267,8 @@ int np_ghost_take(uint32_t rider, uint32_t pcmd)
         s_rt.fallback++;
         if (!s_rt.warned_empty) {
             s_rt.warned_empty = 1;
-            fprintf(stderr, "[GHOST] plus de commande enregistree (etat %u, tick d'origine %u) : repli IA\n", st, gf);
-            ng_stats("repli");
+            fprintf(stderr, "[GHOST] no more recorded command (state %u, original tick %u): AI fallback\n", st, gf);
+            ng_stats("fallback");
         }
         return 0;
     }
@@ -279,10 +279,10 @@ int np_ghost_take(uint32_t rider, uint32_t pcmd)
     return 1;
 }
 
-/* XBOX_GHOST_HUMAN_REPLAY=1 : appelé par le hook Player APRÈS l'original ;
- * remplace la commande du Player humain par celle de l'IA enregistrée au même
- * index, et son facteur de vitesse. Sert à reproduire la course entière
- * (aucun rider ne diffère de l'enregistrement). */
+/* XBOX_GHOST_HUMAN_REPLAY=1: called by the Player hook AFTER the original;
+ * replaces the human Player's command with the one of the AI recorded at the
+ * same index, and its speed factor. Used to reproduce the whole race (no
+ * rider differs from the recording). */
 void np_ghost_player_after(uint32_t rider, uint32_t pcmd)
 {
     uint32_t race, st, rf, gf;
@@ -312,8 +312,8 @@ static void hook_AC9B0(void)
         MEM32(NG_ROSTER_N) = n;
         MEM32(0x001DEC9Cu) = s_g.seed9c;
         if (!s_rt.roster_done)
-            fprintf(stderr, "[GHOST] LoadLevel : roster force (%u entrees, %u avant), ghost=%u (IA), humain=%u (port 0), "
-                    "[0x1DEC9C]=0x%08X, piste live=%u enregistree=%u\n", n, cur, s_g.slot, s_g.human,
+            fprintf(stderr, "[GHOST] LoadLevel: roster forced (%u entries, %u before), ghost=%u (AI), human=%u (port 0), "
+                    "[0x1DEC9C]=0x%08X, live track=%u recorded=%u\n", n, cur, s_g.slot, s_g.human,
                     s_g.seed9c, MEM32(0x001DEC90u), s_g.track);
         s_rt.roster_done = 1;
     }
@@ -330,7 +330,7 @@ static void hook_2E040(void)
         uint32_t before = MEM32(0x001DEC98u);
         MEM32(0x001DEC98u) = s_g.seed98;
         s_rt.seed_writes++;
-        fprintf(stderr, "[GHOST] Race_ResetPlayerRoster : [0x1DEC98] 0x%08X -> 0x%08X\n", before, s_g.seed98);
+        fprintf(stderr, "[GHOST] Race_ResetPlayerRoster: [0x1DEC98] 0x%08X -> 0x%08X\n", before, s_g.seed98);
     }
     g_ecx = ecx;
     sub_0002E040();
@@ -343,7 +343,7 @@ void (*np_ghost_lookup(uint32_t xbox_va))(void)
     return 0;
 }
 
-/* ── Lecture du .npcl ── */
+/* ── Reading the .npcl ── */
 static int ng_load(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -352,9 +352,9 @@ static int ng_load(const char *path)
     npcl_record rec;
     int rng_seen[2] = { 0, 0 };
 
-    if (!f) { fprintf(stderr, "[GHOST] impossible d'ouvrir %s\n", path); return 0; }
+    if (!f) { fprintf(stderr, "[GHOST] cannot open %s\n", path); return 0; }
     if (fread(h, 4, 12, f) != 12 || h[0] != NPCL_MAGIC || h[3] != sizeof(npcl_record)) {
-        fprintf(stderr, "[GHOST] %s : pas un .npcl lisible\n", path); fclose(f); return 0;
+        fprintf(stderr, "[GHOST] %s: not a readable .npcl\n", path); fclose(f); return 0;
     }
     s_g.version = h[1]; hsize = h[2]; rsize = h[3];
     s_g.track = h[4]; s_g.mode = h[5]; s_g.seed98 = h[6]; s_g.seed9c = h[7];
@@ -379,7 +379,7 @@ static int ng_load(const char *path)
         }
     }
     if (s_g.player_idx == NG_UNSET || s_g.fmax > 2000000u) {
-        fprintf(stderr, "[GHOST] %s : aucun enregistrement Player\n", path); fclose(f); return 0;
+        fprintf(stderr, "[GHOST] %s: no Player record\n", path); fclose(f); return 0;
     }
     s_g.cmd = (uint32_t *)calloc(s_g.fmax + 1u, 4);
     s_g.valid = (uint8_t *)calloc(s_g.fmax + 1u, 1);
@@ -388,7 +388,7 @@ static int ng_load(const char *path)
     s_g.hsf = (float *)calloc(s_g.fmax + 1u, 4);
     s_g.hvalid = (uint8_t *)calloc(s_g.fmax + 1u, 1);
     if (!s_g.cmd || !s_g.valid || !s_g.st_at || !s_g.hcmd || !s_g.hsf || !s_g.hvalid) { fclose(f); return 0; }
-    /* slot et humain (nécessaires à la 2e passe) */
+    /* slot and human (needed by the 2nd pass) */
     {
         const char *v = getenv("XBOX_GHOST_SLOT");
         s_g.slot = (v && *v) ? (uint32_t)strtoul(v, 0, 10) : s_g.player_idx;
@@ -398,7 +398,7 @@ static int ng_load(const char *path)
         v = getenv("XBOX_GHOST_HUMAN_REPLAY");
         s_g.human_replay = v && v[0] == '1';
     }
-    /* 2e passe : commandes et états RNG du début de l'état 3 */
+    /* 2nd pass: commands and RNG states of the start of state 3 */
     fseek(f, (long)hsize, SEEK_SET);
     while (fread(&rec, rsize, 1, f) == 1) {
         if (rec.kind == NPCL_KIND_PLAYER && rec.idx == s_g.player_idx) {
@@ -421,9 +421,9 @@ static int ng_load(const char *path)
     }
     s_g.have_rng = rng_seen[0] && rng_seen[1];
     fclose(f);
-    fprintf(stderr, "[GHOST] %s : v%u, %ld octets, piste=%u mode=%u, %u riders, Player enregistre = index %u, "
-            "commandes jusqu'a race+0x18=%u, RNG etat 3 : %s\n", path, s_g.version, fsz, s_g.track, s_g.mode,
-            s_g.nriders, s_g.player_idx, s_g.fmax, s_g.have_rng ? "oui" : "non (v2 : RNG non force)");
+    fprintf(stderr, "[GHOST] %s: v%u, %ld bytes, track=%u mode=%u, %u riders, recorded Player = index %u, "
+            "commands up to race+0x18=%u, state 3 RNG: %s\n", path, s_g.version, fsz, s_g.track, s_g.mode,
+            s_g.nriders, s_g.player_idx, s_g.fmax, s_g.have_rng ? "yes" : "no (v2: RNG not forced)");
     return 1;
 }
 
@@ -435,13 +435,13 @@ void np_ghost_init(void)
     v = getenv("XBOX_GHOST_FORCE");
     s_g.force = !(v && !strcmp(v, "none"));
     if (s_g.slot >= s_g.nroster || s_g.human >= s_g.nroster || s_g.slot == s_g.human) {
-        fprintf(stderr, "[GHOST] slot=%u humain=%u invalides (roster de %u) : off\n", s_g.slot, s_g.human, s_g.nroster);
+        fprintf(stderr, "[GHOST] slot=%u human=%u invalid (roster of %u): off\n", s_g.slot, s_g.human, s_g.nroster);
         return;
     }
-    fprintf(stderr, "[GHOST] actif : slot=%u humain=%u conditions d'egalite %s\n", s_g.slot, s_g.human,
-            s_g.force ? "forcees (roster, graines, RNG)" : "NON forcees (XBOX_GHOST_FORCE=none)");
+    fprintf(stderr, "[GHOST] active: slot=%u human=%u equality conditions %s\n", s_g.slot, s_g.human,
+            s_g.force ? "forced (roster, seeds, RNG)" : "NOT forced (XBOX_GHOST_FORCE=none)");
     if (s_g.human_replay)
-        fprintf(stderr, "[GHOST] humain : rejoue la commande et le +0x15C de l'IA enregistree a l'index %u\n",
+        fprintf(stderr, "[GHOST] human: replays the command and the +0x15C of the AI recorded at index %u\n",
                 s_g.human);
     nc_init();
     g_np_ghost_on = 1;

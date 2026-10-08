@@ -1,5 +1,5 @@
 /*
- * fps_cap -- cadence d'images host au-delà de 60 (fork). Voir fps_cap.h.
+ * fps_cap -- host frame pacing above 60. See fps_cap.h.
  */
 #include <windows.h>
 #include <stdio.h>
@@ -15,8 +15,8 @@ void sub_00151D07(void);    /* WaitForSingleObject (stdcall, ret 8) */
 unsigned d3d8_PresentSeq(void);
 
 int g_fps_cap_on;
-static int s_in_extra;          /* rendu en plus en cours */
-static int s_dup_k;             /* mode DUP : rang du rendu après le rendu normal */
+static int s_in_extra;          /* an extra render is in progress */
+static int s_dup_k;             /* DUP mode: index of the render after the normal one */
 
 #define APP_GLOBAL      0x001E3C7Cu
 #define TICK_MS         (1000.0 / 60.0)
@@ -25,13 +25,15 @@ static int s_dup_k;             /* mode DUP : rang du rendu après le rendu norm
 
 static struct {
     int      cap, log, check, noskip, dup;
-    double   period_ms;             /* 0 = sans limite */
+    double   period_ms;             /* 0 = no limit */
     DWORD    tid;
     double   freq;
-    double   last_tick_ret;         /* retour du hook sur événement de frame (≈ début tick + rendu) */
+    double   last_tick_ret;         /* return of the frame-event hook (~ tick start + render) */
+    int      tick_fresh;            /* the event was seen signaled while waiting (tick produced ~ now) */
+    int      from_wait;             /* the next tick follows a return of the frame wait */
     double   next_render;
     double   avg_render;
-    unsigned dump_from;             /* XBOX_D3D_DUMP_FROM (journal des doublons, T4) */            /* moyenne glissante d'un rendu en plus (ms) */
+    unsigned dump_from;             /* XBOX_D3D_DUMP_FROM (duplicate log, T4) */            /* running average of an extra render (ms) */
 } s;
 
 static struct {
@@ -40,7 +42,7 @@ static struct {
     unsigned present0;
     uint32_t race_tick0, race0;
     double   t0;
-    /* instrument d'état */
+    /* state probe */
     unsigned long long snaps, d_rng, d_race, d_rider, d_audio, d_state, d_app;
     unsigned long long page_scans, page_changed;
 } P, S;
@@ -52,11 +54,11 @@ static double now_ms(void)
     return (double)t.QuadPart * 1000.0 / s.freq;
 }
 
-/* Durée d'un rendu (normal ou en plus) dans la moyenne glissante qui décide
- * si un rendu en plus tient avant le tick. Avant,
- * seuls les rendus en plus la mettaient à jour ; une saccade (chargement,
- * 198 ms) la figeait au-dessus de la marge → plus aucun rendu en plus jusqu'à
- * la fin. Durées > 50 ms (chargements, saccades) ignorées. */
+/* Duration of a render (normal or extra) in the running average that decides
+ * whether an extra render fits before the tick. Every render updates it: if
+ * only extra renders did, one stall (a 198 ms load) would freeze it above the
+ * margin and stop extra renders for good. Durations > 50 ms (loads, stalls)
+ * are ignored. */
 #define RENDER_OUTLIER_MS 50.0
 #define NV_MAX      4u
 #define NR_MAX      8u
@@ -66,9 +68,9 @@ static double now_ms(void)
 #define POS_OFF     0x170u
 #define POSE_OFF    0x48B0u
 #define POSE_N      21u
-#define TELEPORT    400.0f          /* unités par tick (course : ~30) */
-#define CAM_CUT_COS 0.866f          /* rotation caméra > 60° en un tick = coupe */
-#define BONE_CUT_COS 0.0f           /* os tourné de > 180°… : quaternions, cos(demi-angle) < 0 → 90° */
+#define TELEPORT    400.0f          /* units per tick (race: ~30) */
+#define CAM_CUT_COS 0.866f          /* camera rotation > 60 deg in one tick = cut */
+#define BONE_CUT_COS 0.0f           /* bone turned by > 180 deg: quaternions, cos(half angle) < 0 -> 90 deg */
 
 enum { SP_VIEW, SP_POS, SP_POSE };
 typedef struct { uint32_t va, len, kind, off; } Span;
@@ -79,17 +81,21 @@ typedef struct {
 } VS;
 
 static struct {
-    int on, log, synth;             /* XBOX_FPS_INTERP, XBOX_FPS_INTERP_LOG (nombre de rendus journalisés) */
+    int on, log, synth;             /* XBOX_FPS_INTERP, XBOX_FPS_INTERP_LOG (number of renders logged) */
     VS prev, cur, pre, out;
-    int ok;                         /* prev et cur valides, même disposition */
-    double t_tick;                  /* début du dernier tick */
-    int written;                    /* état interpolé en mémoire (rendu en cours) */
+    int ok;                         /* prev and cur valid, same layout */
+    double t_tick;                  /* start of the last tick */
+    double t_est;                   /* estimated production time of the last tick (game timer) */
+    int clock;                      /* XBOX_FPS_INTERP_CLOCK: 1 = timer-based tick time, 0 = consumption time */
+    int mode;                       /* last interp_begin: 0 interpolated, 1 alpha >= 1, 2 memory != tick, 3 not applicable */
+    float alpha;                    /* last alpha (before the >= 1 test) */
+    int written;                    /* interpolated state in memory (render in progress) */
     unsigned long long n_interp, n_mismatch, n_alpha1, n_cut_cam, n_cut_rider, n_badrot, n_logged;
     uint32_t log_from;
 } I;
 
 static unsigned long long s_outliers;
-static int s_measured;           /* durée déjà comptée par hook_AB610 */
+static int s_measured;           /* duration already counted by hook_AB610 */
 static void render_time(double d)
 {
     if (d > RENDER_OUTLIER_MS) { s_outliers++; return; }
@@ -105,24 +111,24 @@ static uint32_t race_ptr(void)
     return MEM32(lvl + 0x1Cu);
 }
 
-/* ── appels invités ─────────────────────────────────────────────── */
+/* ── guest calls ────────────────────────────────────────────────── */
 
-/* WaitForSingleObject(handle, ms) du jeu : renvoie 0 si signalé, 0x102 si délai. */
+/* The game's WaitForSingleObject(handle, ms): 0 if signaled, 0x102 on timeout. */
 static uint32_t guest_wait(uint32_t handle, uint32_t ms)
 {
     uint32_t sv_ecx = g_ecx, sv_edx = g_edx, esp0 = g_esp, r;
     g_esp -= 4; MEM32(g_esp) = ms;
     g_esp -= 4; MEM32(g_esp) = handle;
-    g_esp -= 4; MEM32(g_esp) = 0;          /* retour fictif */
+    g_esp -= 4; MEM32(g_esp) = 0;          /* dummy return address */
     sub_00151D07();
     r = g_eax;
-    g_esp = esp0;                          /* ret 8 a tout dépilé ; par sûreté */
+    g_esp = esp0;                          /* ret 8 popped everything; to be safe */
     g_ecx = sv_ecx; g_edx = sv_edx;
     return r;
 }
 
-/* state->vt+0x18 (rendu de l'état courant), comme la boucle en 0xAA283.
- * Renvoie al (1 = rendu fait). */
+/* state->vt+0x18 (render of the current state), as the loop at 0xAA283 does.
+ * Returns al (1 = render done). */
 static int guest_render(uint32_t app)
 {
     uint32_t sv[7] = { g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_seh_ebp };
@@ -135,27 +141,27 @@ static int guest_render(uint32_t app)
     if (!fn) fn = recomp_lookup(va);
     if (!fn) return 0;
     g_ecx = state;
-    g_esi = app;                           /* comme dans la boucle (esi = Application) */
-    g_esp -= 4; MEM32(g_esp) = 0;          /* retour fictif */
+    g_esi = app;                           /* as in the loop (esi = Application) */
+    g_esp -= 4; MEM32(g_esp) = 0;          /* dummy return address */
     fn();
     al = (int)(g_eax & 0xFFu);
     if (g_esp != esp0) {
         static int warned;
-        if (!warned++) fprintf(stderr, "[FPSCAP] pile déséquilibrée après le rendu : %d octets\n", (int)(g_esp - esp0));
+        if (!warned++) fprintf(stderr, "[FPSCAP] stack unbalanced after the render: %d bytes\n", (int)(g_esp - esp0));
         g_esp = esp0;
     }
     g_eax = sv[0]; g_ecx = sv[1]; g_edx = sv[2]; g_ebx = sv[3]; g_esi = sv[4]; g_edi = sv[5]; g_seh_ebp = sv[6];
     return al;
 }
 
-/* ── instrument d'état (XBOX_FPS_CAP_CHECK=1) ─────────────────── */
+/* ── state probe (XBOX_FPS_CAP_CHECK=1) ───────────────────────── */
 
-/* Régions copiées brutes avant / après chaque rendu en plus ; chaque mot
- * modifié est compté par (région, offset) pour savoir QUOI change. */
+/* Regions copied raw before / after each extra render; every changed word is
+ * counted per (region, offset) to tell WHAT changes. */
 enum { RG_RNG, RG_RACE, RG_RIDER, RG_AUDIO, RG_STATE, RG_APP, RG_N };
-static const char *const s_rg_name[RG_N] = { "rng", "course", "riders", "audio", "etat_jeu", "app" };
-static const uint32_t s_rg_len[RG_N] = { 0x30, 0x400, 0x5A00, 0x400, 0x300, 0x800 };   /* etat_jeu : jusqu'aux vues +0xB0..+0x29F */
-static uint32_t *s_rg_hist[RG_N];          /* compte par mot (riders : tous indices confondus) */
+static const char *const s_rg_name[RG_N] = { "rng", "race", "riders", "audio", "game_state", "app" };
+static const uint32_t s_rg_len[RG_N] = { 0x30, 0x400, 0x5A00, 0x400, 0x300, 0x800 };   /* game state: up to views +0xB0..+0x29F */
+static uint32_t *s_rg_hist[RG_N];          /* count per word (riders: all indices together) */
 
 typedef struct {
     uint32_t base[RG_N + 7];                /* RG_RIDER .. +7 : 8 riders */
@@ -174,7 +180,7 @@ static void snap_bases(Snap *o, uint32_t app)
         n = MEM32(race + 0x88u); if (n > 8) n = 8;
         for (i = 0; i < n; i++) {
             uint32_t r = MEM32(race + 0xC4u + 4u * i);
-            if (r >= 0x1000u) o->base[RG_RIDER + i] = r;   /* sous-objet Rider entier (+0x58E0 utilisé) */
+            if (r >= 0x1000u) o->base[RG_RIDER + i] = r;   /* whole Rider sub-object (+0x58E0 used) */
         }
     }
     if (au >= 0x1000u) o->base[RG_AUDIO + 7] = au;
@@ -192,7 +198,7 @@ static void snap_copy(Snap *o)
     }
 }
 
-/* Compare la copie à la mémoire actuelle ; renvoie un masque des régions modifiées. */
+/* Compares the copy with current memory; returns a mask of the changed regions. */
 static unsigned snap_diff(const Snap *o)
 {
     unsigned mask = 0;
@@ -207,8 +213,8 @@ static unsigned snap_diff(const Snap *o)
         mask |= 1u << rg;
         for (w = 0; w < len / 4; w++)
             if (now[w] != o->buf[k][w]) {
-                if (s_rg_hist[rg][w]++ < 6)   /* 6 premiers exemples par mot : valeur avant -> après */
-                    fprintf(stderr, "[FPSCAP] diff %s+%X (base %08X) : %08X -> %08X\n",
+                if (s_rg_hist[rg][w]++ < 6)   /* first 6 examples per word: value before -> after */
+                    fprintf(stderr, "[FPSCAP] diff %s+%X (base %08X): %08X -> %08X\n",
                             s_rg_name[rg], w * 4, o->base[k], o->buf[k][w], now[w]);
             }
     }
@@ -220,14 +226,14 @@ static void hist_report(void)
     int rg;
     for (rg = 0; rg < RG_N; rg++) {
         uint32_t w, nw = s_rg_len[rg] / 4, shown = 0;
-        fprintf(stderr, "[FPSCAP]   %s : mots modifiés (offset:nb)", s_rg_name[rg]);
+        fprintf(stderr, "[FPSCAP]   %s: changed words (offset:count)", s_rg_name[rg]);
         for (w = 0; w < nw && shown < 24; w++)
             if (s_rg_hist[rg][w]) { fprintf(stderr, " +%X:%u", w * 4, s_rg_hist[rg][w]); shown++; }
-        fprintf(stderr, "%s\n", shown ? "" : " aucun");
+        fprintf(stderr, "%s\n", shown ? "" : " none");
     }
 }
 
-/* Fonctions de rendu appelées par les rendus en plus (vt+0x18 de l'état courant). */
+/* Render functions called by the extra renders (vt+0x18 of the current state). */
 static struct { uint32_t va; unsigned long long n, ok; } s_rva[16];
 static void rva_note(uint32_t va, int ok)
 {
@@ -237,7 +243,7 @@ static void rva_note(uint32_t va, int ok)
     }
 }
 
-/* Diff de pages mémoire invitées (4 Ko) autour d'un rendu en plus, échantillonné. */
+/* Diff of guest memory pages (4 KB) around an extra render, sampled. */
 #define PG_MAX (0x08000000u >> 12)
 static uint64_t *s_pg;
 static uint32_t s_pg_hits[PG_MAX];
@@ -268,7 +274,7 @@ static void pages_hash(uint64_t *out)
 static void pages_report(void)
 {
     uint32_t i, run = 0, start = 0, shown = 0;
-    fprintf(stderr, "[FPSCAP] pages modifiées par les rendus en plus (%llu balayages ; page:nb) :", S.page_scans);
+    fprintf(stderr, "[FPSCAP] pages changed by the extra renders (%llu scans; page:count):", S.page_scans);
     for (i = 0; i <= PG_MAX; i++) {
         int hit = i < PG_MAX && s_pg_hits[i];
         if (hit && !run) { start = i; run = 1; }
@@ -277,7 +283,7 @@ static void pages_report(void)
             run = 0;
         }
     }
-    fprintf(stderr, " (%u plages)\n", shown);
+    fprintf(stderr, " (%u ranges)\n", shown);
 }
 
 /* ── statistiques ─────────────────────────────────────────────── */
@@ -291,19 +297,19 @@ static void report(int force)
     if (!force && el < 2.0) return;
     if (race && race == P.race0 && rt >= P.race_tick0) race_tps = (rt - P.race_tick0) / el;
     fprintf(stderr,
-        "[FPSCAP] t=%.1f cap=%d presents/s=%.1f evenements/s=%.1f ticks_course/s=%.1f "
-        "en_plus/s=%.1f (faits %.1f refuses %.1f) sautes_pour_tick/s=%.1f en_retard/s=%.1f "
-        "rendu_en_plus_ms=%.2f (max %.2f, moyenne glissante %.2f) rng_restaure=%llu",
+        "[FPSCAP] t=%.1f cap=%d presents/s=%.1f events/s=%.1f race_ticks/s=%.1f "
+        "extra/s=%.1f (done %.1f refused %.1f) skipped_for_tick/s=%.1f late/s=%.1f "
+        "extra_render_ms=%.2f (max %.2f, running avg %.2f) rng_restored=%llu",
         t / 1000.0, s.cap, (d3d8_PresentSeq() - P.present0) / el, P.ticks_ev / el, race_tps,
         P.extra / el, P.extra_ok / el, P.refused / el, P.skip_tick / el, P.late / el,
         P.extra_ok ? P.extra_ms / P.extra_ok : 0.0, P.extra_max, s.avg_render, P.rng_restored);
     if (s.check)
-        fprintf(stderr, " | etat[n=%llu rng=%llu course=%llu riders=%llu audio=%llu etat_jeu=%llu app=%llu] pages[balayages=%llu modifiees=%llu]",
+        fprintf(stderr, " | state[n=%llu rng=%llu race=%llu riders=%llu audio=%llu game_state=%llu app=%llu] pages[scans=%llu changed=%llu]",
             P.snaps, P.d_rng, P.d_race, P.d_rider, P.d_audio, P.d_state, P.d_app, P.page_scans, P.page_changed);
     if (I.on)
-        fprintf(stderr, " | interp[n=%llu memoire!=tick=%llu alpha>=1=%llu coupe_cam=%llu coupe_rider=%llu os_non_interp=%llu riders_restaures=%llu] saccades_ignorees=%llu",
+        fprintf(stderr, " | interp[n=%llu memory!=tick=%llu alpha>=1=%llu cam_cut=%llu rider_cut=%llu bones_not_interp=%llu riders_restored=%llu] stalls_ignored=%llu",
                 I.n_interp, I.n_mismatch, I.n_alpha1, I.n_cut_cam, I.n_cut_rider, I.n_badrot, P.rider_restored, s_outliers);
-    fprintf(stderr, " course_tick=%u etat=%u\n", rt, race ? MEM32(race + 0x1Cu) : 0);
+    fprintf(stderr, " race_tick=%u state=%u\n", rt, race ? MEM32(race + 0x1Cu) : 0);
     fflush(stderr);
 #define ACC(f) S.f += P.f
     ACC(rng_restored); ACC(rider_restored); ACC(hook_calls); ACC(ticks_ev); ACC(extra); ACC(extra_ok); ACC(refused); ACC(skip_tick); ACC(late);
@@ -318,13 +324,13 @@ static void report(int force)
         if (force) last_cum = t;
     }
     if (s.check && force) {
-        fprintf(stderr, "[FPSCAP] cumul : RNG tires puis restaures dans %llu rendus en plus\n", S.rng_restored);
-        fprintf(stderr, "[FPSCAP] cumul : rendus en plus %llu (faits %llu) ; differences rng=%llu course=%llu riders=%llu audio=%llu etat_jeu=%llu app=%llu\n",
+        fprintf(stderr, "[FPSCAP] total: RNG drawn then restored in %llu extra renders\n", S.rng_restored);
+        fprintf(stderr, "[FPSCAP] total: extra renders %llu (done %llu); differences rng=%llu race=%llu riders=%llu audio=%llu game_state=%llu app=%llu\n",
             S.extra, S.extra_ok, S.d_rng, S.d_race, S.d_rider, S.d_audio, S.d_state, S.d_app);
         hist_report();
         {
             int i;
-            fprintf(stderr, "[FPSCAP]   fonctions de rendu (va:appels/faits)");
+            fprintf(stderr, "[FPSCAP]   render functions (va:calls/done)");
             for (i = 0; i < 16 && s_rva[i].va; i++) fprintf(stderr, " %06X:%llu/%llu", s_rva[i].va, s_rva[i].n, s_rva[i].ok);
             fputc('\n', stderr);
         }
@@ -332,35 +338,35 @@ static void report(int force)
     }
 }
 
-/* Fidélité : le rendu d'InGameState (0xAB610) décompte un saut d'images
- * [état+0x6C] à chaque appel ; un rendu en plus le consommerait plus vite
- * qu'à l'origine. Pas de rendu en plus tant qu'il est > 0. */
+/* Fidelity: the InGameState render (0xAB610) counts down a frame skip
+ * [state+0x6C] on every call; an extra render would consume it faster than
+ * the original. No extra render while it is > 0. */
 static int extra_allowed(uint32_t app)
 {
     uint32_t st = MEM32(app + 4u), va;
     if (st < 0x1000u) return 0;
     va = MEM32(MEM32(st) + 0x18u);
-    /* Liste blanche: course (InGameState 0xAB610) et menus (0x7CBD0),
-     * vérifiés sans effet logique. Les autres états (démarrage, vidéos,
-     * chargements) font avancer la machine d'états dans leur rendu ou
-     * bloquent : rendu en plus interdit, comme à l'origine. */
+    /* Allow list: race (InGameState 0xAB610) and menus (0x7CBD0), checked to
+     * have no logic effect. The other states (boot, videos, loading) advance
+     * the state machine in their render or block: no extra render, as in the
+     * original. */
     if (va == 0x000AB610u) return (int32_t)MEM32(st + 0x6Cu) <= 0;
     return va == 0x0007CBD0u;
 }
 
-/* ── interpolation ─────────────────────────────────────────
- * Un rendu montre lerp(tick N-1, tick N, alpha), alpha = temps depuis le
- * tick N / 16,67 ms : le rendu normal (juste après le tick) comme les rendus
- * en plus. Affichage décalé d'un tick (latence +16,7 ms), aucune extrapolation.
- * États :
- *   InGameState +0xB0 + i×0x80 (vue i < [+0x298]) : position caméra (4 f),
- *     matrice de vue +0xC0 (lignes 0-2 = rotation, ligne 3 = -c·R),
- *     projection +0x100 / +0x104 ;
- *   rider +0x170 (position, 4 f) et pose +0x48B0 : 21 matrices 4×4 en
- *     coordonnées MONDE (rotation orthonormée + translation).
- * Tout est écrit au tick seulement ; le rendu ne les écrit pas (vérifié).
- * Avant chaque rendu : la mémoire doit être égale à la copie du tick N (sinon
- * pas d'interpolation) ; après : la copie du tick N est réécrite (au bit près). */
+/* ── interpolation ────────────────────────────────────────────────
+ * A render shows lerp(tick N-1, tick N, alpha), alpha = time since tick N /
+ * 16.67 ms: the normal render (right after the tick) as well as the extra
+ * ones. Display is one tick late (+16.7 ms latency), no extrapolation.
+ * State (measured):
+ *   InGameState +0xB0 + i*0x80 (view i < [+0x298]): camera position (4 f),
+ *     view matrix +0xC0 (rows 0-2 = rotation, row 3 = -c*R),
+ *     projection +0x100 / +0x104;
+ *   rider +0x170 (position, 4 f) and pose +0x48B0: 21 4x4 matrices in
+ *     WORLD space (orthonormal rotation + translation).
+ * All of it is written by the tick only; the render never writes it.
+ * Before each render: memory must equal the copy of tick N (else no
+ * interpolation); after: the copy of tick N is written back (bit exact). */
 
 static uint32_t vs_layout(VS *v, uint32_t st)
 {
@@ -412,7 +418,7 @@ static int vs_equals_mem(const VS *v)
     return 1;
 }
 
-/* Quaternion d'une matrice de rotation 3×3 (lignes m[0..2], stride 4). */
+/* Quaternion of a 3x3 rotation matrix (rows m[0..2], stride 4). */
 static void m2q(const float *m, float q[4])
 {
     float tr = m[0] + m[5] + m[10], s;
@@ -439,9 +445,9 @@ static void q2m(const float q[4], float *m)
     m[8] = 2 * (x * z + y * w);     m[9] = 2 * (y * z - x * w);     m[10] = 1 - 2 * (x * x + y * y);
 }
 
-/* Rotation 3×3 (lignes de m) presque orthonormée ; renvoie +1 (directe),
- * -1 (indirecte : la matrice de vue du jeu a un déterminant -1) ou 0, et les
- * normes des lignes. */
+/* Near-orthonormal 3x3 rotation (rows of m); returns +1 (proper), -1
+ * (improper: the game's view matrix has determinant -1) or 0, and the row
+ * norms. */
 static int rot_ok(const float *m, float n[3])
 {
     int i;
@@ -455,13 +461,13 @@ static int rot_ok(const float *m, float n[3])
     return d > 0.98f && d < 1.02f ? 1 : (d < -0.98f && d > -1.02f ? -1 : 0);
 }
 
-/* Rotation interpolée (slerp), normes des lignes interpolées. dot = cos(demi-angle). */
+/* Interpolated rotation (slerp), interpolated row norms. dot = cos(half angle). */
 static int rot_lerp(const float *a, const float *b, float t, float *o, float min_dot)
 {
     float na[3], nb[3], ua[12], ub[12], qa[4], qb[4], q[4], d, l;
     int i, j, sa = rot_ok(a, na), sb = rot_ok(b, nb);
     if (!sa || sa != sb) return 0;
-    if (sa < 0) { na[2] = -na[2]; nb[2] = -nb[2]; }   /* ligne 2 retournée : rotation directe, remise à la fin */
+    if (sa < 0) { na[2] = -na[2]; nb[2] = -nb[2]; }   /* row 2 flipped: proper rotation, restored at the end */
     for (i = 0; i < 3; i++) for (j = 0; j < 3; j++) { ua[4 * i + j] = a[4 * i + j] / na[i]; ub[4 * i + j] = b[4 * i + j] / nb[i]; }
     m2q(ua, qa); m2q(ub, qb);
     d = qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3];
@@ -486,13 +492,13 @@ static float dist3(const float *a, const float *b)
     return sqrtf(x * x + y * y + z * z);
 }
 
-/* Vue : bloc +0xB0 (22 f) : [0..3] position, [4..19] matrice de vue, [20], [21] projection. */
+/* View: block +0xB0 (22 f): [0..3] position, [4..19] view matrix, [20], [21] projection. */
 static int view_lerp(const float *a, const float *b, float t, float *o)
 {
     float ca[3], cb[3], c[3], *m = o + 4;
     const float *ma = a + 4, *mb = b + 4;
     int i, j, r;
-    /* position caméra déduite de la matrice : c = -t·Rᵀ */
+    /* camera position from the matrix: c = -t*R^T */
     for (i = 0; i < 3; i++) {
         ca[i] = -(ma[12] * ma[4 * i] + ma[13] * ma[4 * i + 1] + ma[14] * ma[4 * i + 2]);
         cb[i] = -(mb[12] * mb[4 * i] + mb[13] * mb[4 * i + 1] + mb[14] * mb[4 * i + 2]);
@@ -508,7 +514,7 @@ static int view_lerp(const float *a, const float *b, float t, float *o)
     return 1;
 }
 
-/* Rider : position + 21 os. Téléportation (os racine) → état N. */
+/* Rider: position + 21 bones. Teleport (root bone) -> state N. */
 static int rider_lerp(const float *pa, const float *pb, const float *ka, const float *kb, float t, float *po, float *ko)
 {
     uint32_t b;
@@ -518,23 +524,23 @@ static int rider_lerp(const float *pa, const float *pb, const float *ka, const f
     for (b = 0; b < POSE_N; b++) {
         const float *x = ka + 16 * b, *y = kb + 16 * b;
         float *o = ko + 16 * b;
-        if (rot_lerp(x, y, t, o, BONE_CUT_COS) <= 0) { I.n_badrot++; continue; }   /* reste à N */
+        if (rot_lerp(x, y, t, o, BONE_CUT_COS) <= 0) { I.n_badrot++; continue; }   /* stays at N */
         for (i = 0; i < 3; i++) o[12 + i] = x[12 + i] + (y[12 + i] - x[12 + i]) * t;
     }
     return 1;
 }
 
-/* Journal des coupes (XBOX_FPS_CAP_LOG=1, 40 premières) : état de course et saut de position. */
+/* Cut log (XBOX_FPS_CAP_LOG=1, first 40): race state and position jump. */
 static void cut_note(const char *what, uint32_t va, const float *a, const float *b)
 {
     static int n;
     uint32_t race = race_ptr();
     if (!s.log || n++ >= 40) return;
-    fprintf(stderr, "[INTERP] coupe %s %08X : etat=%u tick=%u saut=%.1f unites\n", what, va,
+    fprintf(stderr, "[INTERP] cut %s %08X: state=%u tick=%u jump=%.1f units\n", what, va,
             race ? MEM32(race + 0x1Cu) : 0, race ? MEM32(race + 0x18u) : 0, dist3(a, b));
 }
 
-/* Écrit l'état interpolé avant un rendu d'InGameState ; 1 si écrit. */
+/* Writes the interpolated state before an InGameState render; 1 if written. */
 static int interp_begin(uint32_t st)
 {
     double a;
@@ -542,11 +548,14 @@ static int interp_begin(uint32_t st)
     uint32_t k;
     VS *o = &I.out;
     I.written = 0;
+    I.mode = 3; I.alpha = 0.0f;
     if (!I.on || !I.ok || I.cur.st != st || GetCurrentThreadId() != s.tid) return 0;
-    if (!vs_equals_mem(&I.cur)) { I.n_mismatch++; return 0; }
+    if (!vs_equals_mem(&I.cur)) { I.n_mismatch++; I.mode = 2; return 0; }
     a = (now_ms() - I.t_tick) / TICK_MS;
-    if (I.synth && s.dup > 0) a = (double)s_dup_k / (s.dup + 1);   /* test DUP : temps synthétique */
-    if (a >= 1.0) { I.n_alpha1++; return 0; }
+    if (I.synth && s.dup > 0) a = (double)s_dup_k / (s.dup + 1);   /* DUP test: synthetic time */
+    I.alpha = (float)a;
+    if (a >= 1.0) { I.n_alpha1++; I.mode = 1; return 0; }
+    I.mode = 0;
     if (a < 0.0) a = 0.0;
     t = (float)a;
     memcpy(o, &I.cur, sizeof *o - sizeof o->w + I.cur.nw * sizeof(float));
@@ -570,7 +579,7 @@ static int interp_begin(uint32_t st)
     if (I.log && I.n_logged < (unsigned long long)I.log) {
         uint32_t race = race_ptr();
         if (race && MEM32(race + 0x1Cu) == 4u && MEM32(race + 0x18u) >= I.log_from) {
-            /* vue 0, puis rider 0 : premier bloc position et sa pose (os 0 = racine) */
+            /* view 0, then rider 0: first position block and its pose (bone 0 = root) */
             static const float z[16];
             const float *v = &o->w[0], *r0 = z, *k0 = z;
             for (k = 0; k + 1 < I.cur.n; k++)
@@ -587,15 +596,15 @@ static int interp_begin(uint32_t st)
 static void interp_end(void)
 {
     if (!I.written) return;
-    vs_write(&I.cur);       /* état du tick N, au bit près */
+    vs_write(&I.cur);       /* state of tick N, bit exact */
     I.written = 0;
 }
 
-/* Test XBOX_FPS_CAP_CHECK=3 : le même rendu en plus refait SANS
- * interpolation depuis le même état ; les mots des riders (et le RNG) qui
- * diffèrent entre les deux rendus sont des valeurs écrites par le rendu qui
- * DÉPENDENT de l'état interpolé. Sert à juger le rendu normal (qui garde ses
- * écritures). Deux Presents par rendu en plus : mesure seulement. */
+/* Test XBOX_FPS_CAP_CHECK=3: the same extra render done again WITHOUT
+ * interpolation from the same state; the rider words (and RNG) that differ
+ * between the two renders are values written by the render that DEPEND on the
+ * interpolated state. Used to judge the normal render (which keeps its
+ * writes). Two Presents per extra render: measurement only. */
 static uint32_t *s_dep_hist;
 static unsigned long long s_dep_runs, s_dep_diff, s_dep_rng;
 static void dep_experiment(uint32_t app, const uint32_t *rva, uint8_t (*rsv)[0x5A00], uint32_t nr, const uint32_t *rng)
@@ -620,14 +629,14 @@ static void dep_experiment(uint32_t app, const uint32_t *rva, uint8_t (*rsv)[0x5
     s_dep_runs++; s_dep_diff += any;
     if (s_dep_runs % 200u == 0u) {
         uint32_t shown = 0;
-        fprintf(stderr, "[FPSCAP] dependance a l'interpolation : %llu essais, %llu avec mots riders differents, %llu avec RNG different ; mots (offset:nb)",
+        fprintf(stderr, "[FPSCAP] dependence on the interpolation: %llu tries, %llu with different rider words, %llu with different RNG; words (offset:count)",
                 s_dep_runs, s_dep_diff, s_dep_rng);
         for (w = 0; w < 0x5A00u / 4u && shown < 64; w++) if (s_dep_hist[w]) { fprintf(stderr, " +%X:%u", w * 4, s_dep_hist[w]); shown++; }
         fputc('\n', stderr);
     }
 }
 
-/* ── un rendu en plus ─────────────────────────────────────────── */
+/* ── one extra render ─────────────────────────────────────────── */
 
 static int extra_render(uint32_t app)
 {
@@ -646,23 +655,23 @@ static int extra_render(uint32_t app)
     t0 = now_ms();
     {
         unsigned seq0 = d3d8_PresentSeq();
-        if (s.check == 2) {             /* témoin : même durée, sans rendu */
+        if (s.check == 2) {             /* control: same duration, no render */
             double until = now_ms() + (s.avg_render > 0.0 ? s.avg_render : 8.0);
             while (now_ms() < until) Sleep(0);
             ok = 1;
         } else {
-            /* Fidélité : le rendu d'InGameState tire le RNG A pendant le
-             * survol d'intro (état de course 1) ; un rendu en
-             * plus décalerait la suite des tirages de la logique. États RNG
-             * A et B (6 + 6 mots, 0x1FAD70) remis tels qu'avant le rendu. */
+            /* Fidelity: the InGameState render draws from RNG A during the
+             * intro fly-over (race state 1); an extra render would shift the
+             * sequence the logic draws. RNG states A and B (6 + 6 words,
+             * 0x1FAD70) restored as they were before the render. */
             uint32_t rng[12], i;
             static uint8_t rsv[NR_MAX][0x5A00];
             uint32_t rva[NR_MAX], nr = 0, race = race_ptr();
             for (i = 0; i < 12; i++) rng[i] = MEM32(0x001FAD70u + 4u * i);
-            /* Interpolation : le rendu calcule quelques dérivés de pose dans le
-             * rider (+0x4DF0..) à partir de l'état interpolé ; un rendu
-             * en plus n'existe pas à l'origine → riders entiers remis tels
-             * qu'avant (0x5A00 o chacun). */
+            /* Interpolation: the render derives a few pose values in the
+             * rider (+0x4DF0..) from the interpolated state; an extra render
+             * does not exist in the original -> whole riders restored as they
+             * were before (0x5A00 bytes each). */
             if (I.on && race && MEM32(MEM32(app + 4u)) && MEM32(MEM32(MEM32(app + 4u)) + 0x18u) == 0x000AB610u) {
                 nr = MEM32(race + 0x88u); if (nr > NR_MAX) nr = NR_MAX;
                 for (i = 0; i < nr; i++) {
@@ -690,14 +699,14 @@ static int extra_render(uint32_t app)
                 for (i = 0; i < 12; i++) MEM32(0x001FAD70u + 4u * i) = rng[i];
             }
         }
-        /* T4 : quels Presents sont des doublons, dans la fenêtre XBOX_D3D_DUMP_FROM. */
+        /* T4: which Presents are duplicates, within the XBOX_D3D_DUMP_FROM window. */
         if (s.dump_from && seq0 + 1u >= s.dump_from && seq0 < s.dump_from + 64u)
-            fprintf(stderr, "[FPSCAP] rendu en plus : present %u -> %u (ok=%d)\n", seq0, d3d8_PresentSeq(), ok);
+            fprintf(stderr, "[FPSCAP] extra render: present %u -> %u (ok=%d)\n", seq0, d3d8_PresentSeq(), ok);
     }
     d = now_ms() - t0;
     P.extra++;
     if (ok) {
-        if (!s_measured) render_time(d);   /* menus : rendu non mesuré par hook_AB610 */
+        if (!s_measured) render_time(d);   /* menus: render not measured by hook_AB610 */
         P.extra_ok++; P.extra_ms += d;
         if (d > P.extra_max) P.extra_max = d;
     } else {
@@ -725,24 +734,66 @@ static int extra_render(uint32_t app)
     return ok;
 }
 
-/* ── test : XBOX_FPS_CAP_DUP=N ────────────────────────────────────
- * Après chaque rendu réussi d'InGameState (0xAB610), N rendus en plus
- * sans tick, collés. Même opération que le cap (rendu sans tick), mais
- * forcée : sert au critère « 0 différence sur ≥ 10 000 rendus en course »
- * sur une machine où le rendu de course dépasse le tick (l'attente
- * 0xAA296 n'est alors jamais atteinte). Équivalent de XBOX_C019_EXTRA. */
+/* ── test: XBOX_FPS_CAP_DUP=N ─────────────────────────────────────
+ * After each successful InGameState render (0xAB610), N extra renders
+ * without a tick, back to back. Same operation as the cap (render without a
+ * tick), but forced: checks "0 difference over >= 10,000 race renders" on a
+ * machine where the race render is longer than the tick (the wait at
+ * 0xAA296 is then never reached). Same as XBOX_C019_EXTRA. */
 void sub_000AB610(void);
 
-/* Test (XBOX_FPS_CAP_STALL=s:ms) : une seule saccade simulée de ms dans un
- * rendu normal, s secondes après le démarrage ; prouve que la cadence repart. */
+/* Test (XBOX_FPS_CAP_STALL=s:ms): one simulated stall of ms in a normal
+ * render, s seconds after start; shows the pacing recovers. */
 static double s_stall_at, s_stall_ms, s_t0_run;
 static void maybe_stall(void)
 {
     if (s_stall_ms > 0.0 && !s_in_extra && now_ms() - s_t0_run >= s_stall_at * 1000.0) {
-        fprintf(stderr, "[FPSCAP] saccade simulee : %.0f ms\n", s_stall_ms);
+        fprintf(stderr, "[FPSCAP] simulated stall: %.0f ms\n", s_stall_ms);
         Sleep((DWORD)s_stall_ms);
         s_stall_ms = 0.0;
     }
+}
+
+/* Test (XBOX_FPS_INTERP_JANK=every:ms): one slow render (ms of busy wait
+ * inside it) every `every` InGameState renders in race (state 4), normal or
+ * extra; reproduces the stutters of a heavy scene. */
+static int s_jank_every;
+static double s_jank_ms;
+static unsigned s_jank_n;
+
+/* Trace (XBOX_FPS_INTERP_TRACE=file): one line per InGameState render on the
+ * loop thread ("R"), per race tick ("T") and per injected stall ("J"); times
+ * in ms since start. R: t_start t_end present tick race_state extra mode alpha
+ * camera(3) rider0(3) camera_step(3) rider0_step(3) -- step = tick N - tick N-1. */
+static FILE *s_trace;
+static unsigned s_trace_n;
+
+static void trace_flush(void)
+{
+    if (s_trace && (++s_trace_n & 255u) == 0u) fflush(s_trace);
+}
+
+/* cam / rp: camera and rider 0 positions as the render saw them. */
+static void trace_render(uint32_t race, double t0, double t1, const float *cam, const float *rp)
+{
+    uint32_t k;
+    float cv[3] = { 0, 0, 0 }, rv[3] = { 0, 0, 0 };
+    if (!race) return;
+    if (I.ok) {
+        int cvdone = 0, rvdone = 0;
+        for (k = 0; k < I.cur.n; k++) {
+            const Span *p = &I.cur.sp[k];
+            float *dst = NULL;
+            int i;
+            if (p->kind == SP_VIEW && !cvdone) { dst = cv; cvdone = 1; }
+            else if (p->kind == SP_POS && !rvdone) { dst = rv; rvdone = 1; }
+            if (dst) for (i = 0; i < 3; i++) dst[i] = I.cur.w[p->off + i] - I.prev.w[p->off + i];
+        }
+    }
+    fprintf(s_trace, "R %.3f %.3f %u %u %u %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+            t0 - s_t0_run, t1 - s_t0_run, d3d8_PresentSeq(), MEM32(race + 0x18u), MEM32(race + 0x1Cu), s_in_extra,
+            I.mode, I.alpha, cam[0], cam[1], cam[2], rp[0], rp[1], rp[2], cv[0], cv[1], cv[2], rv[0], rv[1], rv[2]);
+    trace_flush();
 }
 
 static void hook_AB610(void)
@@ -750,8 +801,25 @@ static void hook_AB610(void)
     uint32_t state = g_ecx, app = MEM32(APP_GLOBAL), sv_eax, sv_ecx, sv_edx;
     double t0 = now_ms();
     int k;
+    double t_in;
     interp_begin(state);
-    sub_000AB610();
+    if (s_trace && GetCurrentThreadId() == s.tid) {
+        /* position as the render sees it (interpolated or tick N) */
+        uint32_t race = race_ptr(), r0 = race && MEM32(race + 0x88u) ? MEM32(race + 0xC4u) : 0;
+        float c[3], r[3] = { 0, 0, 0 };
+        memcpy(c, (const void *)XBOX_PTR(state + VIEW_OFF), sizeof c);
+        if (r0 >= 0x1000u) memcpy(r, (const void *)XBOX_PTR(r0 + POS_OFF), sizeof r);
+        t_in = now_ms();
+        sub_000AB610();
+        if (s_jank_every > 0 && race && MEM32(race + 0x1Cu) == 4u && ++s_jank_n % (unsigned)s_jank_every == 0u) {
+            double until = now_ms() + s_jank_ms;
+            fprintf(s_trace, "J %.3f %.1f\n", now_ms() - s_t0_run, s_jank_ms);
+            while (now_ms() < until) YieldProcessor();
+        }
+        trace_render(race, t_in, now_ms(), c, r);
+    } else {
+        sub_000AB610();
+    }
     interp_end();
     if ((g_eax & 0xFFu) && (!s.tid || GetCurrentThreadId() == s.tid)) {
         maybe_stall();
@@ -770,7 +838,7 @@ static void hook_AB610(void)
     g_eax = sv_eax; g_ecx = sv_ecx; g_edx = sv_edx;
 }
 
-/* Rendu des menus 0x7CBD0 : seulement mesuré (durée pour la cadence). */
+/* Menu render 0x7CBD0: only measured (duration for the pacing). */
 void sub_0007CBD0(void);
 static void hook_7CBD0(void)
 {
@@ -795,11 +863,11 @@ static void hook_B2750(void)
         static int shown;
         if ((s.log || s.check) && shown < 4) {
             shown++;
-            fprintf(stderr, "[FPSCAP] attente de frame : ecx=%08X edi=%u esi=%08X app=%08X [app+0x2C]=%08X tid=%lu\n",
+            fprintf(stderr, "[FPSCAP] frame wait: ecx=%08X edi=%u esi=%08X app=%08X [app+0x2C]=%08X tid=%lu\n",
                     self, g_edi, g_esi, app, app >= 0x1000u ? MEM32(app + 0x2Cu) : 0, GetCurrentThreadId());
         }
     }
-    /* Seulement l'attente de la boucle principale en 0xAA296 (aucun tick fait). */
+    /* Only the main loop's wait at 0xAA296 (no tick done). */
     if (g_edi != 0u || app < 0x1000u || g_esi != app || MEM32(app + 0x2Cu) != self
         || (s.tid && GetCurrentThreadId() != s.tid)) {
         g_ecx = self;
@@ -809,14 +877,23 @@ static void hook_B2750(void)
     if (!s.tid) s.tid = GetCurrentThreadId();
     handle = MEM32(self + 4u);
     t = now_ms();
-    /* Le rendu normal vient de se faire (tick → rendu → attente). */
+    /* The normal render just happened (tick -> render -> wait). */
     if (s.next_render < s.last_tick_ret) s.next_render = s.last_tick_ret + s.period_ms;
 
+    s.tick_fresh = 0;
     for (;;) {
         double expected_tick = s.last_tick_ret + TICK_MS, wait_until, rem;
         t = now_ms();
+        /* The next tick is produced by the game's 60 Hz timer one period
+         * after the previous one, whenever it was consumed (a late consumption
+         * would otherwise push the expected tick, and the extra renders, later
+         * every time). */
+        if (I.clock && I.on && I.t_est > 0.0 && t - I.t_est < 10.0 * TICK_MS) expected_tick = I.t_est + TICK_MS;
+        /* Already signaled (produced during the previous render, time
+         * unknown): tick now, not fresh. */
+        if (guest_wait(handle, 0) == WAIT_OBJ_0) goto tick;
         wait_until = s.next_render;
-        /* Un rendu en plus qui finirait après le tick attendu retarderait la logique : on attend le tick. */
+        /* An extra render ending after the expected tick would delay the logic: wait for the tick. */
         if (!s.noskip && s.avg_render > 0.0 && wait_until + s.avg_render > expected_tick && t < expected_tick + TICK_MS) {
             wait_until = 1e300;
             P.skip_tick++;
@@ -826,26 +903,28 @@ static void hook_B2750(void)
             uint32_t ms = rem > 1e8 ? 0xFFFFFFFFu : (uint32_t)(rem - 1.0);
             if (ms != 0xFFFFFFFFu && wait_until == 1e300) ms = 0xFFFFFFFFu;
             r = guest_wait(handle, ms);
-            if (r != WAIT_TIMEOUT_) break;      /* signalé (ou erreur : comme l'original, on rend la main) */
+            if (r != WAIT_TIMEOUT_) { s.tick_fresh = r == WAIT_OBJ_0; break; }   /* signaled (or error: return, as the original does) */
             if (wait_until == 1e300) continue;
         }
-        /* Fin d'attente fine (< ~1,5 ms) en sondant l'événement. */
+        /* Fine end of the wait (< ~1.5 ms) by polling the event. */
         while ((t = now_ms()) < wait_until) {
-            if (guest_wait(handle, 0) == WAIT_OBJ_0) goto tick;
+            if (guest_wait(handle, 0) == WAIT_OBJ_0) { s.tick_fresh = 1; goto tick; }
             YieldProcessor();
             if (wait_until - t > 0.3) Sleep(0);
         }
-        if (guest_wait(handle, 0) == WAIT_OBJ_0) break;   /* un tick dû passe avant */
+        if (guest_wait(handle, 0) == WAIT_OBJ_0) { s.tick_fresh = 1; break; }   /* a due tick goes first */
         if (t > s.next_render + 1.0) P.late++;
-        if (!extra_allowed(app)) {          /* attendre le tick (compteur de saut en cours) */
+        if (!extra_allowed(app)) {          /* wait for the tick (frame skip in progress) */
             r = guest_wait(handle, 0xFFFFFFFFu);
+            s.tick_fresh = 1;
             break;
         }
-        if (!extra_render(app)) {           /* refusé : comme 0xAA28B, on attend le tick */
+        if (!extra_render(app)) {           /* refused: as 0xAA28B does, wait for the tick */
             r = guest_wait(handle, 0xFFFFFFFFu);
+            s.tick_fresh = 1;
             break;
         }
-        /* Pas de rattrapage : au plus un rendu en retard. */
+        /* No catch-up: one render late at most. */
         s.next_render += s.period_ms;
         t = now_ms();
         if (s.next_render < t) s.next_render = t;
@@ -854,14 +933,15 @@ static void hook_B2750(void)
 tick:
     P.ticks_ev++;
     s.last_tick_ret = now_ms();
+    s.from_wait = 1;
     s.next_render = s.last_tick_ret + s.period_ms;
     report(0);
-    g_eax = 0;            /* WAIT_OBJECT_0, comme l'original */
+    g_eax = 0;            /* WAIT_OBJECT_0, as the original */
     g_ecx = self;
-    g_esp += 4;           /* ret (retour fictif) */
+    g_esp += 4;           /* ret (dummy return address) */
 }
 
-/* ── hook du tick de course 0xAD4A0 (InGameState vt+0x14) ──────── */
+/* ── race tick hook 0xAD4A0 (InGameState vt+0x14) ──────────────── */
 void sub_000AD4A0(void);
 static int s_dump_at;
 
@@ -871,7 +951,7 @@ static void dump_floats(const char *tag, uint32_t va, uint32_t len)
     for (o = 0; o < len; o += 16) {
         const float *f = (const float *)XBOX_PTR(va + o);
         const uint32_t *u = (const uint32_t *)XBOX_PTR(va + o);
-        fprintf(stderr, "[DUMP] %s+%X : %12.4f %12.4f %12.4f %12.4f | %08X %08X %08X %08X\n",
+        fprintf(stderr, "[DUMP] %s+%X: %12.4f %12.4f %12.4f %12.4f | %08X %08X %08X %08X\n",
                 tag, o, f[0], f[1], f[2], f[3], u[0], u[1], u[2], u[3]);
     }
 }
@@ -881,7 +961,7 @@ static void hook_AD4A0(void)
     uint32_t app = MEM32(APP_GLOBAL), st = app >= 0x1000u ? MEM32(app + 4u) : 0, race;
     double t = now_ms();
     int pre = 0;
-    if (I.written) interp_end();     /* par sûreté : jamais de tick sur un état interpolé */
+    if (I.written) interp_end();     /* to be safe: never a tick on an interpolated state */
     if (I.on && vs_layout(&I.pre, st)) { vs_read(&I.pre); pre = 1; }
     sub_000AD4A0();
     if (I.on) {
@@ -891,9 +971,31 @@ static void hook_AD4A0(void)
             memcpy(&I.prev, &I.pre, sizeof I.prev);
             I.ok = 1;
         }
-        /* début du tick : retour de l'attente de frame si ce tick la suit, sinon maintenant */
-        I.t_tick = (t >= s.last_tick_ret && t - s.last_tick_ret < TICK_MS) ? s.last_tick_ret : t;
+        /* Old clock: tick start = return of the frame wait if this tick
+         * follows it by less than a tick, else now. A tick consumed late
+         * (after a slow render, or the 2nd tick of a catch-up) then gets a
+         * wrong time: alpha restarts late (the motion slows down, then jumps)
+         * or uses the previous wait (it overshoots, then freezes at N). */
+        double old = (t >= s.last_tick_ret && t - s.last_tick_ret < TICK_MS) ? s.last_tick_ret : t;
+        /* New clock: the time the game's timer produced this tick. Exact when
+         * the wait saw the event signaled while waiting; otherwise one period
+         * after the previous tick's (the timer is regular), never later than
+         * now. Re-anchored after a pause (> 10 ticks). */
+        double est;
+        if (s.from_wait && s.tick_fresh) est = s.last_tick_ret;
+        else if (I.t_est > 0.0 && t - I.t_est < 10.0 * TICK_MS) { est = I.t_est + TICK_MS; if (est > t) est = t; }
+        else { est = s.from_wait ? s.last_tick_ret : t; if (t - est > TICK_MS) est = t; }
+        if (est > t) est = t;
+        I.t_est = est;
+        I.t_tick = I.clock ? est : old;
+        if (s_trace) {
+            uint32_t rc = race_ptr();
+            fprintf(s_trace, "T %.3f %u %d %d %.3f %.3f\n", t - s_t0_run, rc ? MEM32(rc + 0x18u) : 0, s.from_wait, s.tick_fresh,
+                    est - s_t0_run, old - s_t0_run);
+            trace_flush();
+        }
     }
+    s.from_wait = 0;
     race = race_ptr();
     if (s_dump_at && race && MEM32(race + 0x1Cu) == 4u) {
         uint32_t rt = MEM32(race + 0x18u), r0 = MEM32(race + 0xC4u), k;
@@ -918,34 +1020,58 @@ static void fps_cap_atexit(void) { if (g_fps_cap_on) report(1); }
 
 void fps_cap_init(void)
 {
-    const char *e = getenv("XBOX_FPS_CAP");
+    extern int d3d8_monitor_hz(HWND hwnd);     /* d3d8_sync.h */
+    const char *e = getenv("XBOX_FPS_CAP"), *sy = getenv("XBOX_SYNC");
     LARGE_INTEGER f;
-    int cap = 60;
-    if (e && *e) {
+    int cap = 60, hz = d3d8_monitor_hz(NULL);
+    if (e && !_stricmp(e, "monitor")) {
+        /* Refresh rate of the primary monitor (the game window opens there);
+         * 60 Hz or less, or unknown: 60 = hook not installed. */
+        cap = hz > 61 && hz <= 1000 ? hz : 60;
+        fprintf(stderr, "[FPSCAP] XBOX_FPS_CAP=monitor: display %d Hz -> cap %d\n", hz, cap);
+    } else if (e && *e) {
         char *end;
         long v = strtol(e, &end, 10);
         if (*end || v < 0 || v > 1000 || (v > 0 && v < 60)) {
-            fprintf(stderr, "[FPSCAP] XBOX_FPS_CAP=%s invalide (0 | 60..1000) : 60\n", e);
+            fprintf(stderr, "[FPSCAP] XBOX_FPS_CAP=%s invalid (0 | 60..1000): 60\n", e);
             v = 60;
         }
         cap = (int)v;
     }
-    if (cap == 60) return;    /* défaut : hook non installé */
+    /* With VSync / Adaptive, a cap above the monitor (or no limit) makes the
+     * pump's Present wait on every extra frame, which delays the game (49 fps,
+     * 18 % of frames held at 60 Hz): the cap is lowered to the refresh rate.
+     * XBOX_FPS_CAP_SYNC_CLAMP=0 (test): no clamp. */
+    if (sy && (!_stricmp(sy, "vsync") || !_stricmp(sy, "adaptive")) && hz > 0
+        && (cap == 0 || cap > hz) && !((e = getenv("XBOX_FPS_CAP_SYNC_CLAMP")) && e[0] == '0')) {
+        int was = cap;
+        cap = hz > 61 && hz <= 1000 ? hz : 60;
+        fprintf(stderr, "[FPSCAP] XBOX_SYNC=%s: cap %d lowered to the display (%d Hz) -> %d\n", sy, was, hz, cap);
+    }
+    if (cap == 60) return;    /* default: hook not installed */
     QueryPerformanceFrequency(&f);
     s.freq = (double)f.QuadPart;
     s.cap = cap;
     s.period_ms = cap ? 1000.0 / cap : 0.0;
     e = getenv("XBOX_FPS_CAP_LOG");   s.log = e && e[0] == '1';
-    e = getenv("XBOX_FPS_CAP_CHECK"); s.check = e ? atoi(e) : 0;   /* 1 = instrument, 2 = témoin sans rendu */
-    e = getenv("XBOX_FPS_CAP_DUP"); s.dup = e ? atoi(e) : 0;     /* test, voir hook_AB610 */
+    e = getenv("XBOX_FPS_CAP_CHECK"); s.check = e ? atoi(e) : 0;   /* 1 = probe, 2 = control without render */
+    e = getenv("XBOX_FPS_CAP_DUP"); s.dup = e ? atoi(e) : 0;     /* test, see hook_AB610 */
     e = getenv("XBOX_FPS_INTERP_DUMP"); s_dump_at = e ? atoi(e) : 0;
-    e = getenv("XBOX_FPS_INTERP"); I.on = e && *e ? e[0] == '1' : 1;     /* défaut 1 quand cap != 60 */
+    e = getenv("XBOX_FPS_INTERP"); I.on = e && *e ? e[0] == '1' : 1;     /* default 1 when cap != 60 */
     e = getenv("XBOX_FPS_INTERP_SYNTH"); I.synth = e && e[0] == '1';   /* test DUP : alpha = k / (DUP + 1) */
     e = getenv("XBOX_FPS_INTERP_LOG");
     if (e && *e) { I.log = atoi(e); e = strchr(e, '@'); I.log_from = e ? (uint32_t)atoi(e + 1) : 0; }
     e = getenv("XBOX_FPS_CAP_STALL");
     if (e && *e) { s_stall_at = atof(e); e = strchr(e, ':'); s_stall_ms = e ? atof(e + 1) : 0.0; }
-    e = getenv("XBOX_FPS_CAP_NOSKIP"); s.noskip = e && e[0] == '1';   /* test : rendre même si ça retarde le tick */
+    e = getenv("XBOX_FPS_INTERP_CLOCK"); I.clock = !(e && e[0] == '0');   /* 0 = old clock (comparison) */
+    e = getenv("XBOX_FPS_INTERP_JANK");
+    if (e && *e) { s_jank_every = atoi(e); e = strchr(e, ':'); s_jank_ms = e ? atof(e + 1) : 0.0; }
+    e = getenv("XBOX_FPS_INTERP_TRACE");
+    if (e && *e) {
+        s_trace = fopen(e, "w");
+        if (s_trace) setvbuf(s_trace, NULL, _IOFBF, 1 << 16);
+    }
+    e = getenv("XBOX_FPS_CAP_NOSKIP"); s.noskip = e && e[0] == '1';   /* test: render even if it delays the tick */
     e = getenv("XBOX_D3D_DUMP_FROM"); s.dump_from = (e && getenv("XBOX_D3D_DUMP")) ? (unsigned)atoi(e) : 0;
     if (s.check) {
         int rg;
@@ -955,9 +1081,9 @@ void fps_cap_init(void)
     P.t0 = s_t0_run = now_ms();
     g_fps_cap_on = 1;
     atexit(fps_cap_atexit);
-    fprintf(stderr, "[FPSCAP] plafond %d%s (%s ; logique 60 Hz)%s\n",
-            cap, cap ? " images/s" : " = sans limite", I.on ? "interpolation camera + riders" : "doublons sans tick",
-            s.check ? " ; instrument d'etat actif" : "");
+    fprintf(stderr, "[FPSCAP] cap %d%s (%s; logic 60 Hz)%s\n",
+            cap, cap ? " fps" : " = no limit", I.on ? "camera + riders interpolation" : "duplicates without a tick",
+            s.check ? "; state probe active" : "");
 }
 
 void (*fps_cap_lookup(unsigned int xbox_va))(void)

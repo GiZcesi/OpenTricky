@@ -1,0 +1,30 @@
+OpenTricky -- third-party licences
+==================================
+
+SSX Tricky is a trademark of Electronic Arts. OpenTricky is
+a fan project, not affiliated with or endorsed by EA; it needs your own copy
+of the game (SSX Tricky, USA, Xbox disc image). Nothing from the game's disc
+is included.
+
+The launcher (OpenTricky.exe) is built with the software and fonts below.
+Their licences follow, in full.
+
+  RmlUi 6.3              MIT licence               https://github.com/mikke89/RmlUi
+  SDL 3.4.8              zlib licence              https://libsdl.org
+  FreeType 2.14.3        FreeType License (FTL)    https://freetype.org
+  Inter, Bebas Neue,     SIL Open Font License 1.1 https://github.com/google/fonts
+  Exo 2 (fonts)
+  Bullet (font)          House Industries, licensed font; not covered by the
+                         licences in this file and not to be extracted or
+                         reused on its own.
+
+Portions of this software are copyright (c) 2026 The FreeType Project
+(https://freetype.org).  All rights reserved.
+
+Button icons
+  Xbox and PlayStation button drawings: "FREE Input Prompts Pack" by
+  JulioCacko (https://juliocacko.itch.io/free-input-prompts), Creative Commons
+  Zero (CC0 1.0): no attribution required.
+
+HD textures by Bl4ckH4nd (not included).
+

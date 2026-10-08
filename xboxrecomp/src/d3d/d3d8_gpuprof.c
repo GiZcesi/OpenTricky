@@ -1,6 +1,6 @@
 /*
- * d3d8_gpuprof.c -- temps GPU par passe d'une image.
- * Voir d3d8_gpuprof.h.
+ * d3d8_gpuprof.c -- GPU time per pass of a frame.
+ * See d3d8_gpuprof.h.
  */
 #include "d3d8_internal.h"
 #include "d3d8_gpuprof.h"
@@ -11,8 +11,8 @@
 int g_gpuprof_on;
 
 #define NF    8                 /* images en vol avant relecture */
-#define MAXQ  8192              /* horodatages par image (2 par travail encadré) */
-#define WIN   4096              /* images gardées par fenêtre pour les centiles */
+#define MAXQ  8192              /* timestamps per frame (2 per bracketed piece of work) */
+#define WIN   4096              /* frames kept per window for the percentiles */
 
 static const char *const k_cat_name[GP_N] = {
     "g0", "g1", "g2", "g3", "g4", "g5", "g6", "persp>=7", "hud", "other",
@@ -29,11 +29,11 @@ typedef struct {
 
 static Slot *s_slot;
 static int   s_cur;
-static int   s_in;                      /* une paire est ouverte */
-static int   s_mode;                    /* 1 = par suite de draws de même catégorie, 2 = par draw */
-static int   s_run, s_run_cat;          /* la paire ouverte est une suite de draws */
+static int   s_in;                      /* a pair is open */
+static int   s_mode;                    /* 1 = per run of same-category draws, 2 = per draw */
+static int   s_run, s_run_cat;          /* the open pair is a run of draws */
 static int   s_phase, s_group;
-static unsigned s_flushes, s_note;     /* image en cours de construction */
+static unsigned s_flushes, s_note;     /* frame being built */
 static FILE *s_csv;
 static LARGE_INTEGER s_qf, s_t0;
 
@@ -69,7 +69,7 @@ static void window_print(double secs)
     int len = 0;
     double busy_mean = 0.0, span_mean = 0.0, b50, b95, s50;
     if (!W.frames) {
-        fprintf(stderr, "[GPU] %.1f s : 0 image relue (perdues %u, pas prêtes %u)\n", secs, W.lost, W.notready);
+        fprintf(stderr, "[GPU] %.1f s: 0 frame read back (lost %u, not ready %u)\n", secs, W.lost, W.notready);
         return;
     }
     for (j = 0; j < W.frames && j < WIN; j++) { busy_mean += W.busy[j]; span_mean += W.span[j]; }
@@ -83,11 +83,11 @@ static void window_print(double secs)
         if (W.cat_n[j] && len < (int)sizeof per - 48)
             len += snprintf(per + len, sizeof per - (size_t)len, " %s %.3f (%.0f)",
                             k_cat_name[j], W.cat_ms[j] / W.frames, (double)W.cat_n[j] / W.frames);
-    fprintf(stderr, "[GPU] %.1f s : %u img ; ms GPU/img : occupé moy %.3f p50 %.3f p95 %.3f ; "
-            "span p50 %.3f moy %.3f ; vidages %.1f/img ; perdues %u, pas prêtes %u, débord %u\n",
+    fprintf(stderr, "[GPU] %.1f s: %u frames; GPU ms/frame: busy avg %.3f p50 %.3f p95 %.3f; "
+            "span p50 %.3f avg %.3f; flushes %.1f/frame; lost %u, not ready %u, overflow %u\n",
             secs, W.frames, busy_mean, b50, b95, s50, span_mean,
             (double)W.flushes / W.frames, W.lost, W.notready, W.overflow);
-    fprintf(stderr, "[GPU]   par catégorie, ms/img (encadrés/img) :%s\n", per);
+    fprintf(stderr, "[GPU]   per category, ms/frame (brackets/frame):%s\n", per);
     memset(&W, 0, sizeof W);
 }
 
@@ -95,7 +95,7 @@ static void at_exit(void)
 {
     unsigned j;
     if (!TOT.frames) return;
-    fprintf(stderr, "[GPU] bilan : %llu img ; ms GPU/img : occupé %.3f span %.3f ;",
+    fprintf(stderr, "[GPU] summary: %llu frames; GPU ms/frame: busy %.3f span %.3f;",
             TOT.frames, TOT.busy / TOT.frames, TOT.span / TOT.frames);
     for (j = 0; j < GP_N; j++)
         if (TOT.cat_ms[j] > 0.0) fprintf(stderr, " %s %.3f", k_cat_name[j], TOT.cat_ms[j] / TOT.frames);
@@ -124,7 +124,7 @@ void gpuprof_init(void)
     }
     g_gpuprof_on = 1;
     atexit(at_exit);
-    fprintf(stderr, "[GPU] profil GPU par passe actif%s%s\n", s_csv ? " ; CSV " : "", s_csv ? c : "");
+    fprintf(stderr, "[GPU] per-pass GPU profile active%s%s\n", s_csv ? "; CSV " : "", s_csv ? c : "");
 }
 
 void gpuprof_set_phase(int phase, int group)
@@ -143,7 +143,7 @@ int gpuprof_draw_cat(void)
     }
 }
 
-/* 1 = relue, 0 = pas encore prête. */
+/* 1 = read back, 0 = not ready yet. */
 static int slot_collect(Slot *sl)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
@@ -225,7 +225,7 @@ void gpuprof_begin(int cat)
 {
     Slot *sl;
     if (!g_gpuprof_on) return;
-    if (s_in) gpuprof_end();             /* ferme une suite de draws ouverte */
+    if (s_in) gpuprof_end();             /* closes an open run of draws */
     if (!(sl = slot_open())) return;
     if (sl->n + 2 > MAXQ) { sl->overflow++; return; }
     sl->cat[sl->n / 2] = (unsigned char)cat;
@@ -237,7 +237,7 @@ void gpuprof_end(void)
     if (!g_gpuprof_on || !s_in) return;
     s_in = 0;
     s_run = 0;
-    if (!ts_emit(&s_slot[s_cur])) s_slot[s_cur].n--;   /* paire incomplète : retirée */
+    if (!ts_emit(&s_slot[s_cur])) s_slot[s_cur].n--;   /* incomplete pair: removed */
 }
 
 void gpuprof_count_flush(void)
@@ -262,7 +262,7 @@ void gpuprof_frame(void)
         s_cur = (s_cur + 1) % NF;
     }
     s_flushes = 0; s_note = 0;
-    /* Relire dans l'ordre les images prêtes, la plus ancienne d'abord. */
+    /* Read back the ready frames in order, oldest first. */
     for (i = 0; i < NF; i++) {
         Slot *o = &s_slot[(s_cur + i) % NF];
         if (o->pending && !slot_collect(o)) break;
@@ -280,12 +280,12 @@ void gpuprof_note(unsigned bits)
     if (g_gpuprof_on) s_note |= bits;
 }
 
-/* Draws du jeu. Mode 1 : une seule paire par suite de draws de même
- * catégorie (fermée par un autre travail encadré, un changement de
- * catégorie ou la fin de l'image) -- deux horodatages par draw sérialisent le
- * GPU et gonflent les totaux (2,3 -> 8,3 ms en 640 sur un iGPU). Une
- * suite peut contenir des trous où le GPU attend le CPU : majorant par suite.
- * Mode 2 : une paire par draw (répartition fine, totaux gonflés). */
+/* Game draws. Mode 1: a single pair per run of same-category draws (closed
+ * by another bracketed piece of work, a category change or the end of the
+ * frame) -- two timestamps per draw serialize the GPU and inflate the totals
+ * (2.3 -> 8.3 ms at 640 on an integrated GPU). A run may hold gaps where the
+ * GPU waits for the CPU: an upper bound per run.
+ * Mode 2: one pair per draw (fine breakdown, inflated totals). */
 void gpuprof_draw_begin(void)
 {
     int c;

@@ -227,6 +227,9 @@ uint32_t xbox_tib_alloc_for_thread(uint32_t stack_base, uint32_t stack_limit)
 
 static HANDLE           g_pfifo_pump_thread = NULL;
 static volatile LONG    g_pfifo_pump_running = 0;
+/* Turns of the pump loop; the freeze report (port crashreport.c) says
+ * whether the pump still runs. One increment per turn. */
+volatile uint32_t       g_pump_beats = 0;
 
 /*
  * Sync one channel's fence readback to whatever it's being asked to reach.
@@ -405,7 +408,7 @@ static DWORD WINAPI xbox_vblank_thread(LPVOID param)
     return 0;
 }
 
-/* Temps de traduction du pushbuffer (XBOX_PERF=1). */
+/* Pushbuffer translation time (XBOX_PERF=1). */
 static void perf_pb_tick(uint8_t *mem_base)
 {
     if (g_perf_on) {
@@ -416,6 +419,15 @@ static void perf_pb_tick(uint8_t *mem_base)
         nv2a_live_pb_tick(mem_base);
 }
 
+extern int pgraph_d3d11_reports_pending(void);
+extern int d3d8_pump_alt_off(void);
+static int occ_wait_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_OCCWAIT"); on = !(e && e[0] == '0'); }
+    return on && !d3d8_pump_alt_off();     /* XBOX_FIX_PUMP_ALT=1: every other frame (identity test) */
+}
+
 static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
 {
     uint8_t *mem_base = (uint8_t *)param;
@@ -424,6 +436,7 @@ static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
     int idle = 0;
 
     while (g_pfifo_pump_running) {
+        g_pump_beats++;
         /* Guest .text must not change after load. A jump table at Xbox VA
          * 0x000FB030 (GfxContext_ApplyRenderStateDelta's switch) reads back
          * correct at load and zero by the time the title uses it, and a
@@ -474,7 +487,7 @@ static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
          *
          * So: sample what the title has published, translate everything up to
          * the write pointer (nv2a_live_pb_tick drains it per tick), then
-         * publish the sampled values. Default since the end of part 182:
+         * publish the sampled values. Default because,
          * measured over three character-select runs each, acknowledging first
          * left 8-14 corrupt frames per run (shards, a missing cave) and
          * acknowledging last left none. (The first measurement, which found
@@ -562,6 +575,13 @@ static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
             SwitchToThread();
         } else if (++idle < 8) {
             SwitchToThread();
+        } else if (occ_wait_on() && pgraph_d3d11_reports_pending()) {
+            /* Fork: the title spins on a visibility-test report (LensFX's
+             * sun, Render_ReadVisibilityTestResult) until the pump writes it;
+             * a Sleep(1) here added ~1-2 ms to each such wait. Poll without
+             * sleeping until the report is written -- the same value, only
+             * sooner. XBOX_FIX_PUMP_OCCWAIT=0: the old Sleep(1). */
+            SwitchToThread();
         } else {
             Sleep(1);
         }
@@ -578,6 +598,295 @@ static HANDLE g_mapping_handle = NULL;
 
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
+
+/*
+ * A mirror slot that something else in the process has already claimed
+ * part of cannot take a full view. Rather than leave the whole slot
+ * (g_memory_size, e.g. 140 MB) as a hole, the free parts of it get smaller
+ * views of the matching part of the section, so only the foreign bytes
+ * themselves stay unmapped. Up to this many pieces per slot.
+ */
+#define XBOX_MIRROR_MAX_PARTS 8
+typedef struct {
+    void     *view;
+    uintptr_t slot_off;   /* offset inside the slot == offset inside the section */
+    size_t    len;
+} xbox_mirror_part;
+static xbox_mirror_part g_mirror_parts[XBOX_NUM_MIRRORS][XBOX_MIRROR_MAX_PARTS];
+
+/* Number of mirror slots below the GPU MMIO aperture (set by the mapping loop). */
+static int g_mirror_slots = 0;
+
+/* Address-space reservations held from base selection until each slot is
+ * mapped (see xbox_reserve_layout). */
+static BOOL g_mirror_reserved[XBOX_NUM_MIRRORS];
+static BOOL g_gap_reserved = FALSE;
+
+/*
+ * Test hook (XBOX_TEST_MIRROR_BLOCK=<n>[t]): plant a foreign 64 KB
+ * allocation in the middle of RAM mirror slot <n> (1-based) right after the
+ * base view is chosen, standing in for whatever else in the process
+ * occasionally lands in a mirror slot between the layout probe and the
+ * mirror mapping (seen live: "Mirror 14: FAILED", roughly one start in ten).
+ * A trailing 't' makes the block transient: it is released after the first
+ * failed attempt to map that mirror, like a short-lived allocation would be.
+ * Off unless the variable is set; never set by the launcher or the tools.
+ */
+static int   g_test_block_slot = 0;          /* 1-based mirror number, 0 = off */
+static int   g_test_block_transient = 0;
+static void *g_test_block = NULL;
+
+static void xbox_test_plant_mirror_block(void)
+{
+    const char *e = getenv("XBOX_TEST_MIRROR_BLOCK");
+    int n;
+    uintptr_t addr;
+    if (!e || !e[0]) return;
+    n = atoi(e);
+    if (n < 1 || n > XBOX_NUM_MIRRORS) return;
+    g_test_block_slot = n;
+    g_test_block_transient = (strchr(e, 't') != NULL);
+    addr = (uintptr_t)g_memory_base + (uintptr_t)n * g_memory_size
+         + ((g_memory_size / 2) & ~(uintptr_t)0xFFFF);
+    g_test_block = VirtualAlloc((void *)addr, 0x10000,
+                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    fprintf(stderr, "  TEST: planted %s 64 KB block in mirror slot %d at %p (%s)\n",
+            g_test_block_transient ? "transient" : "permanent", n, (void *)addr,
+            g_test_block ? "ok" : "FAILED");
+}
+
+/*
+ * Layout report (XBOX_MEMLAYOUT_LOG=1): every region of native address
+ * space from the base view up to the end of the GPU MMIO aperture, as
+ * offsets from g_memory_base, plus a read-only check that each mirror slot
+ * really aliases the base view. Used to compare layouts between builds.
+ */
+static int xbox_memlayout_log_on(void)
+{
+    const char *e = getenv("XBOX_MEMLAYOUT_LOG");
+    return e && e[0] == '1';
+}
+
+static void xbox_memlayout_check_aliases(uintptr_t gpu_mmio_offset)
+{
+    int m;
+    for (m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        uintptr_t slot = (uintptr_t)(m + 1) * g_memory_size;
+        uintptr_t off;
+        int same = 0, differ = 0, hole = 0;
+        if (slot + g_memory_size > gpu_mmio_offset) break;
+        /* One 4 KB page every 1 MB of the slot. */
+        for (off = 0; off < g_memory_size; off += 0x100000) {
+            const uint8_t *b = (const uint8_t *)g_memory_base + off;
+            const uint8_t *a = (const uint8_t *)g_memory_base + slot + off;
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(a, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+                mbi.Type != MEM_MAPPED) {
+                hole++;
+                continue;
+            }
+            if (memcmp(a, b, 0x1000) == 0) same++; else differ++;
+        }
+        fprintf(stderr, "  MEMLAYOUT alias: mirror %2d %s (pages same %d, differ %d, not a view %d)\n",
+                m + 1, (differ == 0 && hole == 0) ? "OK  " : "BAD ", same, differ, hole);
+    }
+}
+
+static void xbox_memlayout_dump_regions(void)
+{
+    uintptr_t base = (uintptr_t)g_memory_base;
+    uintptr_t p = base, end = base + 0xFD000000u + 0x03000000u;
+    fprintf(stderr, "  MEMLAYOUT base %p\n", g_memory_base);
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uintptr_t rend;
+        if (VirtualQuery((LPCVOID)p, &mbi, sizeof(mbi)) == 0) break;
+        rend = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (rend > end) rend = end;
+        fprintf(stderr, "  MEMLAYOUT +0x%09llX..+0x%09llX %-7s %-7s alloc %s0x%09llX prot 0x%lX\n",
+                (unsigned long long)(p - base), (unsigned long long)(rend - base),
+                mbi.State == MEM_FREE ? "free" : mbi.State == MEM_RESERVE ? "reserve" : "commit",
+                mbi.State == MEM_FREE ? "-" : mbi.Type == MEM_MAPPED ? "mapped" :
+                mbi.Type == MEM_IMAGE ? "image" : "private",
+                (uintptr_t)mbi.AllocationBase >= base ? "+" : "abs ",
+                (unsigned long long)((uintptr_t)mbi.AllocationBase >= base
+                    ? (uintptr_t)mbi.AllocationBase - base : (uintptr_t)mbi.AllocationBase),
+                (unsigned long)mbi.Protect);
+        p = rend;
+    }
+}
+
+/* Number of mirror slots that fit below the GPU MMIO aperture: slot m
+ * (0-based) spans [(m+1)*size, (m+2)*size) from the base view. */
+static int xbox_mirror_slot_limit(size_t memory_size, uintptr_t gpu_mmio_offset)
+{
+    int m;
+    for (m = 0; m < XBOX_NUM_MIRRORS; m++)
+        if ((uintptr_t)(m + 2) * memory_size > gpu_mmio_offset) break;
+    return m;
+}
+
+/* Name whatever occupies [start, end), so a failed mirror says what took
+ * its place (a module, a mapped file, a heap or thread-stack block...). */
+static void xbox_describe_occupants(uintptr_t start, uintptr_t end)
+{
+    uintptr_t p = start;
+    int shown = 0;
+    while (p < end && shown < 6) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uintptr_t rend;
+        if (VirtualQuery((LPCVOID)p, &mbi, sizeof(mbi)) == 0) break;
+        rend = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (rend > end) rend = end;
+        if (mbi.State != MEM_FREE) {
+            char name[MAX_PATH] = "";
+            if (mbi.Type == MEM_IMAGE)
+                GetModuleFileNameA((HMODULE)mbi.AllocationBase, name, sizeof(name));
+            fprintf(stderr, "    occupied: Xbox VA 0x%08llX-0x%08llX by %s %s memory "
+                            "(allocation base %p)%s%s\n",
+                    (unsigned long long)(p - (uintptr_t)g_memory_offset),
+                    (unsigned long long)(rend - (uintptr_t)g_memory_offset),
+                    mbi.State == MEM_RESERVE ? "reserved" : "committed",
+                    mbi.Type == MEM_IMAGE ? "image" : mbi.Type == MEM_MAPPED ? "mapped" : "private",
+                    mbi.AllocationBase, name[0] ? " " : "", name);
+            shown++;
+        }
+        p = rend;
+    }
+}
+
+/* Collect the free, 64 KB-aligned stretches of [start, end) (allocation
+ * granularity: views and VirtualAlloc ranges must start on it). */
+static int xbox_free_subranges(uintptr_t start, uintptr_t end,
+                               uintptr_t *out_start, size_t *out_len, int max)
+{
+    uintptr_t p = start;
+    int n = 0;
+    while (p < end && n < max) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uintptr_t rend;
+        if (VirtualQuery((LPCVOID)p, &mbi, sizeof(mbi)) == 0) break;
+        rend = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (rend > end) rend = end;
+        if (mbi.State == MEM_FREE) {
+            uintptr_t s = (p + 0xFFFFu) & ~(uintptr_t)0xFFFFu;
+            uintptr_t e = rend & ~(uintptr_t)0xFFFFu;
+            if (e > s) {
+                out_start[n] = s;
+                out_len[n] = (size_t)(e - s);
+                n++;
+            }
+        }
+        p = rend;
+    }
+    return n;
+}
+
+/*
+ * Reserve every mirror slot and the gap above them as soon as the base view
+ * is placed. xbox_probe_layout_free only checks that they are free at that
+ * moment; the views themselves are mapped much later in
+ * xbox_MemoryLayoutInit, after the XBE sections are loaded, and anything
+ * else in the process that allocates in between can land inside a slot
+ * (seen live: mirror 14 failing about one start in ten, leaving a 140 MB
+ * hole). Holding the ranges as plain reservations closes that window; each
+ * one is released immediately before its view is mapped onto it. When all
+ * of them succeed, the final layout is exactly what it was without them.
+ */
+static void xbox_reserve_layout(uintptr_t gpu_mmio_offset)
+{
+    uintptr_t base = (uintptr_t)g_memory_base;
+    int m, slots = xbox_mirror_slot_limit(g_memory_size, gpu_mmio_offset);
+    uintptr_t gap_start = (uintptr_t)(slots + 1) * g_memory_size;
+
+    for (m = 0; m < slots; m++) {
+        void *want = (void *)(base + (uintptr_t)(m + 1) * g_memory_size);
+        void *got = VirtualAlloc(want, g_memory_size, MEM_RESERVE, PAGE_NOACCESS);
+        if (got && got != want) {
+            VirtualFree(got, 0, MEM_RELEASE);
+            got = NULL;
+        }
+        g_mirror_reserved[m] = (got != NULL);
+    }
+    if (gap_start < gpu_mmio_offset) {
+        void *want = (void *)(base + gap_start);
+        void *got = VirtualAlloc(want, gpu_mmio_offset - gap_start, MEM_RESERVE, PAGE_READWRITE);
+        if (got && got != want) {
+            VirtualFree(got, 0, MEM_RELEASE);
+            got = NULL;
+        }
+        g_gap_reserved = (got != NULL);
+    }
+}
+
+/* Map one full mirror view, retrying a couple of times: the reservation
+ * covers the slot only if it was still entirely free at base selection, and
+ * a short-lived foreign allocation may be gone a moment later. */
+static void *xbox_map_mirror(int m, uintptr_t addr)
+{
+    int attempt;
+    for (attempt = 1; attempt <= 3; attempt++) {
+        void *v;
+        DWORD err;
+        if (g_mirror_reserved[m]) {
+            VirtualFree((void *)addr, 0, MEM_RELEASE);
+            g_mirror_reserved[m] = FALSE;
+        }
+        v = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0,
+                            g_memory_size, (LPVOID)addr);
+        if (v) {
+            if (attempt > 1)
+                fprintf(stderr, "  Mirror %d: mapped at %p on attempt %d\n",
+                        m + 1, (void *)addr, attempt);
+            return v;
+        }
+        err = GetLastError();
+        fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu), attempt %d of 3\n",
+                m + 1, (void *)addr, err, attempt);
+        if (attempt == 1)
+            xbox_describe_occupants(addr, addr + g_memory_size);
+        if (g_test_block && g_test_block_transient && m + 1 == g_test_block_slot) {
+            VirtualFree(g_test_block, 0, MEM_RELEASE);
+            g_test_block = NULL;
+            fprintf(stderr, "  TEST: transient block in mirror slot %d released\n", m + 1);
+        }
+        Sleep(10u * (DWORD)attempt);
+    }
+    return NULL;
+}
+
+/* Last resort for a slot that cannot take a full view: map the matching
+ * part of the section onto each free stretch of it, so only the foreign
+ * bytes stay unmapped instead of the whole slot. Returns bytes covered. */
+static size_t xbox_map_mirror_parts(int m, uintptr_t addr)
+{
+    uintptr_t s[XBOX_MIRROR_MAX_PARTS];
+    size_t l[XBOX_MIRROR_MAX_PARTS];
+    size_t covered = 0;
+    int i, k = 0;
+    int n = xbox_free_subranges(addr, addr + g_memory_size, s, l, XBOX_MIRROR_MAX_PARTS);
+
+    for (i = 0; i < n; i++) {
+        uintptr_t off = s[i] - addr;
+        void *v = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS, 0, (DWORD)off,
+                                  l[i], (LPVOID)s[i]);
+        if (v == (void *)s[i]) {
+            g_mirror_parts[m][k].view = v;
+            g_mirror_parts[m][k].slot_off = off;
+            g_mirror_parts[m][k].len = l[i];
+            k++;
+            covered += l[i];
+        } else if (v) {
+            UnmapViewOfFile(v);
+        }
+    }
+    fprintf(stderr, "  Mirror %d: partial -- %d view(s) cover %u of %u KB of the slot "
+                    "(Xbox VA 0x%08llX-0x%08llX); the rest stays unmapped\n",
+            m + 1, k, (unsigned)(covered / 1024), (unsigned)(g_memory_size / 1024),
+            (unsigned long long)(addr - (uintptr_t)g_memory_offset),
+            (unsigned long long)(addr + g_memory_size - (uintptr_t)g_memory_offset));
+    return covered;
+}
 
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
@@ -812,7 +1121,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * width -- so each attempt actually lands somewhere new instead of
          * re-probing the same occupied neighborhood. */
         int found = 0;
-        for (int i = 0; i < num_try_bases; i++) {
+
+        /* Test hook (XBOX_TEST_BASE=<hex address>): try this base first,
+         * through the same probe as the candidates below. Lets a layout test
+         * pick a base whose mirror slots are all free (e.g. one above the
+         * fixed system pages at native 0x7FFE0000, which every lower
+         * candidate's slot range covers). Off unless the variable is set. */
+        {
+            const char *e = getenv("XBOX_TEST_BASE");
+            uintptr_t hint_addr = e ? (uintptr_t)strtoull(e, NULL, 16) : 0;
+            if (hint_addr) {
+                if (xbox_probe_layout_free(hint_addr, g_memory_size)) {
+                    g_memory_base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,
+                                                    0, 0, g_memory_size, (LPVOID)hint_addr);
+                    if (g_memory_base && (uintptr_t)g_memory_base != hint_addr) {
+                        UnmapViewOfFile(g_memory_base);
+                        g_memory_base = NULL;
+                    }
+                    found = (g_memory_base != NULL);
+                }
+                fprintf(stderr, "  TEST: base candidate 0x%p %s\n", (void *)hint_addr,
+                        found ? "used" : "rejected");
+            }
+        }
+
+        for (int i = 0; i < num_try_bases && !found; i++) {
             uintptr_t hint_addr = try_bases[i];
             if (!xbox_probe_layout_free(hint_addr, g_memory_size)) {
                 fprintf(stderr, "  Base candidate 0x%p: skipped -- a mirror slot or the "
@@ -882,7 +1215,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         return FALSE;
     }
 
+    xbox_test_plant_mirror_block();
+
     g_memory_offset = (uintptr_t)g_memory_base - XBOX_MAP_START;
+
+    xbox_reserve_layout(0xFD000000u);
 
     if (g_memory_offset == 0) {
         fprintf(stderr, "xbox_MemoryLayoutInit: mapped %zu KB at 0x%08X (original Xbox address)\n",
@@ -1246,7 +1583,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * safe for any heap size, instead of hardcoding a mirror count that
          * happens to work for one specific XBOX_TOTAL_RAM. */
         const uintptr_t gpu_mmio_offset = 0xFD000000u;
-        int mirrors_ok = 0;
+        int mirrors_ok = 0, mirrors_partial = 0;
+        char incomplete[128] = "";
         int m;
         for (m = 0; m < XBOX_NUM_MIRRORS; m++) {
             uintptr_t mirror_offset = (uintptr_t)(m + 1) * g_memory_size;
@@ -1257,23 +1595,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 break;
             }
             uintptr_t mirror_base = (uintptr_t)g_memory_base + mirror_offset;
-            g_mirror_views[m] = MapViewOfFileEx(
-                g_mapping_handle,
-                FILE_MAP_ALL_ACCESS,
-                0, 0,
-                g_memory_size,
-                (LPVOID)mirror_base
-            );
+            g_mirror_views[m] = xbox_map_mirror(m, mirror_base);
             if (g_mirror_views[m]) {
                 mirrors_ok++;
             } else {
-                fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu)\n",
-                        m + 1, (void *)mirror_base, GetLastError());
+                size_t len = strlen(incomplete);
+                if (xbox_map_mirror_parts(m, mirror_base)) mirrors_partial++;
+                if (len + 4 < sizeof(incomplete))
+                    snprintf(incomplete + len, sizeof(incomplete) - len, " %d", m + 1);
             }
         }
+        g_mirror_slots = m;
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
                 mirrors_ok, m,
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
+        if (mirrors_ok != m)
+            fprintf(stderr, "  RAM mirror: INCOMPLETE -- mirror(s)%s not fully mapped "
+                    "(%d of them partially); see the lines above\n",
+                    incomplete, mirrors_partial);
 
         /*
          * Back the leftover gap between where mirrors had to stop (to avoid
@@ -1288,25 +1627,53 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * thread and a worker thread simultaneously. This gap's size depends on XBOX_TOTAL_RAM (a
          * larger heap leaves a smaller gap here, since mirrors reach
          * further before hitting the cap), so it's computed, not hardcoded.
+         *
+         * The gap starts right after the last mirror slot the loop above
+         * walked through (m slots), whether or not each of those slots got
+         * its view. It used to start after "mirrors_ok" slots instead, which
+         * is the same number only when every mirror maps: with one mirror
+         * missing in the middle, the gap started one slot too low, collided
+         * with the last mirror's view, failed to back anything, and left the
+         * whole real gap (0xF5000000-0xFD000000 at 140 MB) unmapped on top of
+         * the missing mirror's own 140 MB hole.
          */
         {
-            uintptr_t gap_start = (uintptr_t)(mirrors_ok + 1) * g_memory_size;
+            uintptr_t gap_start = (uintptr_t)(m + 1) * g_memory_size;
             if (gap_start < gpu_mmio_offset) {
                 uintptr_t gap_size = gpu_mmio_offset - gap_start;
                 void *gap_native = (void *)((uintptr_t)g_memory_base + gap_start);
                 void *gap_mapped = VirtualAlloc(gap_native, gap_size,
-                                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                                                 g_gap_reserved ? MEM_COMMIT
+                                                                : (MEM_COMMIT | MEM_RESERVE),
+                                                 PAGE_READWRITE);
                 if (gap_mapped && gap_mapped == gap_native) {
                     fprintf(stderr, "  RAM mirror gap: backed %d MB at Xbox VA 0x%08X-0x%08X "
                             "with zeroed memory (absorbs reads/writes past the last mirror)\n",
                             (int)(gap_size / (1024 * 1024)), (unsigned)gap_start, (unsigned)gpu_mmio_offset);
                 } else {
-                    fprintf(stderr, "  RAM mirror gap: FAILED to back 0x%08X-0x%08X (error %lu) -- "
-                            "reads/writes there will still fault\n",
+                    /* Something else already holds part of the gap: back
+                     * every free stretch of it instead of none of it. */
+                    uintptr_t s[XBOX_MIRROR_MAX_PARTS];
+                    size_t l[XBOX_MIRROR_MAX_PARTS], backed = 0;
+                    int i, n;
+                    fprintf(stderr, "  RAM mirror gap: FAILED to back 0x%08X-0x%08X (error %lu) "
+                            "in one piece\n",
                             (unsigned)gap_start, (unsigned)gpu_mmio_offset, GetLastError());
+                    xbox_describe_occupants((uintptr_t)gap_native, (uintptr_t)gap_native + gap_size);
+                    n = xbox_free_subranges((uintptr_t)gap_native, (uintptr_t)gap_native + gap_size,
+                                            s, l, XBOX_MIRROR_MAX_PARTS);
+                    for (i = 0; i < n; i++)
+                        if (VirtualAlloc((void *)s[i], l[i], MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_READWRITE) == (void *)s[i])
+                            backed += l[i];
+                    fprintf(stderr, "  RAM mirror gap: backed %u of %u KB in %d piece(s); "
+                            "reads/writes in the rest will still fault\n",
+                            (unsigned)(backed / 1024), (unsigned)(gap_size / 1024), n);
                 }
             }
         }
+        if (xbox_memlayout_log_on())
+            xbox_memlayout_check_aliases(gpu_mmio_offset);
     }
 
     /*
@@ -1407,6 +1774,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    if (xbox_memlayout_log_on())
+        xbox_memlayout_dump_regions();
+
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
@@ -1429,7 +1799,14 @@ void xbox_MemoryLayoutShutdown(void)
             UnmapViewOfFile(g_mirror_views[m]);
             g_mirror_views[m] = NULL;
         }
+        for (int k = 0; k < XBOX_MIRROR_MAX_PARTS; k++) {
+            if (g_mirror_parts[m][k].view) {
+                UnmapViewOfFile(g_mirror_parts[m][k].view);
+                g_mirror_parts[m][k].view = NULL;
+            }
+        }
     }
+    g_mirror_slots = 0;
     /* Unmap base view */
     if (g_memory_base) {
         UnmapViewOfFile(g_memory_base);
@@ -1892,6 +2269,35 @@ int xbox_GetMirrorCount(void)
     for (m = 0; m < XBOX_NUM_MIRRORS; m++)
         if (g_mirror_views[m]) n++;
     return n;
+}
+
+/* Number of mirror slots below the GPU MMIO aperture. Slot m (0-based)
+ * sits at g_memory_base + (m+1)*g_memory_size. Not the same as
+ * xbox_GetMirrorCount when a slot in the middle could not take a view:
+ * walk the slots and ask xbox_IsMirrorAddress before touching one. */
+int xbox_GetMirrorSlotCount(void)
+{
+    return g_mirror_slots;
+}
+
+/* TRUE when p lies inside one of our mirror views (a full view or a part
+ * of a partially mapped slot), i.e. memory that aliases the base view --
+ * never something else that happens to occupy a mirror slot. */
+BOOL xbox_IsMirrorAddress(const void *p)
+{
+    uintptr_t a = (uintptr_t)p, base = (uintptr_t)g_memory_base, rel, slot_off;
+    int m, k;
+    if (!g_memory_base || g_memory_size == 0 || a < base + g_memory_size) return FALSE;
+    rel = a - base;
+    m = (int)(rel / g_memory_size) - 1;
+    if (m < 0 || m >= g_mirror_slots) return FALSE;
+    if (g_mirror_views[m]) return TRUE;
+    slot_off = rel % g_memory_size;
+    for (k = 0; k < XBOX_MIRROR_MAX_PARTS; k++)
+        if (g_mirror_parts[m][k].view && slot_off >= g_mirror_parts[m][k].slot_off &&
+            slot_off < g_mirror_parts[m][k].slot_off + g_mirror_parts[m][k].len)
+            return TRUE;
+    return FALSE;
 }
 
 int xbox_VerifyViewIntegrity(const char *tag)

@@ -17,7 +17,7 @@
 0x0015DC80
 0x0016BBF6
 0x0016BC0A
-# Undetected stubs of a fresh regen (recomp_stubs_unresolved.c), recovered upstream in part 180:
+# Undetected stubs of a fresh regen (recomp_stubs_unresolved.c), recovered upstream:
 0x00020001
 0x0002021B
 0x00030060

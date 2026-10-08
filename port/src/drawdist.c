@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "recomp/recomp_types.h"
 #include "drawdist.h"
 
@@ -12,6 +13,8 @@ void sub_000DE230(void);    /* TerrainNode_TickVisibilityUpdate (thiscall, ret) 
 void sub_000FFB50(void);    /* SceneView_RenderPass */
 void sub_000F8F10(void);    /* BoardMesh_DrawAttachedPatches */
 void sub_000F8BA0(void);    /* terrain patch re-tessellation into a cache slot */
+void sub_000DFE90(void);    /* FogVolume_DrawCloudPuffs (thiscall, ret 16) -- log only */
+void sub_000E6670(void);    /* particle emitter render (thiscall) -- log only */
 
 #define APP_GLOBAL   0x001E3C7Cu
 #define CELL_COUNT   0x001FAF88u + 0x2C4u    /* list 0x1FAF88+0x3C, count at +0x288 */
@@ -19,11 +22,14 @@ void sub_000F8BA0(void);    /* terrain patch re-tessellation into a cache slot *
 #define FAR_MUL      0x001C0834u
 #define PATCH_LOD    0x001BD160u
 #define PATCH_SLOTS  0x001BD158u
+#define FOG_FAR      0x0019CFCCu              /* fog volumes: none drawn beyond (20000) */
+#define FOG_NEAR     0x0019CFD0u              /* ... fade start (12500); the draw ignores the fade */
 #define LIST_SAFE    150                      /* of 162 entries */
 #define CELL         10000.0f                 /* the title's divisor (0xDE28C), not the grid's own */
 
 int g_drawdist_level;
 static int s_log;
+static int s_fx = 1;                /* also push the fog volume distance (XBOX_DRAW_DISTANCE_FX) */
 static float s_mul;
 
 static struct {
@@ -32,12 +38,31 @@ static struct {
     float cap60, cap64;             /* radius caps for this level's grid */
     float ofar, wfar, otl, wtl;     /* far multiplier, terrain patch distance */
     int   far_set, tl_set;
+    float ofogf, ofogn, wfogf;      /* fog volume distance: the title's, what we wrote */
+    int   fog_set;
     int   cut;                      /* run-time guard: cells taken off the radius */
     unsigned rp_since_tick;         /* SceneView_RenderPass calls since the last terrain tick */
     unsigned max_cells, cuts, overflow, ticks;
     unsigned pool_slots, max_claims, reuse, calls;
     unsigned long long claims;
+    unsigned max_clouds, max_cmds;  /* cloud record pool (3600) / view command list (2048) use */
 } s;
+
+/* Log only: where effects start being drawn. An object (fog volume, emitter)
+ * drawn now and not in the last FX_GAP terrain ticks "appears"; its distance
+ * to the camera goes into a histogram of FX_BIN-unit bins. */
+#define FX_GAP  8u
+#define FX_BIN  2500.0f
+#define FX_BINS 40
+enum { FX_FOG, FX_EMIT, FX_KINDS };
+static const char *const fx_name[FX_KINDS] = { "fog volumes", "emitters" };
+static struct {
+    uint32_t key[4096];
+    unsigned seen[4096];
+    unsigned hist[FX_BINS + 1];
+    unsigned appear, calls;
+    float dmax;
+} fx[FX_KINDS];
 
 static float rdf(uint32_t va) { float f; uint32_t u = MEM32(va); memcpy(&f, &u, 4); return f; }
 static void  wrf(uint32_t va, float f) { uint32_t u; memcpy(&u, &f, 4); MEM32(va) = u; }
@@ -85,6 +110,17 @@ static void level_report(const char *why)
     fprintf(stderr, "[DRAWDIST] %s: %u ticks, cells max %u / 162, guard cuts %u, overflow %u; "
             "patch cache %u slots: claims max %u per call, slot reused within a call %u (%u calls)\n",
             why, s.ticks, s.max_cells, s.cuts, s.overflow, s.pool_slots, s.max_claims, s.reuse, s.calls);
+    if (s_log) {
+        int k, b;
+        fprintf(stderr, "[DRAWDIST] %s: cloud records max %u / 3600, view commands max %u / 2048, fog cut %.0f\n",
+                why, s.max_clouds, s.max_cmds, rdf(FOG_FAR));
+        for (k = 0; k < FX_KINDS; k++) {
+            fprintf(stderr, "[DRAWDIST] %s: %s drawn %u, appearances %u, farthest drawn %.0f; appear at (x%.0f):",
+                    why, fx_name[k], fx[k].calls, fx[k].appear, fx[k].dmax, FX_BIN);
+            for (b = 0; b <= FX_BINS; b++) if (fx[k].hist[b]) fprintf(stderr, " %d:%u", b, fx[k].hist[b]);
+            fputc('\n', stderr);
+        }
+    }
     fflush(stderr);
 }
 
@@ -93,7 +129,8 @@ static void new_level(uint32_t lvl, uint32_t cfg)
     int w60 = 0, w64 = 0;
     level_report("level end");
     s.max_cells = s.cuts = s.overflow = s.ticks = s.max_claims = s.reuse = s.calls = 0;
-    s.claims = 0; s.cut = 0;
+    s.claims = 0; s.cut = 0; s.max_clouds = s.max_cmds = 0;
+    memset(fx, 0, sizeof fx);
     s.lvl = lvl; s.cfg = cfg;
     s.o60 = rdf(cfg + 0x60u); s.o64 = rdf(cfg + 0x64u);
     if (g_drawdist_level) {
@@ -131,6 +168,17 @@ static void prepare(void)
     tl = rdf(PATCH_LOD);
     if (!s.tl_set || tl != s.wtl) { s.otl = tl; s.wtl = tl * s_mul; s.tl_set = 1; }
     wrf(PATCH_LOD, s.wtl);
+    if (s_fx) {
+        /* Fog volumes (FogMan_RenderFogVolumes 0xDFA00) come from the visible
+         * cells but are cut at FOG_FAR from the camera -- a hard cut, the
+         * fade it computes is not used by the draw. Push it out by the radius
+         * actually applied, so the title's fog / scenery ratio holds. */
+        float k = s.o60 > 0.0f ? s.w60 / s.o60 : 1.0f;
+        if (!s.fog_set) { s.ofogf = rdf(FOG_FAR); s.ofogn = rdf(FOG_NEAR); s.fog_set = 1; }
+        if (k < 1.0f) k = 1.0f;
+        s.wfogf = s.ofogf * k;
+        wrf(FOG_FAR, s.wfogf); wrf(FOG_NEAR, s.ofogn * k);
+    }
 }
 
 /* After it: the list it built. */
@@ -146,7 +194,7 @@ static void check(void)
         fprintf(stderr, "[DRAWDIST] guard: %u cells, radius cut by one cell (%d)\n", n, s.cut);
         fflush(stderr);
     }
-    if (s.ticks % 1800u == 0) level_report("running");     /* ~30 s; tests end by a kill */
+    if (s.ticks % (s_log ? 600u : 1800u) == 0) level_report("running");   /* tests end by a kill */
 }
 
 void hook_drawdist_000DE230(void)
@@ -163,12 +211,23 @@ void hook_drawdist_000DE230(void)
  * the terrain patch distance goes back too, for the front end. */
 void hook_drawdist_000FFB50(void)
 {
+    if (s_log) {
+        uint32_t view = g_ecx, g = MEM32(APP_GLOBAL), gfx = g ? MEM32(g + 0x720u) : 0;
+        int32_t n = (int32_t)(MEM32(view + 0x808u) - view - 0x8C0u) / 0x18;
+        if (n > (int32_t)s.max_cmds && n < 100000) s.max_cmds = (unsigned)n;
+        if (gfx) {
+            uint32_t idx = MEM32(gfx + 0x196008u) & 1u;
+            int32_t c = (int32_t)(MEM32(gfx + 0x18E5C4u) - MEM32(gfx + 0x18E620u + 4u * idx)) / 0x30;
+            if (c > (int32_t)s.max_clouds && c < 100000) s.max_clouds = (unsigned)c;
+        }
+    }
     if (g_drawdist_level) {
         float f = rdf(FAR_MUL);
         int racing = s.rp_since_tick < 400u;
         if (!s.far_set || f != s.wfar) { s.ofar = f; s.far_set = 1; }   /* the title's own value */
         s.wfar = racing ? s.ofar * s_mul : s.ofar;
         if (!racing && s.tl_set && rdf(PATCH_LOD) == s.wtl) { wrf(PATCH_LOD, s.otl); s.tl_set = 0; }
+        if (!racing && s.fog_set && rdf(FOG_FAR) != s.ofogf) { wrf(FOG_FAR, s.ofogf); wrf(FOG_NEAR, s.ofogn); }
         if (f != s.wfar) wrf(FAR_MUL, s.wfar);
         if (s.rp_since_tick < 0xFFFFFFFFu) s.rp_since_tick++;
     }
@@ -202,6 +261,50 @@ void hook_drawdist_000F8BA0(void)
     sub_000F8BA0();
 }
 
+static void fx_seen(int k, uint32_t obj, uint32_t lo, uint32_t hi)
+{
+    uint32_t g = MEM32(APP_GLOBAL), lvl = g ? MEM32(g + 0x72Cu) : 0, cam;
+    unsigned h = (obj >> 4) & 4095u, i, last = 0, found = 0;
+    float dx, dy, dz, d;
+    if (!lvl) return;
+    cam = lvl + 0xB0u + (MEM32(lvl + 0x290u) << 7);
+    dx = 0.5f * (rdf(lo) + rdf(hi)) - rdf(cam);
+    dy = 0.5f * (rdf(lo + 4u) + rdf(hi + 4u)) - rdf(cam + 4u);
+    dz = 0.5f * (rdf(lo + 8u) + rdf(hi + 8u)) - rdf(cam + 8u);
+    d = sqrtf(dx * dx + dy * dy + dz * dz);
+    fx[k].calls++;
+    if (d > fx[k].dmax) fx[k].dmax = d;
+    for (i = 0; i < 4096; i++, h = (h + 1) & 4095u) {
+        if (!fx[k].key[h] || fx[k].key[h] == obj) { found = fx[k].key[h] == obj; break; }
+    }
+    if (i == 4096) return;
+    last = fx[k].seen[h];
+    if (!found || s.ticks - last > FX_GAP) {
+        int b = (int)(d / FX_BIN);
+        fx[k].appear++;
+        fx[k].hist[b < FX_BINS ? b : FX_BINS]++;
+        if (s_log > 1) { fprintf(stderr, "[DRAWDIST] appear: %s at %.0f\n", fx_name[k], d); fflush(stderr); }
+    }
+    fx[k].key[h] = obj; fx[k].seen[h] = s.ticks;
+}
+
+/* FogVolume_DrawCloudPuffs: one fog volume that passed the distance test;
+ * arg 1 is the cell sub-object, bounds at +0x44 / +0x50 (centre as 0xDFA00). */
+void hook_drawdist_000DFE90(void)
+{
+    uint32_t sub = MEM32(g_esp + 4u);
+    if (s_log) fx_seen(FX_FOG, sub, sub + 0x44u, sub + 0x50u);
+    sub_000DFE90();
+}
+
+/* Particle emitter render: bounds at +0x150 / +0x160 (its frustum test). */
+void hook_drawdist_000E6670(void)
+{
+    uint32_t em = g_ecx;
+    if (s_log) fx_seen(FX_EMIT, em, em + 0x150u, em + 0x160u);
+    sub_000E6670();
+}
+
 static void at_exit(void) { level_report("exit"); }
 
 void drawdist_init(void)
@@ -215,10 +318,13 @@ void drawdist_init(void)
     g_drawdist_level = v;
     s_mul = v == 2 ? 2.0f : v == 1 ? 1.5f : 1.0f;
     e = getenv("XBOX_DRAW_DISTANCE_LOG");
-    s_log = e && e[0] == '1';
+    s_log = e && e[0] >= '1' && e[0] <= '2' ? e[0] - '0' : 0;
+    e = getenv("XBOX_DRAW_DISTANCE_FX");
+    s_fx = !(e && e[0] == '0');
     if (v || s_log) atexit(at_exit);
-    fprintf(stderr, "[DRAWDIST] XBOX_DRAW_DISTANCE=%s%s\n",
-            v == 2 ? "max (x2)" : v == 1 ? "far (x1.5)" : "original", s_log ? ", log" : "");
+    fprintf(stderr, "[DRAWDIST] XBOX_DRAW_DISTANCE=%s%s%s\n",
+            v == 2 ? "max (x2)" : v == 1 ? "far (x1.5)" : "original", s_log ? ", log" : "",
+            v && !s_fx ? ", fog volume distance left alone" : "");
 }
 
 void (*drawdist_lookup(unsigned int xbox_va))(void)
@@ -228,5 +334,8 @@ void (*drawdist_lookup(unsigned int xbox_va))(void)
     if (xbox_va == 0x000FFB50u) return hook_drawdist_000FFB50;
     if (xbox_va == 0x000F8F10u) return hook_drawdist_000F8F10;
     if (xbox_va == 0x000F8BA0u) return hook_drawdist_000F8BA0;
+    if (!s_log) return 0;
+    if (xbox_va == 0x000DFE90u) return hook_drawdist_000DFE90;
+    if (xbox_va == 0x000E6670u) return hook_drawdist_000E6670;
     return 0;
 }

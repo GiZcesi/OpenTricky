@@ -101,5 +101,55 @@ typedef void (*pgraph_pass_phase_fn)(int old_phase, int new_phase, uint32_t tag)
 void pgraph_d3d11_set_pass_phase_callback(pgraph_pass_phase_fn fn);
 int  pgraph_d3d11_pass_phase(void);
 
+/* Race HUD in its own proportions (the title side is
+ * port/src/hud_anchor.c, which groups the HUD into elements and picks an
+ * anchor for each). With the pass markers on, the title writes two HUD tags
+ * before the records of each element; the HUD-phase draws that follow are
+ * scaled by kx horizontally and ky vertically around the anchor, up to the
+ * next tag or pass marker. kx = (4/3) / screen shape x HUD size, ky = HUD
+ * size; both 1 or 0 (default) = off, nothing changes.
+ * Tags: PGRAPH_HUD_TAG_MAGIC in the 16 high bits, bit 15 = scale, bits 0-14
+ * = anchor x in 1/16 pixel of the title's 640x480 screen; then
+ * PGRAPH_HUD_TAG_MAGIC_Y, bits 0-14 = anchor y, same unit. */
+#define PGRAPH_HUD_TAG_MAGIC   0x4855u
+#define PGRAPH_HUD_TAG_MAGIC_Y 0x4856u
+void pgraph_d3d11_set_hud_scale(float kx, float ky);
+
+/* Menus in a centred 16:9 frame beyond 16:9 (fork; the title side is
+ * port/src/hud_anchor.c). PGRAPH_BOX_TAG_MAGIC in the 16 high bits, low
+ * bits: 0 = the records that follow are drawn as is, 1 = framed (x scaled
+ * by k about the centre, wide images only), 2 = the frame is shown whole
+ * in a 16:9 frame (the host presents it at 16:9), 3 = the frame is wide.
+ * k = (16/9) / screen shape; 0 (default) = off, nothing changes. */
+#define PGRAPH_BOX_TAG_MAGIC   0x4857u
+
+/* Panels edge to edge (fork; the title side is port/src/hud_anchor.c,
+ * "Panels edge to edge"). Two tags before the records of a panel's end
+ * pieces: PGRAPH_PANEL_TAG_MAGIC, bits 0-13 = left edge, then
+ * PGRAPH_PANEL_TAG_MAGIC_R, bits 0-13 = right edge, in 1/16 pixel of the
+ * title's 640x480 screen. The HUD-phase draws that follow, up to the next
+ * tag or pass marker, have their x at the 4:3 proportions about the centre
+ * (k2d, or 0.75 in an image shown at 16:9; as drawn at 4:3, with neither),
+ * except the vertices left of the
+ * left edge (to x = 0) and right of the right edge (to the screen's
+ * width); those draws take the CPU path, where a moved vertex gets the
+ * attributes of its triangle's plane at its new place. First tag bit 15: wide images only (else drawn as is, like a
+ * framed record) ; bit 14: 4:3 proportions only, no edge. */
+#define PGRAPH_PANEL_TAG_MAGIC   0x4858u
+#define PGRAPH_PANEL_TAG_MAGIC_R 0x4859u
+void pgraph_d3d11_set_box(float k);
+/* The race's own 2D outside the race HUD (finish banner, pause, end
+ * screens) at the title's 4:3 proportions: the framed records of a wide
+ * image are scaled by k2d = (4/3) / screen shape about the centre instead
+ * of k. Works at any shape wider than 4:3, with or without the 16:9 frame
+ * (at 16:9 or 16:10 the title side writes the frame tags for it only, and
+ * the presentation does not change). 0 (default) = off, k as before. */
+void pgraph_d3d11_set_box_race2d(float k2d);
+/* The shape of the frame a framed (not wide) image is shown in, for the
+ * panels' content (PGRAPH_PANEL_TAG_MAGIC): kboxed = (4/3) / frame shape,
+ * 0.75 for the 16:9 frame (default), 1 for the 4:3 frame (the menus at
+ * 4:3: the image is already at the title's proportions). */
+void pgraph_d3d11_set_box_frame(float kboxed);
+
 #endif /* NV2A_PGRAPH_D3D11_H */
 void pgraph_d3d11_present_guest_fb(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h);

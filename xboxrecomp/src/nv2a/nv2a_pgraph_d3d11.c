@@ -27,6 +27,8 @@ extern int d3d8_pump_cache_on(void);
 #include "../d3d/d3d8_gpuprof.h"
 #include "nv2a_vsh_cpu.h"
 #include "nv2a_psh.h"
+#include "nv2a_hdtex.h"
+#include "nv2a_btnicons.h"
 extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
 /* Global.txd texture lookup */
@@ -602,6 +604,130 @@ static struct {
 } g_nop;
 
 
+/* Race HUD proportions (see nv2a_pgraph_d3d11.h). The title's
+ * hooks (port/src/hud_anchor.c) write two HUD tags (anchor x, anchor y)
+ * before the records of each element of its race HUD, right after the pass
+ * tag of their group; every HUD-phase draw up to the next tag or pass tag is
+ * scaled by kx, ky around that anchor (hud_element). Pump thread only. */
+static struct {
+    float kx, ky;                       /* 0 = off */
+    int   on;                           /* the last x tag scales */
+    float ax, ay;                       /* the anchor, title pixels of a 640x480 screen */
+    unsigned long long tags, draws;
+} g_hud;
+
+void pgraph_d3d11_set_hud_scale(float kx, float ky)
+{
+    int on = kx > 0.0f && ky > 0.0f && (kx < 1.0f || ky < 1.0f);
+    g_hud.kx = on ? kx : 0.0f;
+    g_hud.ky = on ? ky : 0.0f;
+}
+
+/* The 16:9 frame (fork, port/src/hud_anchor.h). Box tags: a record
+ * framed in the centred 16:9 (x scaled by k about the centre) or drawn as
+ * is; frame tags: the frame is wide (menus framed) or shown whole at 16:9.
+ * A frame tag applies to the image the frame's overlay goes into, which
+ * holds the 3D of the frame before : the mode of the image is the
+ * one of the previous frame tag. Pump thread only. */
+static struct {
+    float k;                            /* (16/9) / shape, 0 = off */
+    float k2d;                          /* (4/3) / shape for framed records, 0 = k */
+    float kboxed;                       /* (4/3) / the frame's shape: 0.75 (16:9 frame), 1 (4:3 frame); 0 = 0.75 */
+    int   on;                           /* the last box tag frames */
+    int   img_wide;                     /* the image being drawn is wide */
+    int   next_wide;                    /* the last frame tag */
+    int   tagged;                       /* a frame tag since the last image */
+    unsigned long long boxed_images, wide_images;
+} g_box;
+
+void pgraph_d3d11_set_box(float k)
+{
+    g_box.k = k > 0.0f && k < 1.0f ? k : 0.0f;
+    d3d8_SetPresentBox(g_box.k > 0.0f);             /* the boot and the videos: framed */
+}
+
+void pgraph_d3d11_set_box_race2d(float k2d)
+{
+    g_box.k2d = k2d > 0.0f && k2d < 1.0f ? k2d : 0.0f;
+}
+
+void pgraph_d3d11_set_box_frame(float kboxed)
+{
+    g_box.kboxed = kboxed > 0.0f ? kboxed : 0.75f;
+}
+
+/* Panels edge to edge (nv2a_pgraph_d3d11.h, PGRAPH_PANEL_TAG_MAGIC). Pump
+ * thread only. */
+static struct {
+    int   on;                           /* the last tag was a panel's */
+    int   wide_only, scale_only;
+    float l, r;                         /* the panel's edges, title pixels */
+    unsigned long long moved;           /* vertices moved to an edge */
+} g_panel;
+
+static void panel_tag_seen(uint32_t p)
+{
+    if ((p >> 16) == PGRAPH_PANEL_TAG_MAGIC_R) {
+        g_panel.r = (float)(p & 0x3FFFu) / 16.0f;
+        return;
+    }
+    g_hud.on = 0;
+    g_box.on = 0;
+    g_panel.on = 1;
+    g_panel.wide_only = (p & 0x8000u) != 0;
+    g_panel.scale_only = (p & 0x4000u) != 0;
+    g_panel.l = (float)(p & 0x3FFFu) / 16.0f;
+    g_panel.r = 1e9f;                   /* until its second tag */
+}
+
+static void box_tag_seen(uint32_t p)
+{
+    switch (p & 3u) {
+    case 0: case 1:
+        g_box.on = (int)(p & 1u);
+        g_hud.on = 0;
+        break;
+    default:
+        g_box.img_wide = g_box.next_wide;
+        g_box.next_wide = (p & 3u) == 3u;
+        g_box.tagged = 1;
+        break;
+    }
+}
+
+/* Just before an image is presented: framed unless it is a wide one. */
+static void box_image_done(void)
+{
+    int boxed;
+    if (!(g_box.k > 0.0f)) return;
+    boxed = !(g_box.tagged && g_box.img_wide);
+    g_box.tagged = 0;
+    if (boxed) g_box.boxed_images++; else g_box.wide_images++;
+    d3d8_SetPresentBox(boxed);
+}
+
+static void hud_tag_seen(uint32_t p)
+{
+    g_hud.tags++;
+    if ((p >> 16) == PGRAPH_PANEL_TAG_MAGIC || (p >> 16) == PGRAPH_PANEL_TAG_MAGIC_R) {
+        panel_tag_seen(p);
+        return;
+    }
+    g_panel.on = 0;
+    if ((p >> 16) == PGRAPH_BOX_TAG_MAGIC) {
+        box_tag_seen(p);
+        return;
+    }
+    g_box.on = 0;
+    if ((p >> 16) == PGRAPH_HUD_TAG_MAGIC) {
+        g_hud.on = (p & 0x8000u) != 0;
+        g_hud.ax = (float)(p & 0x7FFFu) / 16.0f;
+        g_hud.ay = 240.0f;
+    } else {
+        g_hud.ay = (float)(p & 0x7FFFu) / 16.0f;
+    }
+}
+
 /* Pass phases (fork).
  *
  * With XBOX_PASS_TAGS=emit the title's own hooks (port/src/pass_tags.c) write
@@ -649,10 +775,14 @@ int  pgraph_d3d11_pass_phase(void) { return g_ph.phase; }
 
 static void phase_set(int ph, uint32_t tag)
 {
+    {   /* XBOX_CULLSTAT group (cheap; read only in sampled frames) */
+        extern void cullstat_set_group(int ph, uint32_t tag);
+        cullstat_set_group(ph, tag);
+    }
     uint32_t now = g_pg.stats.draw_calls;
     g_ph.draws[g_ph.phase] += now - g_ph.draw_mark;
     g_ph.draw_mark = now;
-    if (g_gpuprof_on)                   /* groupe des marqueurs GROUP */
+    if (g_gpuprof_on)                   /* group of the GROUP markers */
         gpuprof_set_phase(ph, ((tag >> 14) & 3u) == 2u ? (int)((tag >> 5) & 31u) : -1);
     if (ph != g_ph.phase) {
         int old = g_ph.phase;
@@ -665,6 +795,9 @@ static void pass_tag_seen(uint32_t p)
 {
     uint32_t f = p & 0x1FFFu;
     g_ph.tags++;
+    g_hud.on = 0;                       /* a HUD tag holds until the next pass tag */
+    g_box.on = 0;                       /* and a box tag */
+    g_panel.on = 0;                     /* and a panel tag */
     switch ((p >> 14) & 3u) {
     case 0:                                         /* FRAME_BEGIN */
         if (g_ph.in_frame) g_ph.lost_end++;
@@ -725,15 +858,46 @@ static void pass_phase_image_done(void)
     memset(g_ph.draws, 0, sizeof g_ph.draws);
 }
 
+/* XBOX_PUMPLAG (port/src/pumplag.c, diagnostic): NOP 0x5D000000 | q before
+ * each mesh part, q = 0 after the list. At the marker the port compares the
+ * part's constant block with what the title drew it with; a rewritten part's
+ * draws are then measured (plag_draw) and the frame saved. */
+typedef int (*pgraph_plag_fn)(uint32_t q, uint32_t *cb, const uint8_t **snap);
+static struct {
+    pgraph_plag_fn check;
+    int bad;                        /* the current part's matrix was rewritten */
+    uint32_t cb;                    /* its block (guest VA) */
+    const uint8_t *snap;            /* the block as the title drew the part */
+    const uint8_t *patch;           /* va_fetch4: read the block from snap */
+} g_plag;
+void pgraph_d3d11_set_plag_check(pgraph_plag_fn fn) { g_plag.check = fn; }
+/* Draw fence: the last NOP 0x5C000000 | n translated (XBOX_FIX_CONSTWAIT, pumplag.c). */
+volatile uint32_t pgraph_d3d11_fork_fence;
+
 static void nop_note(uint32_t param)
 {
     unsigned i;
     g_nop.total++;
+    if ((param >> 24) == 0x5Cu) {   /* fork draw fence (port/src/pumplag.c): passed */
+        pgraph_d3d11_fork_fence = param & 0xFFFFFFu;
+        return;
+    }
+    if ((param >> 24) == 0x5Du && g_plag.check) {
+        uint32_t q = param & 0xFFFFFFu;
+        g_plag.bad = q ? g_plag.check(q, &g_plag.cb, &g_plag.snap) == 1 : 0;
+        return;
+    }
     if ((param >> 16) == NV2A_PASS_TAG_MAGIC) {
         g_nop.tags++;
         g_nop.tag_type[(param >> 14) & 3u]++;
         pass_tag_seen(param);
         return;                     /* tags stay out of the title's histogram */
+    }
+    if ((param >> 16) == PGRAPH_HUD_TAG_MAGIC || (param >> 16) == PGRAPH_HUD_TAG_MAGIC_Y ||
+        (param >> 16) == PGRAPH_BOX_TAG_MAGIC ||    /* 16:9 frame */
+        (param >> 16) == PGRAPH_PANEL_TAG_MAGIC || (param >> 16) == PGRAPH_PANEL_TAG_MAGIC_R) {
+        hud_tag_seen(param);
+        return;
     }
     for (i = 0; i < g_nop.n; i++)
         if (g_nop.slot[i].param == param) { g_nop.slot[i].hits++; return; }
@@ -1008,11 +1172,16 @@ typedef struct {
     IDirect3DTexture8 *tex;
     unsigned last_use;
     int next;                   /* bucket chain, or free list */
+    uint32_t hd_bytes;          /* GPU bytes of an HD replacement, else 0 */
+    uint32_t hd_tick;           /* pump tick of its last use */
+    HdJob   *hd_job;            /* its HD copy, being loaded */
 } TcEntry;
 static TcEntry g_tc[TC_POOL];
 static int g_tc_head[TC_BUCKETS];
 static int g_tc_free = -1, g_tc_ready = 0;
 static unsigned g_texcache_clock, g_tc_uploads, g_tc_live;
+static uint64_t g_tc_hd_bytes;  /* live HD replacements, in GPU bytes */
+static uint32_t g_sig_gen = 1;  /* pump tick, see tex_sig */
 
 static unsigned tc_bucket(uint32_t offset, uint32_t format)
 {
@@ -1029,7 +1198,9 @@ static void tc_init(void)
 }
 
 /* Unlink entry i from its bucket, release its texture, return it to the pool. */
-static void tc_remove(int i)
+static void tc_remove_why(int i, int over_budget);
+static void tc_remove(int i) { tc_remove_why(i, 0); }
+static void tc_remove_why(int i, int over_budget)
 {
     unsigned b = tc_bucket(g_tc[i].offset, g_tc[i].format);
     int *link = &g_tc_head[b];
@@ -1037,6 +1208,15 @@ static void tc_remove(int i)
     if (*link == i) *link = g_tc[i].next;
     if (g_tc[i].tex) g_tc[i].tex->lpVtbl->Release(g_tc[i].tex);
     g_tc[i].tex = NULL;
+    if (g_tc[i].hd_bytes) {
+        g_tc_hd_bytes -= g_tc[i].hd_bytes;
+        hdtex_note_evicted(g_tc[i].hd_bytes, over_budget);
+        g_tc[i].hd_bytes = 0;
+    }
+    if (g_tc[i].hd_job) {
+        hdtex_cancel(g_tc[i].hd_job);
+        g_tc[i].hd_job = NULL;
+    }
     g_tc[i].next = g_tc_free;
     g_tc_free = i;
     g_tc_live--;
@@ -1045,13 +1225,12 @@ static void tc_remove(int i)
 extern int d3d8_pump_cache_on(void);
 static uint32_t tex_sig_raw(uint32_t offset, uint32_t size);
 
-/* XBOX_FIX_PUMP_CACHE : la signature d'une plage de texture est
- * calculée une fois par tour du pump (nv2a_live_pb_tick) au lieu d'à chaque
- * liaison (~2 600 par image). Exact : le jeu ne réécrit une texture déjà
- * référencée par des commandes qu'après une fence, que le pump n'acquitte
- * qu'à la fin de son tour (ack late) ; dans un tour, le contenu lu est donc
- * le même. Cache à correspondance directe, invalidé par génération. */
-static uint32_t g_sig_gen = 1;
+/* XBOX_FIX_PUMP_CACHE: the signature of a texture range is
+ * computed once per pump round (nv2a_live_pb_tick) instead of on every bind
+ * (~2,600 per frame). Exact: the game rewrites a texture already referenced
+ * by commands only after a fence, which the pump acknowledges only at the
+ * end of its round (ack late); within a round, the content read is the
+ * same. Direct-mapped cache, invalidated by generation. */
 static struct { uint32_t offset, size, gen, sig; } g_sigc[2048];
 
 void pgraph_d3d11_tick_begin(void) { g_sig_gen++; }
@@ -1083,6 +1262,22 @@ static uint32_t tex_sig_raw(uint32_t offset, uint32_t size)
     return (h ^ p[n - 1]) * 16777619u;
 }
 
+/* HD replacements past their GPU budget go, least recently used
+ * first -- never one used in this pump tick (it may still be bound; the budget
+ * is then exceeded until the next HD texture arrives). */
+static void tc_hd_budget(void)
+{
+    while (g_tc_hd_bytes > hdtex_budget()) {
+        int k, victim = -1;
+        unsigned oldest = ~0u;
+        for (k = 0; k < TC_POOL; k++)
+            if (g_tc[k].tex && g_tc[k].hd_bytes && g_tc[k].hd_tick != g_sig_gen &&
+                g_tc[k].last_use < oldest) { oldest = g_tc[k].last_use; victim = k; }
+        if (victim < 0) break;
+        tc_remove_why(victim, 1);
+    }
+}
+
 static IDirect3DTexture8 *texcache_find(uint32_t offset, uint32_t format, uint32_t sig)
 {
     int i;
@@ -1094,12 +1289,28 @@ static IDirect3DTexture8 *texcache_find(uint32_t offset, uint32_t format, uint32
                 return NULL;
             }
             g_tc[i].last_use = ++g_texcache_clock;
+            g_tc[i].hd_tick = g_sig_gen;
+            if (g_tc[i].hd_job) {              /* its HD copy is ready? */
+                IDirect3DTexture8 *hd;
+                uint32_t bytes;
+                if (hdtex_collect(g_tc[i].hd_job, &hd, &bytes)) {
+                    g_tc[i].hd_job = NULL;
+                    if (hd) {
+                        g_tc[i].tex->lpVtbl->Release(g_tc[i].tex);
+                        g_tc[i].tex = hd;
+                        g_tc[i].hd_bytes = bytes;
+                        g_tc_hd_bytes += bytes;
+                        tc_hd_budget();
+                    }
+                }
+            }
             return g_tc[i].tex;
         }
     return NULL;
 }
 
-static void texcache_put(uint32_t offset, uint32_t format, uint32_t sig, IDirect3DTexture8 *tex)
+static void texcache_put(uint32_t offset, uint32_t format, uint32_t sig, IDirect3DTexture8 *tex,
+                         HdJob *hd_job)
 {
     unsigned b;
     int i;
@@ -1119,6 +1330,9 @@ static void texcache_put(uint32_t offset, uint32_t format, uint32_t sig, IDirect
     g_tc[i].sig      = sig;
     g_tc[i].tex      = tex;
     g_tc[i].last_use = ++g_texcache_clock;
+    g_tc[i].hd_bytes = 0;
+    g_tc[i].hd_tick  = g_sig_gen;
+    g_tc[i].hd_job   = hd_job;
     g_tc[i].next     = g_tc_head[b];
     g_tc_head[b]     = i;
     g_tc_live++;
@@ -1133,6 +1347,65 @@ static void texcache_put(uint32_t offset, uint32_t format, uint32_t sig, IDirect
             last_up = g_tc_uploads;
         }
     }
+}
+
+/* Test only -- XBOX_HD_TEXTURES_ALT=<N>: from present N on, one
+ * presented frame in two (odd PresentSeq) binds every texture freshly decoded
+ * from the guest bytes, bypassing the texture cache and everything the HD path added
+ * to it (no lookup, no HD request, no swap, no budget); the other frames take
+ * the normal path. The decode code is fork/main's. In a frozen scene
+ * (pump_ident, N after the pause starts) every capture must then be identical
+ * whatever its parity: with HD textures off, the cache hands out exactly the
+ * guest textures. Within one fresh frame a texture is decoded once (a table
+ * of that frame only); fresh textures are released two presents later. */
+static int hd_alt_fresh(void)
+{
+    static long from = -1;
+    unsigned seq;
+    if (from < 0) { const char *e = getenv("XBOX_HD_TEXTURES_ALT"); from = e && e[0] ? atol(e) : 0; if (from < 0) from = 0; }
+    if (!from) return 0;
+    seq = d3d8_PresentSeq();
+    return seq >= (unsigned)from && (seq & 1u);
+}
+
+static struct { uint32_t offset, format, sig; unsigned seq; IDirect3DTexture8 *tex; } g_alt_memo[4096];
+
+static IDirect3DTexture8 *hd_alt_memo_find(uint32_t offset, uint32_t format, uint32_t sig)
+{
+    unsigned h = (offset * 2654435761u ^ format * 40503u ^ sig) & 4095u, seq = d3d8_PresentSeq();
+    if (g_alt_memo[h].seq == seq && g_alt_memo[h].tex && g_alt_memo[h].offset == offset &&
+        g_alt_memo[h].format == format && g_alt_memo[h].sig == sig)
+        return g_alt_memo[h].tex;
+    return NULL;
+}
+
+static void hd_alt_memo_put(uint32_t offset, uint32_t format, uint32_t sig, IDirect3DTexture8 *tex)
+{
+    unsigned h = (offset * 2654435761u ^ format * 40503u ^ sig) & 4095u;
+    g_alt_memo[h].offset = offset; g_alt_memo[h].format = format; g_alt_memo[h].sig = sig;
+    g_alt_memo[h].seq = d3d8_PresentSeq(); g_alt_memo[h].tex = tex;
+}
+
+static struct { IDirect3DTexture8 *tex; unsigned seq; } g_alt_keep[16384];
+static int g_alt_n;
+
+static void hd_alt_keep(IDirect3DTexture8 *t)
+{
+    static unsigned last = ~0u;
+    unsigned seq = d3d8_PresentSeq();
+    if (seq != last) {                       /* once per frame: drop the old ones */
+        int i, k = 0;
+        for (i = 0; i < g_alt_n; i++)
+            if (seq - g_alt_keep[i].seq >= 2) g_alt_keep[i].tex->lpVtbl->Release(g_alt_keep[i].tex);
+            else g_alt_keep[k++] = g_alt_keep[i];
+        g_alt_n = k;
+        last = seq;
+    }
+    if (g_alt_n < (int)(sizeof g_alt_keep / sizeof g_alt_keep[0])) {
+        g_alt_keep[g_alt_n].tex = t;
+        g_alt_keep[g_alt_n].seq = seq;
+        g_alt_n++;
+    }                                        /* full: kept alive (test only) */
 }
 
 /* Bytes in mip level `level` of a w x h texture. */
@@ -1179,6 +1452,7 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
     uint32_t w      = 1u << TEXFMT_SIZE_U(fmt);
     uint32_t h      = 1u << TEXFMT_SIZE_V(fmt);
     uint32_t xfmt = 0, block_bytes = 0, sig = 0;
+    int fresh = hd_alt_fresh();              /* test (XBOX_HD_TEXTURES_ALT) */
     const uint8_t *src;
     IDirect3DTexture8 *tex = NULL;
     D3DLOCKED_RECT lr;
@@ -1264,7 +1538,7 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
         }
         sig = tex_sig(offset, sz);
         if (linear) sig ^= g_pg.tex[stage].image_rect * 0x9E3779B1u;   /* same bytes, other shape */
-        hit = texcache_find(offset, fmt, sig);
+        hit = fresh ? hd_alt_memo_find(offset, fmt, sig) : texcache_find(offset, fmt, sig);
         if (hit) {
             g_pg.tex[stage].d3d = hit;
             g_pg.tex[stage].d3d_offset = offset;
@@ -1428,7 +1702,33 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
             fprintf(stderr, "[TEXUP] off %08X fmt %08X color %02X %ux%u levels %u bytes %u\n",
                     offset, fmt, (unsigned)color, w, h, levels, total);
     }
-    texcache_put(offset, fmt, sig, tex);
+    {
+        /* The guest texture is drawn until its HD copy, if the pack
+         * has one (XBOX_HD_TEXTURES), is loaded and swapped in by texcache_find.
+         * Linear images (render targets, video frames) never. */
+        HdJob *job = NULL;
+        if (fresh) {
+            hd_alt_keep(tex);                /* not cached: the reference frame */
+            hd_alt_memo_put(offset, fmt, sig, tex);
+        } else {
+            /* Button icons (XBOX_BUTTON_ICONS): a button atlas is swapped at
+             * once for its composed copy; nothing else is looked up for it. */
+            IDirect3DTexture8 *icons = NULL;
+            if (!linear && btnicons_on()) {
+                uint32_t n0 = tex_level_bytes(color, w, h, 0);
+                icons = btnicons_compose(va_ptr(offset, n0), n0, w, h, color, tex);
+                if (icons) {
+                    tex->lpVtbl->Release(tex);
+                    tex = icons;
+                }
+            }
+            if (!icons && !linear && hdtex_on()) {
+                uint32_t n0 = tex_level_bytes(color, w, h, 0);
+                job = hdtex_request(va_ptr(offset, n0), n0, w, h);
+            }
+            texcache_put(offset, fmt, sig, tex, job);
+        }
+    }
     g_pg.tex[stage].d3d        = tex;
     g_pg.tex[stage].d3d_offset = offset;
     g_pg.tex[stage].d3d_format = fmt;
@@ -1489,8 +1789,8 @@ static void apply_draw_state(IDirect3DDevice8 *dev)
             dev->lpVtbl->SetTextureStageState(dev, 0, 4, 4 /*ALPHAOP   = MODULATE*/);
             dev->lpVtbl->SetTextureStageState(dev, 0, 5, 2 /*ALPHAARG1 = TEXTURE*/);
             dev->lpVtbl->SetTextureStageState(dev, 0, 6, 0 /*ALPHAARG2 = DIFFUSE*/);
-            /* The title's own address modes (confirmed against
-             * xemu in part 182): clamping every texture smeared the wrapped ones. */
+            /* The title's own address modes (checked against xemu): clamping
+             * every texture smeared the wrapped ones. */
             {
                 uint32_t au = g_pg.tex[0].address & 0xF, av = (g_pg.tex[0].address >> 8) & 0xF;
                 dev->lpVtbl->SetTextureStageState(dev, 0, 13, au >= 1 && au <= 4 ? au : 3 /*ADDRESSU*/);
@@ -1559,6 +1859,10 @@ static void va_fetch4(int attr, uint32_t idx, float o[4])
     p = va_ptr(g_pg.vattr[attr].offset + idx * stride, 16);
     if (!p)
         return;
+    if (g_plag.patch && stride == 0) {  /* XBOX_PUMPLAG: the block as the title drew the part */
+        uint32_t off = (g_pg.vattr[attr].offset & 0x0FFFFFFFu) - (g_plag.cb & 0x0FFFFFFFu);
+        if (off + 16u <= 0xE0u) p = g_plag.patch + off;
+    }
     switch (type) {
     case NV2A_VA_TYPE_F:
         for (k = 0; k < size && k < 4; k++) {
@@ -1908,7 +2212,20 @@ static void occ_get_report(uint32_t param)
     g_occ_job[j].n = g_occ_ncur;
     for (i = 0; i < g_occ_ncur; i++) { g_occ_job[j].span[i] = g_occ_cur[i]; g_occ_span[g_occ_cur[i]].refs++; }
     QueryPerformanceCounter(&g_occ_job[j].t0);
+    {   /* Fork: the title spins on this report until the pump writes it;
+         * send the queries to the GPU now rather than at the next poll.
+         * XBOX_FIX_PUMP_OCCFLUSH=0: no flush here (the old latency). */
+        static int fl = -1;
+        extern void d3d8_OcclusionFlush(void);
+        extern int d3d8_pump_alt_off(void);
+        if (fl < 0) { const char *e = getenv("XBOX_FIX_PUMP_OCCFLUSH"); fl = !(e && e[0] == '0'); }
+        if (fl && !d3d8_pump_alt_off()) d3d8_OcclusionFlush();
+    }
 }
+
+/* Reports the title is (or will be) waiting for: the pump does not sleep
+ * while there is one (XBOX_FIX_PUMP_OCCWAIT, xbox_memory_layout.c). */
+int pgraph_d3d11_reports_pending(void) { return g_occ_njob; }
 
 /* Pump thread, every tick: write the reports whose spans are all counted. */
 void pgraph_d3d11_poll_reports(void)
@@ -2220,7 +2537,7 @@ static int gpu_prepare(Nv2aVshDraw *d, const uint32_t *indices, uint32_t start, 
 
     if (on < 0) { const char *e = getenv("XBOX_VSH_GPU"); on = !(e && e[0] == '0'); }
     if (!on || g_pg.prog_len <= 0 || count == 0) GPU_NO(0);
-    if (mode == 1 && !d3d8_points_gpu_on()) GPU_NO(1);      /* points sur GPU */
+    if (mode == 1 && !d3d8_points_gpu_on()) GPU_NO(1);      /* points on the GPU */
     if (g_pg.prog_writes_c) GPU_NO(2);
 
     memset(d, 0, sizeof *d);
@@ -2325,6 +2642,8 @@ static int gpu_prepare(Nv2aVshDraw *d, const uint32_t *indices, uint32_t start, 
         d->attr[a].stride = stride;
         d->attr[a].bytes = total;
     }
+    d->mem_lo = g_pg_mem_base;
+    d->mem_hi = g_pg_mem_base ? g_pg_mem_base + g_pg_mem_size : NULL;
     d->prog = g_pg.prog_dec;
     d->prog_len = g_pg.prog_len;
     d->prog_hash = g_pg.prog_hash;
@@ -2357,6 +2676,7 @@ static int gpu_prepare(Nv2aVshDraw *d, const uint32_t *indices, uint32_t start, 
     d->point_smooth = g_pg.point_smooth ? 1 : 0;
     d->point_kx = g_pg.draw_mode == 1 ? points_kx() : 1.0f;
     d->point_zoom = d3d8_PointZoom();
+    d->hud_kx = d->hud_ax = d->hud_ky = d->hud_ay = 0.0f;
     if (!d3d8_nv2a_vsh_ready(d)) GPU_NO(7);
     g_gpu_ok++;
     return 1;
@@ -2398,6 +2718,258 @@ static uint32_t points_squares(const ProgVertex *vb, const uint8_t *okb, const f
         tb[o++] = q[2]; tb[o++] = q[1]; tb[o++] = q[3];
     }
     return o;
+}
+
+/* The scale of the current HUD element, in the draw's pixels; 0 when
+ * the draw is not part of one. */
+static int hud_element(float *kx, float *ax, float *ky, float *ay)
+{
+    float sw = (float)d3d8_GetBackbufferWidth(), sh = (float)d3d8_GetBackbufferHeight();
+    if (sw <= 0.0f) sw = 640.0f;
+    if (sh <= 0.0f) sh = 480.0f;
+    /* With the 16:9 frame, the mode of the image (its 3D is the frame
+     * before's); without it (16:9, 16:10) only the 2D changes: the mode of
+     * the frame being drawn (its frame tag comes first). */
+    int wide = g_box.k > 0.0f ? g_box.img_wide : g_box.next_wide;
+    if (g_panel.on && g_ph.phase == PGRAPH_PHASE_HUD) {
+        /* a panel: x at the 4:3 proportions of the image (k2d; in a
+         * framed image, kboxed: 0.75 when it is shown at 16:9, 1 when at
+         * 4:3), its ends to the screen's edges (the frame's, framed).
+         * kx < 0 says so: then ky, ay are the left and right edges, in the
+         * draw's pixels (hud_vertex, and the vertex shader). */
+        int boxed = g_box.k > 0.0f && !wide;
+        float k = boxed ? (g_box.kboxed > 0.0f ? g_box.kboxed : 0.75f) : g_box.k2d;
+        if (g_panel.wide_only && !wide) return 0;
+        if (!(k > 0.0f && k < 1.0f)) {
+            /* 4:3 (no race 2D, no frame), or an image already at 4:3 in
+             * its frame: x as drawn, only the ends move */
+            if (g_panel.scale_only || (!boxed && (g_box.k > 0.0f || g_box.k2d > 0.0f))) return 0;
+            k = 1.0f;
+        }
+        *ax = 0.5f * sw;
+        if (g_panel.scale_only) {
+            *kx = k;
+            *ky = 1.0f;
+            *ay = 0.0f;
+        } else {
+            *kx = -k;
+            *ky = g_panel.l * sw / 640.0f;
+            *ay = g_panel.r * sw / 640.0f;
+        }
+        g_hud.draws++;
+        return 1;
+    }
+    if (g_box.on && wide && (g_box.k2d > 0.0f || g_box.k > 0.0f) &&
+        g_ph.phase == PGRAPH_PHASE_HUD) {
+        /* framed: the title's 4:3 proportions, else the centred 16:9 */
+        *kx = g_box.k2d > 0.0f ? g_box.k2d : g_box.k;
+        *ky = 1.0f;
+        *ax = 0.5f * sw;
+        *ay = 0.0f;
+        g_hud.draws++;
+        return 1;
+    }
+    if (!(g_hud.on && g_hud.kx > 0.0f && g_ph.phase == PGRAPH_PHASE_HUD)) return 0;
+    *kx = g_hud.kx;
+    *ky = g_hud.ky;
+    *ax = g_hud.ax * sw / 640.0f;
+    *ay = g_hud.ay * sh / 480.0f;
+    g_hud.draws++;
+    return 1;
+}
+
+/* One vertex through hud_element's scale; kx < 0: a panel's end piece, the
+ * vertices past its edges (ky, ay) to the screen's (0, width sw). Keep in
+ * step with the vertex shader (d3d8_nv2a_vsh.c). */
+static void hud_vertex(float *x, float *y, float kx, float ax, float ky, float ay)
+{
+    if (kx < 0.0f) {
+        float sw = (float)d3d8_GetBackbufferWidth();
+        if (sw <= 0.0f) sw = 640.0f;
+        *x = *x <= ky ? 0.0f : *x >= ay ? sw : ax + (*x - ax) * -kx;
+        return;
+    }
+    *x = ax + (*x - ax) * kx;
+    *y = ay + (*y - ay) * ky;
+}
+
+/* A panel's end pieces on the CPU path (triangle list): x at the 4:3
+ * proportions, and the vertices past the panel's edges to the screen's.
+ * A piece is one quad holding a straight run and half of the bar's curve
+ * (texture across the whole quad): moving its outer vertex alone would
+ * stretch the curve. So the moved vertex takes the attributes (texture
+ * coordinates, colours, fog) of the triangle's plane at its new place: the
+ * texture keeps its 4:3 density and only runs on past the old end (the
+ * straight run, with the texture clamped). */
+static int panel_snap_list(ProgVertex *v, uint32_t n, float k, float ax, float el, float er)
+{
+    static ProgVertex *src;
+    static uint32_t cap;
+    float sw = (float)d3d8_GetBackbufferWidth();
+    uint32_t t, j;
+    int moved = 0;
+    if (sw <= 0.0f) sw = 640.0f;
+    if (n > cap) {
+        ProgVertex *a = (ProgVertex *)realloc(src, n * sizeof *a);
+        if (!a) return 0;
+        src = a;
+        cap = n;
+    }
+    for (j = 0; j < n; j++) {
+        src[j] = v[j];
+        src[j].x = ax + (v[j].x - ax) * k;      /* the 4:3 place of every vertex */
+        v[j].x = src[j].x;
+    }
+    for (t = 0; t + 2 < n; t += 3) {
+        const ProgVertex *a = &src[t], *b = &src[t + 1], *c = &src[t + 2];
+        float d = (b->x - a->x) * (c->y - a->y) - (c->x - a->x) * (b->y - a->y);
+        for (j = t; j < t + 3; j++) {
+            float ox = ax + (src[j].x - ax) / k, nx, dx;
+            const float *pa, *pb, *pc;
+            float *out;
+            int m;
+            if (ox <= el) nx = 0.0f;
+            else if (ox >= er) nx = sw;
+            else continue;
+            dx = nx - src[j].x;
+            v[j].x = nx;
+            moved++;
+            if (!(d > 1e-6f || d < -1e-6f)) continue;
+            /* d(attribute)/dx of the plane through a, b, c */
+#define PANEL_EXTRA(field, cnt)             for (m = 0, pa = a->field, pb = b->field, pc = c->field, out = v[j].field; m < (cnt); m++)                 out[m] = src[j].field[m] + dx * (((pb[m] - pa[m]) * (c->y - a->y) - (pc[m] - pa[m]) * (b->y - a->y)) / d);
+            PANEL_EXTRA(t[0], 4)
+            PANEL_EXTRA(t[1], 4)
+            PANEL_EXTRA(t[2], 4)
+            PANEL_EXTRA(t[3], 4)
+            PANEL_EXTRA(d0, 4)
+            PANEL_EXTRA(d1, 4)
+#undef PANEL_EXTRA
+        }
+    }
+    return moved;
+}
+
+/* ── XBOX_CULLSTAT=N (diagnostic): which draws reach the screen ─────
+ * Every N-th presented frame, each program draw is run through the CPU
+ * vertex program (all its vertices) and classified: fully outside the
+ * title frame (every vertex on the same outer side, or all behind the eye),
+ * sub-pixel (screen box under 2x2 title pixels), or visible. One [CULL]
+ * line per sampled frame: draws / vertices per class and per render group
+ * (g0..g6 3D, 7 persp >= 7, 8 HUD, 9 other). Off by default; the sampled
+ * frames are much slower (CPU transform of every vertex). */
+static int g_cull_n = -1;
+static int g_cull_grp = 9;
+void cullstat_set_group(int ph, uint32_t tag)
+{
+    if (ph == 2) { if (((tag >> 14) & 3u) == 2u) { int g = (int)((tag >> 5) & 31u); g_cull_grp = g > 6 ? 6 : g; } }
+    else g_cull_grp = ph == 3 ? 7 : ph == 4 ? 8 : 9;
+}
+static unsigned g_cull_frame = 0xFFFFFFFFu;
+static struct { unsigned d[10][3]; unsigned long long v[10][3]; } g_cs;
+static void cullstat_flush(unsigned f)
+{
+    int g, c;
+    unsigned td[3] = {0, 0, 0};
+    unsigned long long tv[3] = {0, 0, 0};
+    char buf[1024];
+    int o = 0;
+    for (g = 0; g < 10; g++) for (c = 0; c < 3; c++) { td[c] += g_cs.d[g][c]; tv[c] += g_cs.v[g][c]; }
+    if (td[0] + td[1] + td[2] == 0) return;
+    for (g = 0; g < 10; g++)
+        if (g_cs.d[g][0] + g_cs.d[g][1] + g_cs.d[g][2])
+            o += snprintf(buf + o, sizeof buf - (size_t)o, " g%d %u/%u/%u", g,
+                          g_cs.d[g][0], g_cs.d[g][1], g_cs.d[g][2]);
+    fprintf(stderr, "[CULL] f%u draws vis/out/tiny %u/%u/%u verts %llu/%llu/%llu |%s\n", f,
+            td[0], td[1], td[2], tv[0], tv[1], tv[2], buf);
+    memset(&g_cs, 0, sizeof g_cs);
+}
+/* XBOX_PUMPLAG: a draw of a part whose matrix was rewritten. Its screen box
+ * as drawn (the block now) and as the title meant it (the block when it drew
+ * the part), both run through the CPU vertex program; the frame is saved
+ * (XBOX_PUMPLAG_SHOTS). [PLAGD] lines, in title pixels (sw x sh). */
+static void plag_box(const uint32_t *indices, uint32_t start, uint32_t count, float b[4], unsigned *front)
+{
+    uint32_t i;
+    b[0] = b[1] = 1e30f; b[2] = b[3] = -1e30f; *front = 0;
+    for (i = 0; i < count; i++) {
+        float in[16][4], out[VSHCPU_OUT_REGS][4], x, y, w;
+        uint32_t idx = indices ? indices[i] : start + i;
+        int a;
+        for (a = 0; a < 16; a++) {
+            if (g_pg.prog_inputs & (1u << a)) va_fetch4(a, idx, in[a]);
+            else in[a][0] = in[a][1] = in[a][2] = 0.0f, in[a][3] = 1.0f;
+        }
+        vshcpu_run(g_pg.prog_dec, g_pg.prog_len, (const float (*)[4])in, g_pg.vconst, out);
+        x = out[VSHCPU_OUT_POS][0]; y = out[VSHCPU_OUT_POS][1]; w = out[VSHCPU_OUT_POS][3];
+        if (!(w > 0.0f)) continue;
+        (*front)++;
+        if (x < b[0]) b[0] = x;
+        if (y < b[1]) b[1] = y;
+        if (x > b[2]) b[2] = x;
+        if (y > b[3]) b[3] = y;
+    }
+}
+static void plag_draw(const uint32_t *indices, uint32_t start, uint32_t count, float sw, float sh)
+{
+    static unsigned printed;
+    extern void d3d8_PlagShot(void);
+    float d[4], e[4];
+    unsigned fd, fe;
+    plag_box(indices, start, count, d, &fd);
+    g_plag.patch = g_plag.snap;
+    plag_box(indices, start, count, e, &fe);
+    g_plag.patch = NULL;
+    if (printed++ < 2000u)
+        fprintf(stderr, "[PLAGD] f%u block %08X count %u drawn x %.1f..%.1f y %.1f..%.1f (%u in front) "
+                "meant x %.1f..%.1f y %.1f..%.1f (%u in front) frame %.0fx%.0f\n",
+                d3d8_PresentSeq(), g_plag.cb, count, d[0], d[2], d[1], d[3], fd, e[0], e[2], e[1], e[3], fe, sw, sh);
+    d3d8_PlagShot();
+}
+
+static void cullstat_draw(const uint32_t *indices, uint32_t start, uint32_t count, float sw, float sh)
+{
+    unsigned f = d3d8_PresentSeq();
+    uint32_t i;
+    unsigned and_code = 0xFFu;
+    float mnx = 1e30f, mny = 1e30f, mxx = -1e30f, mxy = -1e30f;
+    int cls, front = 0;
+    if (g_cull_n < 0) { const char *e = getenv("XBOX_CULLSTAT"); g_cull_n = e ? atoi(e) : 0; }
+    if (g_cull_n <= 0) return;
+    if (f != g_cull_frame) { if (g_cull_frame != 0xFFFFFFFFu) cullstat_flush(g_cull_frame); g_cull_frame = f; }
+    if (f % (unsigned)g_cull_n) return;
+    for (i = 0; i < count; i++) {
+        float in[16][4], out[VSHCPU_OUT_REGS][4], x, y, z, w;
+        uint32_t idx = indices ? indices[i] : start + i;
+        unsigned code = 0;
+        int a;
+        for (a = 0; a < 16; a++) {
+            if (g_pg.prog_inputs & (1u << a)) va_fetch4(a, idx, in[a]);
+            else in[a][0] = in[a][1] = in[a][2] = 0.0f, in[a][3] = 1.0f;
+        }
+        vshcpu_run(g_pg.prog_dec, g_pg.prog_len, (const float (*)[4])in, g_pg.vconst, out);
+        x = out[VSHCPU_OUT_POS][0]; y = out[VSHCPU_OUT_POS][1];
+        z = out[VSHCPU_OUT_POS][2]; w = out[VSHCPU_OUT_POS][3];
+        if (!(w > 0.0f)) code = 16;
+        else {
+            if (x < 0.0f) code |= 1;
+            if (x > sw) code |= 2;
+            if (y < 0.0f) code |= 4;
+            if (y > sh) code |= 8;
+            if (g_pg.clip_max > 0.0f && z > g_pg.clip_max) code |= 32;
+            if (x < mnx) mnx = x;
+            if (x > mxx) mxx = x;
+            if (y < mny) mny = y;
+            if (y > mxy) mxy = y;
+            front = 1;
+        }
+        and_code &= code;
+        if (!and_code && i > 64 && front && (mxx - mnx) * (mxy - mny) >= 4.0f) break;   /* visible: no need to finish */
+    }
+    if (and_code) cls = 1;
+    else if (front && (mxx - mnx) < 2.0f && (mxy - mny) < 2.0f && i >= count) cls = 2;
+    else cls = 0;
+    g_cs.d[g_cull_grp][cls]++;
+    g_cs.v[g_cull_grp][cls] += count;
 }
 
 static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count)
@@ -2446,6 +3018,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         int f = (int)d3d8_PresentSeq();
         if (pick_cpu < 0) pick_cpu = getenv("XBOX_NV2A_PICK") != NULL;
         gpu = !(pick_cpu && g_drawlog_lo >= 0 && f >= g_drawlog_lo && f < g_drawlog_lo + g_drawlog_n)
+              && !(g_panel.on && !g_panel.scale_only && g_ph.phase == PGRAPH_PHASE_HUD)  /* panel ends: CPU */
               && gpu_prepare(&gd, indices, start, count);
     }
     if (gpu) {
@@ -2833,11 +3406,15 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                 union { float f; DWORD u; } fb;
                 if (bias & 0x1000) bias -= 0x2000;
                 fb.f = (float)bias / 256.0f;
-                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MAGFILTER, mag == 1 ? 1 : 2);
+                /* The PS2 game's buttons (XBOX_BUTTON_ICONS=ps2): their atlas
+                 * is sampled nearest neighbour, mip levels included, so that
+                 * its pixels show as they are (nv2a_btnicons.h). */
+                int pt = btnicons_point(t);
+                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MAGFILTER, (pt || mag == 1) ? 1 : 2);
                 dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MINFILTER,
-                                                  (min == 1 || min == 3 || min == 5) ? 1 : 2);
+                                                  (pt || min == 1 || min == 3 || min == 5) ? 1 : 2);
                 dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MIPFILTER,
-                                                  (min == 3 || min == 4) ? 1 : (min == 5 || min == 6) ? 2 : 0);
+                                                  (min == 3 || min == 4) ? 1 : (min == 5 || min == 6) ? (pt ? 1 : 2) : 0);
                 dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MIPMAPLODBIAS, fb.u);
                 dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MAXMIPLEVEL, ((c0 >> 18) & 0xFFFu) >> 8);
                 dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MAXANISOTROPY, 1u << ((c0 >> 4) & 3u));
@@ -3030,8 +3607,8 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
 
         double ptk = g_perf_on ? perf_now() : 0.0;
         if (d3d8_pump_cache_on()) {
-            /* Même état octet pour octet qu'au draw précédent =
-             * même clé (la clé est un hachage de ces octets). */
+            /* Same state byte for byte as the previous draw =
+             * same key (the key is a hash of these bytes). */
             static Nv2aPshState last;
             static uint64_t last_key;
             static int have;
@@ -3102,6 +3679,19 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                     if (fix ? g_pg.front_face == 0x901 : g_pg.front_face == 0x900) raster |= 8;
                 }
             }
+            {
+                /* Race HUD element in its own proportions. */
+                float kx, ax, ky, ay;
+                if (hud_element(&kx, &ax, &ky, &ay)) {
+                    if (gpu) { gd.hud_kx = kx; gd.hud_ax = ax; gd.hud_ky = ky; gd.hud_ay = ay; }
+                    else if (kx < 0.0f && prim == D3DPT_TRIANGLELIST && !points)
+                        g_panel.moved += (unsigned long long)panel_snap_list(tb, n, -kx, ax, ky, ay);
+                    else for (i = 0; i < n; i++)
+                        hud_vertex(&tb[i].x, &tb[i].y, kx, ax, ky, ay);
+                }
+            }
+            if (gpu && !points) cullstat_draw(indices, start, count, gd.screen_w, gd.screen_h);
+            if (gpu && g_plag.bad && !points) plag_draw(indices, start, count, gd.screen_w, gd.screen_h);
             if (gpu) {
                 gd.ps_key = key;
                 gd.ps_consts = &pc;
@@ -3159,6 +3749,16 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         g_vs.z_neg = g_vs.z_over = g_vs.xy_off = g_vs.w_neg = 0;
         fflush(stderr);
     }
+}
+
+/* The same for the title's pre-transformed vertices (screen pixels). */
+static void hud_scale_out(OutputVertex *out, uint32_t n)
+{
+    float kx, ax, ky, ay;
+    uint32_t i;
+    if (!hud_element(&kx, &ax, &ky, &ay)) return;
+    for (i = 0; i < n; i++)
+        hud_vertex(&out[i].x, &out[i].y, kx, ax, ky, ay);
 }
 
 /* Gather `count` vertices starting at `start` from the bound streams and hand
@@ -3291,6 +3891,7 @@ static void draw_arrays(uint32_t start, uint32_t count)
         }
     }
 
+    hud_scale_out(out, count);
     dev->lpVtbl->BeginScene(dev);
     dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)prim, prim_count,
                                  out, sizeof(OutputVertex));
@@ -3640,6 +4241,7 @@ static void submit_draw(void)
     dev->lpVtbl->BeginScene(dev);
 
     /* Draw */
+    hud_scale_out(out, out_vert_count);
     dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)g_pg.d3d_prim_type,
                                   prim_count, out, sizeof(OutputVertex));
 
@@ -4015,6 +4617,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
                 g_pg.draws_since_present = 0;
                 g_pg.frame_no++;
                 pass_phase_image_done();
+                box_image_done();
                 d3d8_PresentFrame();
             }
         }
@@ -4077,6 +4680,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             g_pg.draws_since_present = 0;
             g_pg.frame_no++;
             pass_phase_image_done();
+            box_image_done();
             d3d8_PresentFrame();
         }
         if (dev) {
@@ -4420,6 +5024,13 @@ void pgraph_d3d11_get_stats(PgraphD3D11Stats *out)
     if (out) *out = g_pg.stats;
 }
 
+/* Draws translated so far, read from another thread (the freeze watchdog,
+ * port crashreport.c): it only looks for a change. */
+uint32_t pgraph_d3d11_draw_count(void)
+{
+    return *(volatile uint32_t *)&g_pg.stats.draw_calls;
+}
+
 /* Present the frame.
  *
  * SSX never emits NV097_FLIP_STALL or NV097_FLIP_INCREMENT_WRITE -- the
@@ -4559,7 +5170,7 @@ void pgraph_d3d11_present_guest_fb(uint32_t va, uint32_t pitch,
     }
 }
 
-/* Compteurs cumulés pour XBOX_PERF (lus au Present). */
+/* Cumulative counters for XBOX_PERF (read at Present). */
 void pgraph_d3d11_perf_counts(unsigned *draws, unsigned *methods, unsigned *verts)
 {
     *draws = (unsigned)g_pg.stats.draw_calls;

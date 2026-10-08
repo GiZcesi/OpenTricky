@@ -1,14 +1,14 @@
-<img width="1280" height="320" alt="BANNIERE-FINALE-1280x320" src="https://github.com/user-attachments/assets/eb23ea38-f97d-43a1-b22c-e58a80f90aa7" />
+<a href="https://opentricky.com"><img width="1280" height="320" alt="OpenTricky" src="https://github.com/user-attachments/assets/eb23ea38-f97d-43a1-b22c-e58a80f90aa7" /></a>
 
 <h1 align="center">OpenTricky</h1>
 
-
 <p align="center">
-  <b>SSX Tricky (Xbox, 2001), running natively on Windows</b><br>
-  A recompiled PC port with modern display options. It is not an emulator. Bring your own disc.
+  <b>The PC port SSX Tricky never got.</b><br>
+  Built from the Xbox game, with the original's features restored, and everything a modern PC release would have: today's controllers, new visual options, ultrawide, high frame rates and a real launcher.
 </p>
 
 <p align="center">
+  <a href="https://opentricky.com"><img alt="Website: opentricky.com" src="https://img.shields.io/badge/website-opentricky.com-0b5cd5"></a>
   <a href="https://github.com/GiZcesi/OpenTricky/releases"><img alt="Release" src="https://img.shields.io/github/v/release/GiZcesi/OpenTricky?include_prereleases&label=release&color=orange"></a>
   <img alt="Status: unstable" src="https://img.shields.io/badge/status-unstable-orange">
   <img alt="Platform: Windows 10/11 x64" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue">
@@ -20,12 +20,8 @@
 
 <p align="center"><b>Join the <a href="https://discord.gg/r38sThsqnj">OpenTricky Discord</a></b> for help, screenshots and news about the next builds.</p>
 
-<!-- TODO screenshot (hero): 21:9 race start on Garibaldi — Smooth edges High, Soft shadows On, Draw distance Max -->
-
 > [!IMPORTANT]
-> **You need your own game.** This repository contains source code only: no disc image, no game data, music or video, and no translated game code.
-> The release contains the compiled executable only: no disc image, game data, music or video.
-> To play, you still need a disc image (`.iso`) of your own ***SSX Tricky* for the original Xbox, USA release**.
+> **You need your own game.** No disc image, game code, music or video is distributed: you need a disc image (`.iso` or `.xiso`) of ***SSX Tricky* for the original Xbox, USA release**.
 
 > [!WARNING]
 > **This is an unstable release.** You can play it from start to finish, but some parts are still rough. Please read [Known issues](#known-issues) before reporting a bug.
@@ -35,17 +31,13 @@
 ## Contents
 
 - [What is this?](#what-is-this)
-- [What's new since SSX Tricky PC v0.2.0](#whats-new-since-ssx-tricky-pc-v020)
-- [Screenshots](#screenshots)
-- [What you need](#what-you-need)
+- [What's new in 0.1.1](#whats-new-in-011)
 - [Install and play](#install-and-play)
-- [Controls](#controls)
-- [Settings](#settings)
+- [Controls and settings](#controls-and-settings)
 - [Known issues](#known-issues)
 - [FAQ](#faq)
 - [Building from source](#building-from-source)
 - [Reporting a bug](#reporting-a-bug)
-- [Community](#community)
 - [Credits](#credits)
 - [Legal](#legal)
 
@@ -53,163 +45,76 @@
 
 ## What is this?
 
-OpenTricky continues [**SSX Tricky PC**](https://github.com/MatiasRiveraC/SSX-Tricky-PC) by MatiasRiveraC.
-The game's own Xbox code is translated to C with [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and compiled into an ordinary Windows program.
-The Xbox's graphics, sound and input chips are reimplemented on Direct3D 11, XAudio2 and XInput.
+OpenTricky runs *SSX Tricky* (Xbox, 2001) natively on Windows. It is not an emulator: the game's own Xbox code is translated to C with
+[xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and compiled into an ordinary Windows program, and the Xbox's graphics, sound and input chips
+are reimplemented on Direct3D 11, XAudio2 and XInput. OpenTricky continues [**SSX Tricky PC**](https://github.com/MatiasRiveraC/SSX-Tricky-PC) by MatiasRiveraC.
 
-The goals, in order:
+The goals:
 
-1. **Look and play like the Xbox.** Everything that works on the console should work here, including the fog, lens flares, colours and intro scenes.
-2. **Run well on today's PCs**: high frame rates, ultrawide screens, any resolution.
-3. **Offer optional extras on top**: smoother edges, soft shadows, a longer draw distance.
-   Every extra can be switched off, and the defaults look like the Xbox.
+1. **Feature complete.** Built from the Xbox version, with the console's features restored: fog, lens flares, colours, 5.1 sound.
+2. **A modern PC release**: modern controllers and button styles (Xbox, PlayStation, PS2 original), the original PS2 controls with all 15 grabs, full keyboard and controller remapping, any resolution, ultrawide, high frame rates, all set up in one launcher.
+3. **New options on top**: smoother edges, soft shadows, longer draw distance, optional HD textures. The *Original Xbox* preset turns them all off at once.
 
-## What's new since SSX Tricky PC v0.2.0
+## What's new in 0.1.1
 
-**Closer to the Xbox**
-- The fog and mist banks over the courses are back.
-- The sun's lens flares are back.
-- Board tops are no longer black. This fixes the Uberboard and also brings back the terrain's distance haze.
-- Colours and brightness match the console. The Xbox's gamma ramp is now applied, so the picture is no longer about 12 % too bright.
-- The race fly-over and the rider intros play in full.
-- A rare freeze at the EA logo on start-up is fixed.
+- **A new launcher**, `OpenTricky.exe`: settings in six tabs with presets, full keyboard and controller remapping, and updates it installs only if you say so.
+- **The original PS2 controls**: all 15 grabs on the shoulder buttons and triggers, with *Xbox modern*, *PlayStation modern* or *PS2 original* buttons.
+- **Wide screens done properly**: the race HUD keeps its proportions, and the menus are shown as the Xbox drew them, in 4:3.
+- **More stable**: a rare save loss and rare freezes and crashes are fixed, and your previous save is kept as a backup.
+- **5.1 surround**, **VSync**, smoother high frame rates and less overhead in the busiest scenes.
 
-**Faster and smoother**
-- **High frame rates**: 60 like the Xbox, or 120, 144, 240 or unlimited.
-  The game logic still runs at 60 steps per second, exactly as on the Xbox. The frames in between are interpolated, so the gameplay doesn't change.
-- **A much lighter renderer**: it does less work per frame, and particles are now drawn on the GPU. On a gaming PC at 1080p, this took the median frame rate from about 110 to about 225 FPS.
-- The sound no longer crackles, and the audio delay is shorter.
-
-**Modern display**
-- **Ultrawide 21:9 and 32:9**: the game draws a wider view itself instead of stretching the picture. A field-of-view setting is included.
-- **Smooth edges (SMAA)**, from Low to Ultra. Menu and HUD text stays sharp.
-- **Soft shadows** (optional): shadow edges fade over a few pixels instead of the Xbox's hard edges.
-- **Draw distance** (optional): Original, Far (×1.5) or Max (×2), so less scenery pops in.
-
-**Like a real PC game**
-- A new launcher in the style of the game, with the game's own menu sounds and settings in tabs.
-- Keyboard and controller remapping in the launcher.
-- A clean borderless window (`Alt+Enter` or `F11` for fullscreen), and `F12` screenshots.
-- Saves are kept in `Documents\My Games\SSX Tricky\Saves`. A portable mode is also available.
-
-The full list is in [CHANGELOG.md](CHANGELOG.md).
-
-## Screenshots
-
-<!-- TODO screenshot 1: race start, 1920×1080 16:9 — Smooth edges High, Soft shadows On, Draw distance Max -->
-<!-- TODO screenshot 2: 3440×1440 21:9 — a big trick in mid-air, showing the wider view -->
-<!-- TODO screenshot 3: comparison "v0.2.0 vs OpenTricky" — fog on Garibaldi, sun flare on Elysium, Uberboard, brightness -->
-
-*Screenshots are coming soon.*
-
-## What you need
-
-| | |
-|---|---|
-| **The game** | A disc image (`.iso`) of your own ***SSX Tricky* Xbox disc, USA release**. The PS2 and GameCube versions won't work, and neither will the PAL or Japanese Xbox releases. |
-| **PC** | Windows 10 or 11, 64-bit, and a Direct3D 11 graphics card. Any recent PC plays at 60 FPS. For high frame rates at high resolutions, you need a gaming PC. |
-| **Controller** | Optional. Any Xbox-style (XInput) controller works, and so does the keyboard. |
+Everything else: the [release notes](https://github.com/GiZcesi/OpenTricky/releases) and [CHANGELOG.md](CHANGELOG.md).
 
 ## Install and play
 
+**You need** Windows 10 or 11 (64-bit), a Direct3D 11 graphics card, and a disc image (`.iso` or `.xiso`) of your own ***SSX Tricky* Xbox disc, USA release**
+(the PS2, GameCube, PAL and Japanese versions won't work). A controller is optional: Xbox-style (XInput) controllers and the keyboard work.
+
 1. Download `OpenTricky-<version>-win64.zip` from [**Releases**](https://github.com/GiZcesi/OpenTricky/releases) and extract it into a folder of its own.
-2. Make a disc image (`.iso`) of your SSX Tricky Xbox disc.
-3. Start **`SSX Tricky.exe`**. The first time, the launcher asks for your disc image and then remembers it.
-4. Open **SETTINGS** to choose the resolution, the screen shape (the game starts in 4:3, like the Xbox) and the extras, then press **PLAY**.
+2. Start **`OpenTricky.exe`**, the launcher, and choose your disc image: the launcher checks it and remembers it.
+3. Pick a preset or your own settings, then press **PLAY**.
 
 > [!NOTE]
 > Windows SmartScreen may warn you because the program isn't code-signed. If you trust the download, choose **More info → Run anyway**.
 
-Settings are kept in `SSX Tricky.ini`, next to the game. Screenshots go to a `Screenshots` folder next to the game.
-For a portable copy that keeps its saves next to the game, create an empty file named `portable.txt` in the game's folder.
+The launcher also installs the next versions for you, only if you say so. More in the [install guide](https://opentricky.com/install).
 
-## Controls
+## Controls and settings
 
-Everything can be remapped in **SETTINGS → CONTROLS**.
+The game uses the **original PS2 layout**. Everything can be remapped in the launcher's **Controls** tab.
 
-| Xbox button | Controller | Keyboard |
+| PS2 button | Controller | Keyboard |
 |---|---|---|
-| A / B / X / Y | A / B / X / Y | `Space` / `Esc` / `C` / `V` |
-| Black / White | RB / LB | `R` / `F` |
-| Left / right trigger | LT / RT | `Q` / `E` |
-| Start / Back | Start / Back | `Enter` / `Tab` |
+| Cross / Circle / Square / Triangle | A / B / X / Y | `Space` / `Esc` / `C` / `V` |
+| L1 / R1 | LB / RB | `F` / `R` |
+| L2 / R2 | LT / RT | `Q` / `E` |
+| Start / Select | Start / Back | `Enter` / `Tab` |
+| L3 (press the left stick) | Left stick press | `X` |
 | Left stick and D-pad | Left stick and D-pad | Arrow keys |
 
-| In the game window | |
-|---|---|
-| `Alt+Enter` or `F11` | Window / fullscreen |
-| `F12` | Screenshot |
-| `Alt+F4` | Quit |
+In the game window: `Alt+Enter` or `F11` switches window / fullscreen, `F12` takes a screenshot, `Alt+F4` quits.
 
-## Settings
-
-All settings are in the launcher. Defaults are in **bold**. Out of the box, the game looks like the Xbox.
-
-| Setting | Choices | What it does |
-|---|---|---|
-| Resolution | from 640×480 to 4K, plus ultrawide sizes | The size the game is drawn at. |
-| Display | **Window**, Fullscreen | `Alt+Enter` switches while you play. |
-| Screen shape | **4:3**, 16:9, 21:9, 32:9, Auto | 16:9 is the game's own widescreen mode. 21:9 and 32:9 show a wider view and aren't stretched. |
-| Field of view (wide screens) | **No stretch**, Balanced, Full | For 21:9 and 32:9 only. *No stretch* keeps the 16:9 width of view. *Full* shows more, with stretched edges. |
-| Smooth edges | **Off**, Low, Medium, High, Ultra | SMAA edge smoothing. Text stays sharp. |
-| Extra edge smoothing (MSAA) | **Off**, 2×, 4×, 8× | Smooths edges while drawing. It costs more, and it adds to *Smooth edges*. |
-| Texture sharpness | **Like the Xbox**, 2× to 16× | Anisotropic filtering: sharper slopes in the distance. |
-| Soft shadows | **Off**, On | Shadow edges fade over a few pixels instead of the Xbox's hard edges. |
-| Frame rate limit | **60**, 120, 144, 240, Unlimited | Above 60, the frames in between are interpolated. The game logic stays at 60. |
-| Draw distance | **Original**, Far, Max | Draws scenery ×1.5 or ×2 further away. It costs CPU time. |
-| Show frame rate | **Off**, On | Shows the FPS in the window title. |
-| Audio delay | **normal (~76 ms)**, shorter or longer | Raise it if the sound crackles. |
-| Menu sounds | **On**, Off | Plays the game's own menu sounds in the launcher, read from your disc. |
-| Look like the Xbox | **On**, Off | The fixes that bring back the fog, lens flares, board tops and colours. Leave it on. |
-| Save games folder | **Automatic**, a folder you choose | `Documents\My Games\SSX Tricky\Saves` by default. |
-| Log file | **Off**, On | Writes `SSX Tricky.log` next to the game, for bug reports. |
+All settings are in the launcher, in six tabs (*Display*, *Graphics*, *Audio*, *Controls*, *Game*, *Advanced*). Three presets set the main ones at once:
+**Recommended** (the default), *Original Xbox* (every PC extra off) and *Steam Deck* (1280×800, 60 FPS).
+Every setting, with its choices and default, is explained in the [**Settings guide**](https://opentricky.com/settings) and the [controls page](https://opentricky.com/controls).
 
 ## Known issues
 
-From most to least serious. If your problem isn't listed, please [report it](#reporting-a-bug).
+The main ones, most serious first. The full list is on [opentricky.com/known-issues](https://opentricky.com/known-issues).
 
-| Severity | Problem | What to do for now |
-|---|---|---|
-| High | **Rare crash while a race loads or during its intro.** It is very rare, and the cause is being investigated. | Start the game again; your saves are safe. If it happens, please send the log file. |
-| Medium | **21:9 and 32:9: the race HUD is stretched.** Menus and loading screens also fill the whole width instead of keeping their original frame. A proper wide-screen HUD is in progress. | Play in 16:9 if this bothers you. The 3D view itself is correct. |
-| Medium | **32:9 with *No stretch*: the view looks zoomed in.** | Use the *Balanced* field of view on 32:9 screens. |
-| Medium | **A short flash on screen when your rider respawns after a fall.** | No workaround yet. A fix is in progress. |
-| Low | **At very high resolutions with every extra on** (for example 3440×1440 with Soft shadows and Draw distance Max), the game runs at about 100–140 FPS, with occasional dips. | Use *Draw distance: Far* or *Original*, or a 144 FPS limit. |
-| Low | **No VSync option yet.** With *Unlimited*, you may see tearing. | Set *Frame rate limit* to your monitor's refresh rate. |
-| Low | **Above 60 FPS, the controls answer one game step later** (about 17 ms). The interpolated frames need this. | Use *60* for the Xbox's exact timing. |
-| Low | **Split screen: if both players are on the same controller,** the second view shows the first player. The original port does this too. | Give each player their own controller. |
-| Low | **The sound may crackle on some PCs.** | Raise *Audio delay* in the launcher. |
-| Minor | **Only Xbox-style (XInput) controllers are supported.** PlayStation controllers aren't supported natively yet, and the on-screen buttons are Xbox ones. | Use Steam Input or DS4Windows. Native support is in progress. |
-| Minor | **Snow spray and trails can look smaller or fainter than you remember.** We found no error in the port: they match what the game itself draws. | Nothing to do. We're still comparing against a real console. |
-| Minor | **The Snowdream and Pipedream skies differ from v0.2.0.** The night sky with the moon, and the black sky above the Pipedream dome, are what the Xbox shows. | Nothing to do. |
-| Minor | **The launcher's menu sounds are a little loud.** | Set *Menu sounds* to Off. |
-| Minor | ***Far* and *Max* draw distance are new.** A track may show odd scenery far away. | Switch back to *Original*, and tell us which track it was. |
+| Problem | What to do for now |
+|---|---|
+| **At the start of a race, the picture can briefly look doubled or shifted** with some settings. We're looking into it. | Tell us your settings (Discord or an issue). |
+| **During the opening logo video, the first press of Start is sometimes ignored** (Enter on the keyboard). | Press it again. If it still doesn't react, let the video play to the end, or restart the game. |
+| **Frame rate drops when riders collide, and Snowdream runs slower than other tracks.** | No workaround yet. |
+| **Above 60 FPS, the controls answer one game step later** (about 17 ms). | Set *Frame rate limit* to *60* for the Xbox's exact timing. |
+| **Only Xbox-style (XInput) controllers are supported natively.** | Use Steam Input or DS4Windows, and choose *PlayStation modern* or *PS2 original* in *Button style*. |
+| **Steam Deck, Linux (Proton) and real 5.1 speakers are not tested yet.** | Reports are welcome. |
 
 ## FAQ
 
-**Is this an emulator?**
-No. The game's code was translated once into a normal Windows program. Only the console's graphics, sound and input chips are reimplemented, on Direct3D 11, XAudio2 and XInput.
-
-**Why do I need my own disc image?**
-The game belongs to Electronic Arts, so nothing from it is shared here. The launcher reads your disc image each time you play and never changes it.
-
-**Which disc image works?**
-*SSX Tricky* for the original Xbox, USA release. Both an extract-xiso image and a full disc dump work.
-
-**Can I use the PS2 or GameCube version?**
-No. The port is built from the Xbox program.
-
-**Does it run on Linux or the Steam Deck?**
-It hasn't been tested. It is a plain Direct3D 11 Windows program, so Proton or Wine may work. Reports are welcome.
-
-**Are the high frame rates real?**
-The game logic runs at 60 steps per second, as on the Xbox, so physics, AI and replays behave exactly the same. The camera and the riders are interpolated between those steps. Motion is smooth at 120, 144, 240 FPS and above.
-
-**Where are my saves?**
-In `Documents\My Games\SSX Tricky\Saves`, or in `Saves` next to the game when you use `portable.txt`. The launcher can open that folder for you.
-
-**Is online multiplayer planned?**
-It is being explored, but it isn't part of this release.
+Disc images, saves, updates, frame rates, controllers, Linux and the Steam Deck, help when something goes wrong:
+every answer is on [**opentricky.com/faq**](https://opentricky.com/faq).
 
 ## Building from source
 
@@ -226,9 +131,9 @@ The game code is translated **on your own PC, from your own disc image**. It is 
    build.bat "C:\path\to\SSX Tricky (USA).iso"
    ```
    Or from the UCRT64 shell: `./build.sh "/c/path/to/SSX Tricky (USA).iso"`.
-3. When the build is done, the game is in `dist/OpenTricky/`.
+3. When the build is done, start `dist/OpenTricky/OpenTricky.exe` (the launcher) and choose the same disc image.
 
-The script reads `default.xbe` from your disc image, translates it to C and applies the port's fix-up passes. It then compiles everything and copies the program and the DLLs it needs into `dist/`.
+The script reads `default.xbe` from your disc image, translates it to C, applies the port's fix-up passes, then compiles the game and the launcher into `dist/OpenTricky/`.
 No other tool is needed. [docs/building.md](docs/building.md) has the details.
 
 > [!CAUTION]
@@ -236,16 +141,9 @@ No other tool is needed. [docs/building.md](docs/building.md) has the details.
 
 ## Reporting a bug
 
-Please open an [issue](https://github.com/GiZcesi/OpenTricky/issues/new/choose) and include:
-- the version: the release name, or the build date shown in *SETTINGS → ADVANCED → About*;
-- your settings: resolution, screen shape, frame rate limit and the extras you use;
-- your graphics card and CPU;
-- the **log file**: turn on *SETTINGS → ADVANCED → Log file*, make the problem happen again, then attach `SSX Tricky.log`;
-- an `F12` screenshot if something looks wrong, and where in the game it happened.
-
-## Community
-
-Questions, screenshots or just want to chat? Join the [**OpenTricky Discord**](https://discord.gg/r38sThsqnj). Bugs still go to [GitHub issues](https://github.com/GiZcesi/OpenTricky/issues), so they don't get lost.
+Open an [issue](https://github.com/GiZcesi/OpenTricky/issues/new/choose), or post in #bug-reports on the [Discord](https://discord.gg/r38sThsqnj), with the version
+(*Settings → Advanced → About OpenTricky*), your settings, your PC, and `SSX Tricky.log` (next to `settings.ini`) or the zip made by *Prepare a bug report* in the launcher.
+Nothing is ever sent by itself. More in [Help & bug reports](https://opentricky.com/faq#help).
 
 ## Credits
 
@@ -255,6 +153,8 @@ Questions, screenshots or just want to chat? Join the [**OpenTricky Discord**](h
 | [**sp00nznet**](https://github.com/sp00nznet) | [xboxrecomp](https://github.com/sp00nznet/xboxrecomp), the static recompiler and Xbox runtime everything is built on (MIT). |
 | [**xemu**](https://xemu.app) | The GPU and audio emulation that parts of the renderer and the audio are adapted from (LGPL-2.1-or-later), and the accuracy reference. |
 | **Jorge Jimenez et al.** | [SMAA](https://www.iryoku.com/smaa/) (MIT). |
+| **Bl4ckH4nd** | HD textures (not included). |
+| [RmlUi](https://github.com/mikke89/RmlUi), [SDL](https://www.libsdl.org/), [FreeType](https://freetype.org/) | The launcher's interface, window and input, and text (MIT, zlib, FreeType License). |
 | [Capstone](https://www.capstone-engine.org/), [Ghidra](https://ghidra-sre.org/) | Disassembly and reverse engineering. |
 | **GiZcesi** | OpenTricky: direction, testing and playing. |
 
@@ -264,8 +164,10 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 - OpenTricky is an unofficial fan project. It is not affiliated with or endorsed by Electronic Arts, EA Canada or Microsoft.
   *SSX* and *SSX Tricky* are trademarks of Electronic Arts, and Xbox is a trademark of Microsoft.
-- **No game data is distributed.** This repository holds source code only. The release holds the compiled executable only: no disc image, game data, audio or video.
-  You must own the game and supply your own disc image.
+- **No disc image, game code, music or video is distributed.** You need your own copy of the game.
 - Licences: OpenTricky's code is under the **GNU General Public License v3.0 only** (`GPL-3.0-only`, see [LICENSE](LICENSE)), unless a file says otherwise.
   `xboxrecomp/` keeps its MIT licence (`xboxrecomp/LICENSE`). Files adapted from xemu stay under LGPL-2.1-or-later, as their headers say. SMAA is MIT.
+  The launcher uses RmlUi (MIT), SDL 3 (zlib), FreeType (FreeType License) and fonts under the SIL Open Font License;
+  their licences are in `port/third_party/` and `port/launcher/app/ui/fonts/`, and in `THIRD-PARTY-LICENSES.txt` in the release.
+  Portions of this software are copyright © 2026 The FreeType Project (https://freetype.org). All rights reserved.
 - Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.

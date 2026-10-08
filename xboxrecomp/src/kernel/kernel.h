@@ -622,6 +622,10 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
+/* Forget the directory scan bound to a handle that is being closed. */
+void xbox_dir_context_release(HANDLE FileHandle);
+/* TRUE when a directory scan is still bound to this handle value. */
+BOOL xbox_dir_context_bound(HANDLE FileHandle);
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 

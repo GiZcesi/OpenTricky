@@ -788,6 +788,12 @@ int d3d8_SoftShadowDraw(float shade, unsigned cmp, unsigned ref, unsigned rmask,
 /* The last presented frame as a texture, for titles that sample the previous
  * frame buffer; NULL until the first present after a request. */
 IDirect3DTexture8 *d3d8_PrevFrameTexture(void);
+/* A linear A8R8G8B8 texture built in one call from its finished
+ * levels (BGRA rows, tightly packed, level i = max(w >> i, 1) x max(h >> i, 1)).
+ * It keeps no system-memory copy, so it can never be locked: for textures
+ * the host makes once and only samples (HD replacements). */
+HRESULT d3d8_CreateTextureFromLevels(UINT Width, UINT Height, UINT Levels,
+                                     const void *const *level_bits, IDirect3DTexture8 **ppTex);
 /* NV2A window clip as a scissor rectangle for game draws. */
 void d3d8_SetWindowClip(int on, long x0, long y0, long x1, long y1);
 int d3d8_WindowClipOn(void);
@@ -808,6 +814,12 @@ void d3d8_GetGuestScale(float *sx, float *sy);
  * frame at this shape. d3d8_HostAspect returns the shape in use. */
 void   d3d8_SetHostAspect(double aspect);
 double d3d8_HostAspect(void);
+/* Fork: 1 = the next image is shown in a centred 16:9 frame (black
+ * bars) on a wider screen ; the translator sets it per image. Captures and
+ * screenshots show it the same way. */
+void   d3d8_SetPresentBox(int on);
+/* The frame's shape (16:9 default, 4:3 with XBOX_WIDE_MENUS=43). */
+void   d3d8_SetPresentBoxShape(double shape);
 /* The zoom the narrowed field of view puts on the 3D (1 = none).
  * The title sizes its particles in pixels from their distance alone, not
  * from the projection; the translator scales the program's point size

@@ -566,7 +566,7 @@ class FunctionTranslator:
         # mm0-7 are macros for the per-thread register files g_xmm / g_mm in
         # recomp_types.h. Function-local copies lost every value live across
         # a call, a tail jump or a fall-through into a split fragment -- the
-        # same defect the x87 stack had until part 179.
+        # same defect the x87 stack used to have.
 
         # FPU stack: the per-thread x87 register file. `_fp_stack`/`_fp_top`
         # alias g_fp_stack/g_fp_top in recomp_types.h; a private copy per

@@ -33,9 +33,18 @@
 #include "pass_tags.h"
 #include "netplay/np_cmdlog.h"
 #include "netplay/np_ghost.h"
+#include "netplay/np_net.h"
+#include "netplay/np_racebench.h"
 #include "fps_cap.h"
 #include "aspect.h"
 #include "drawdist.h"
+#include "hud_anchor.h"
+#include "fullfade.h"
+#include "ps2legend.h"
+#include "ctlscheme.h"
+#include "pumplag.h"
+#include "strmwalk.h"
+#include "chantfix.h"
 #include "ticktrace.h"
 #include "../../xboxrecomp/src/kernel/xbox_perf.h"
 extern void (*perf_lookup(unsigned int xbox_va))(void);
@@ -195,6 +204,13 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
         if (fn) return fn;
     }
 
+    /* Race HUD in its own proportions, at the size chosen (see
+     * hud_anchor.h). The hooks pass straight through when it is off. */
+    {
+        recomp_func_t fn = hud_anchor_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
     /* Draw distance Far / Max (XBOX_DRAW_DISTANCE) -- in Original
      * (default) none is handed out (see drawdist.h). */
     {
@@ -202,9 +218,51 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
         if (fn) return fn;
     }
 
+    /* Mesh parts drawn after their constant block was rewritten
+     * (XBOX_PUMPLAG, diagnostic; see pumplag.h). Off: none is handed out. */
+    {
+        recomp_func_t fn = pumplag_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
+    /* Full-screen fades over the whole screen, not the TV safe area (see
+     * fullfade.h). Off (XBOX_FULLSCREEN_FADES=0), none is handed out. */
+    {
+        recomp_func_t fn = fullfade_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
+    /* The Basic Controls splash (Xbox layout) is skipped and the hard disk
+     * check's minimum wait cut (see ps2legend.h). */
+    {
+        recomp_func_t fn = ps2legend_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
+    /* Lessons in the PS2 layout: the demo's recorded buttons are translated
+     * as they are injected (see ctlscheme.h). Off, none is handed out. */
+    {
+        recomp_func_t fn = ctlscheme_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
+    /* EA stream reader: block search bounded to the ring (XBOX_FIX_STRMWALK,
+     * default 2; 0 = the original walk, see strmwalk.h). */
+    {
+        recomp_func_t fn = strmwalk_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
+    /* Crowd chant names: the slot one past each list closed after chant.inf
+     * is read (XBOX_FIX_CHANT, default 1; see chantfix.h). */
+    {
+        recomp_func_t fn = chantfix_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
     /* Rider command log, only when XBOX_NETLOG=1 -- off, the
      * original path is untouched (see netplay/np_cmdlog.h). */
-    if (g_np_cmdlog_on || g_np_ghost_on) {
+    if (g_np_cmdlog_on || g_np_ghost_on || g_np_net_on || g_np_rb_on || g_np_stuck_on) {
         recomp_func_t fn = np_cmdlog_lookup(xbox_va);
         if (fn) return fn;
     }
@@ -234,6 +292,54 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
     }
 
     return (recomp_func_t)0;
+}
+
+/* ── Indirect-call target cache (fork) ─────────────────────────────
+ * RECOMP_ICALL resolved its target on every call: the whole hook chain above
+ * (a dozen lookup functions) and then a binary search over ~12 000 entries --
+ * ~3 % of the game thread in a race. Results are fixed once the title runs
+ * (each hook is handed out or not from flags set at start-up), so a resolved
+ * target is cached, per thread (no locking), direct-mapped on the address.
+ * Misses (NULL) and kernel thunks (the lookup selects the slot) are not
+ * cached: they go through the full lookup as before.
+ * XBOX_FIX_ICALL_CACHE=0: no cache (the old lookup on every call). Off until
+ * the title starts (recomp_icall_cache_start), so nothing resolved during
+ * start-up, before the hook flags are set, can stay cached. */
+#define ICALL_CACHE_SIZE 2048u
+static __thread struct { uint32_t va; recomp_func_t fn; } t_icall_cache[ICALL_CACHE_SIZE];
+static int g_icall_cache_on;            /* 0 until recomp_icall_cache_start() */
+
+/* Called by main just before the title's entry point: every hook decision
+ * (environment, launcher settings) is taken by then. */
+void recomp_icall_cache_start(void)
+{
+    const char *e = getenv("XBOX_FIX_ICALL_CACHE");
+    g_icall_cache_on = !(e && e[0] == '0');
+}
+
+/* *cacheable = 0 for a kernel thunk: recomp_lookup_kernel also selects the
+ * slot (g_kernel_dispatch_slot) that kernel_thunk_dispatch then calls, so it
+ * must run on every call. */
+static recomp_func_t resolve_full(uint32_t va, int *cacheable)
+{
+    recomp_func_t fn = recomp_lookup_manual(va);
+    if (!fn) fn = recomp_lookup(va);
+    *cacheable = fn != NULL;
+    if (!fn) fn = recomp_lookup_kernel(va);
+    return fn;
+}
+
+recomp_func_t recomp_resolve_icall(uint32_t va)
+{
+    unsigned h;
+    int cacheable;
+    recomp_func_t fn;
+    if (!g_icall_cache_on) return resolve_full(va, &cacheable);
+    h = ((va >> 2) ^ (va >> 13)) & (ICALL_CACHE_SIZE - 1u);
+    if (t_icall_cache[h].va == va && t_icall_cache[h].fn) return t_icall_cache[h].fn;
+    fn = resolve_full(va, &cacheable);
+    if (cacheable) { t_icall_cache[h].va = va; t_icall_cache[h].fn = fn; }
+    return fn;
 }
 
 /* ── ICALL failure logging ─────────────────────────────────── */

@@ -37,7 +37,7 @@
  * not called.
  *
  * Split 3D / overlay (XBOX_POST_SPLIT=1; ON BY DEFAULT WITH XBOX_SMAA=1 --
- * human decision 2026-10-03 -- an explicit XBOX_POST_SPLIT=0 turns it off): the chain then treats the 3D
+ * an explicit XBOX_POST_SPLIT=0 turns it off): the chain then treats the 3D
  * only. Order of one presented image:
  *     3D (groups 0-6) -> FRAME_END marker -> POST -> overlay -> present
  *   - at FRAME_END (the pass_tags marker, read by the translator on the pump

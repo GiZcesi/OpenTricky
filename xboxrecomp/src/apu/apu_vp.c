@@ -65,7 +65,7 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 /* Voice handles come from the guest and index host-side arrays (filters, SSL
  * state, lock bitmaps). xemu guards them with assert(), which NDEBUG removes,
  * so a bad handle wrote straight past those arrays -- host memory corrupted
- * by guest garbage. Seen in part 177: a guest thread whose esp had run into
+ * by guest garbage. Seen once: a guest thread whose esp had run into
  * the APU aperture pushed stack data that arrived here as FE methods, and
  * SET_VOICE_SSL_A indexed ssl[] with it. Hardware ignores a handle it has no
  * voice for; do the same, and say so. */

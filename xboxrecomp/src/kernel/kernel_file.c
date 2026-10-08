@@ -17,6 +17,7 @@
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
 #include "xbox_xdvdfs.h"
+#include "xbox_file_hook.h"
 
 /* Defined in kernel_path.c -- TRUE when an Xbox path resolves to the game
  * disc (as opposed to the emulated hard disk), with the part after the
@@ -24,6 +25,7 @@
 BOOL xbox_path_split_game_disc(const char* xbox_path, const char** remainder);
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -77,6 +79,8 @@ typedef struct {
     uint32_t size;        /* file size in bytes (dir: extent size)      */
     uint32_t pos;         /* current file position                      */
     uint32_t enum_index;  /* directory enumeration cursor               */
+    uint8_t *mem;         /* host-rewritten file (xbox_file_hook.h), or NULL:
+                           * read from here instead of the disc, freed on close */
 } iso_handle;
 
 static iso_handle s_iso_handles[ISO_HANDLE_MAX];
@@ -117,6 +121,7 @@ static HANDLE iso_handle_alloc(uint32_t sector, uint32_t size, BOOL is_dir)
             s_iso_handles[i].size       = size;
             s_iso_handles[i].pos        = 0;
             s_iso_handles[i].enum_index = 0;
+            s_iso_handles[i].mem        = NULL;
             LeaveCriticalSection(&s_iso_cs);
             return (HANDLE)(ISO_HANDLE_TAG | (UINT_PTR)i);
         }
@@ -132,6 +137,8 @@ static void iso_handle_free(HANDLE h)
     if (!s) return;
     EnterCriticalSection(&s_iso_cs);
     s->in_use = FALSE;
+    free(s->mem);
+    s->mem = NULL;
     LeaveCriticalSection(&s_iso_cs);
 }
 
@@ -217,7 +224,7 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
-NTSTATUS __stdcall xbox_NtCreateFile(
+static NTSTATUS nt_create_file(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
@@ -365,7 +372,14 @@ NTSTATUS __stdcall xbox_NtReadFile(
         if (ih) {
             uint32_t off = (ByteOffset && ByteOffset->QuadPart >= 0)
                          ? (uint32_t)ByteOffset->QuadPart : ih->pos;
-            uint32_t got = xdvdfs_read(ih->sector, ih->size, off, Buffer, Length);
+            uint32_t got;
+            if (ih->mem) {
+                got = off < ih->size ? ih->size - off : 0;
+                if (got > Length) got = Length;
+                if (got) memcpy(Buffer, ih->mem + off, got);
+            } else {
+                got = xdvdfs_read(ih->sector, ih->size, off, Buffer, Length);
+            }
             if (!(ByteOffset && ByteOffset->QuadPart >= 0))
                 ih->pos = off + got;
             IoStatusBlock->Information = got;
@@ -472,12 +486,57 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     return STATUS_INVALID_HANDLE;
 }
 
+/* Save safety net (on by default; XBOX_SAVE_BACKUP=0 turns it off).
+ *
+ * Overwriting a save is delete-then-write in the title itself: XDeleteSaveGame
+ * removes the old files, then the new ones are written. If anything stops the
+ * write, the player has lost the old save. Before a file under UDATA is
+ * deleted, copy it to the same place under UDATA-backup (next to UDATA, which
+ * the title never lists), replacing the previous copy. Nothing the title sees
+ * changes. */
+static void save_backup_before_delete(const WCHAR *path)
+{
+    static int on = -1;
+    WCHAR dst[MAX_PATH];
+    const WCHAR *u;
+    size_t pre, i;
+    DWORD attrs;
+
+    if (on < 0) { const char *e = getenv("XBOX_SAVE_BACKUP"); on = !(e && e[0] == '0'); }
+    if (!on || !path) return;
+    if (wcsncmp(path, L"\\\\?\\", 4) == 0) path += 4;
+    u = wcsstr(path, L"\\UDATA\\");
+    if (!u) return;
+    attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return;
+    pre = (size_t)(u - path);
+    if (pre + wcslen(L"\\UDATA-backup\\") + wcslen(u + 7) >= MAX_PATH) return;
+    memcpy(dst, path, pre * sizeof(WCHAR));
+    dst[pre] = 0;
+    wcscat_s(dst, MAX_PATH, L"\\UDATA-backup\\");
+    wcscat_s(dst, MAX_PATH, u + 7);
+    /* Create the folders on the way, then copy over the previous backup. */
+    for (i = pre + 1; dst[i]; i++) {
+        if (dst[i] == L'\\') {
+            dst[i] = 0;
+            CreateDirectoryW(dst, NULL);
+            dst[i] = L'\\';
+        }
+    }
+    if (CopyFileW(path, dst, FALSE))
+        fprintf(stderr, "[SAVE] backup before delete: %ls\n", dst);
+    else
+        fprintf(stderr, "[SAVE] backup FAILED (err=%lu): %ls\n", GetLastError(), dst);
+    fflush(stderr);
+}
+
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     WCHAR win_path[MAX_PATH];
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %S", win_path);
+    save_backup_before_delete(win_path);
     if (DeleteFileW(win_path))    return STATUS_SUCCESS;
     if (RemoveDirectoryW(win_path)) return STATUS_SUCCESS;
     return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -699,6 +758,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
              * 1709+, NTFS) unlinks immediately; fall back where it is not
              * supported. */
             if (info->DeleteFile) {
+                WCHAR cur[MAX_PATH];
+                DWORD n = GetFinalPathNameByHandleW(FileHandle, cur, MAX_PATH,
+                                                    FILE_NAME_NORMALIZED);
+                if (n > 0 && n < MAX_PATH) save_backup_before_delete(cur);
+            }
+            if (info->DeleteFile) {
                 struct { DWORD Flags; } fdx;
                 fdx.Flags = 0x1 /* DELETE */ | 0x2 /* POSIX_SEMANTICS */
                           | 0x10 /* IGNORE_READONLY_ATTRIBUTE */;
@@ -735,11 +800,42 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     }
 }
 
+/* Free space of the disk the queried handle is on -- the save folder's disk
+ * when the game asks about its save partition -- like the non-Win32 backend
+ * (fstatvfs on the handle). XBOX_FIX_FREESPACE=0, or a handle with no host
+ * path (game disc image, synthetic handle): the current directory's disk,
+ * as before. */
+static BOOL handle_disk_free(HANDLE h, ULARGE_INTEGER *free_bytes,
+                             ULARGE_INTEGER *total_bytes, ULARGE_INTEGER *total_free)
+{
+    static int on = -1, logged;
+    WCHAR path[MAX_PATH], root[MAX_PATH];
+    DWORD n;
+
+    if (on < 0) { const char *e = getenv("XBOX_FIX_FREESPACE"); on = !(e && e[0] == '0'); }
+    if (on && h && h != INVALID_HANDLE_VALUE && !is_iso_handle(h)) {
+        n = GetFinalPathNameByHandleW(h, path, MAX_PATH, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (n > 0 && n < MAX_PATH && GetVolumePathNameW(path, root, MAX_PATH)) {
+            WCHAR *r = root;
+            if (wcsncmp(r, L"\\\\?\\", 4) == 0 && r[4] && r[5] == L':')
+                r += 4;                         /* "\\?\C:\" -> "C:\" */
+            if (GetDiskFreeSpaceExW(r, free_bytes, total_bytes, total_free)) {
+                if (!logged) {
+                    logged = 1;
+                    fprintf(stderr, "[FREESPACE] free space read on %ls\n", r);
+                }
+                return TRUE;
+            }
+        }
+    }
+    return GetDiskFreeSpaceExW(NULL, free_bytes, total_bytes, total_free);
+}
+
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -747,7 +843,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
-            if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+            if (handle_disk_free(FileHandle, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = 512;
                 info->SectorsPerAllocationUnit = 8;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
@@ -858,6 +954,21 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
  * enumerator's query for "SaveMeta.xbx" continue an already-finished scan and
  * return STATUS_NO_MORE_FILES for a file sitting right there on disk, which in
  * turn made the manager mark the save bad and the title skip autoloading it. */
+/* TRUE when a directory scan is still bound to this handle value -- for a
+ * handle that was just opened, a scan left over from an earlier handle with
+ * the same value, which the next query would continue. */
+BOOL xbox_dir_context_bound(HANDLE FileHandle)
+{
+    BOOL bound = FALSE;
+    if (!s_dir_cs_init) return FALSE;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++)
+        if (s_dir_contexts[i].file_handle == FileHandle &&
+            s_dir_contexts[i].find_handle != NULL) { bound = TRUE; break; }
+    LeaveCriticalSection(&s_dir_cs);
+    return bound;
+}
+
 void xbox_dir_context_release(HANDLE FileHandle)
 {
     if (!s_dir_cs_init) return;
@@ -1038,6 +1149,105 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         IoStatusBlock->Information = header_size + name_len;
     }
     return STATUS_SUCCESS;
+}
+
+/* ---- Host-rewritten files (xbox_file_hook.h) ------------------------------
+ *
+ * A claimed file is opened the normal way (disc image or host file), read in
+ * full and closed; the hook's replacement is then served from memory through
+ * a virtual handle of the same kind as the ISO ones (read, size, seek). Only
+ * plain read-only opens are claimed; anything the hook declines, or any
+ * failure on the way, falls back to the original open. */
+#define MAX_FILE_HOOKS 4
+static xbox_file_hook_match_fn   s_hook_match[MAX_FILE_HOOKS];
+static xbox_file_hook_rewrite_fn s_hook_rewrite[MAX_FILE_HOOKS];
+static int s_hooks;
+
+void xbox_file_add_hook(xbox_file_hook_match_fn match, xbox_file_hook_rewrite_fn rewrite)
+{
+    if (!match || !rewrite || s_hooks == MAX_FILE_HOOKS) return;
+    s_hook_match[s_hooks] = match;
+    s_hook_rewrite[s_hooks] = rewrite;
+    s_hooks++;
+}
+
+void xbox_file_set_hook(xbox_file_hook_match_fn match, xbox_file_hook_rewrite_fn rewrite)
+{
+    xbox_file_add_hook(match, rewrite);
+}
+
+static BOOL hook_try_open(PHANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+                          PXBOX_IO_STATUS_BLOCK IoStatusBlock, ULONG ShareAccess,
+                          ULONG CreateDisposition, ULONG CreateOptions, NTSTATUS *status)
+{
+    const char *path = get_xbox_path(ObjectAttributes);
+    HANDLE h = INVALID_HANDLE_VALUE, mh;
+    XBOX_IO_STATUS_BLOCK io;
+    XBOX_FILE_STANDARD_INFORMATION info;
+    uint8_t *orig = NULL, *out;
+    uint32_t size, got = 0, out_size = 0;
+    iso_handle *ih;
+    int k;
+
+    if (!s_hooks || !path) return FALSE;
+    if (CreateDisposition != XBOX_FILE_OPEN && CreateDisposition != XBOX_FILE_OPEN_IF) return FALSE;
+    if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) return FALSE;
+    for (k = 0; k < s_hooks && !s_hook_match[k](path); k++) {}
+    if (k == s_hooks) return FALSE;            /* the first hook that claims it serves it */
+
+    if (!NT_SUCCESS(nt_create_file(&h, XBOX_GENERIC_READ, ObjectAttributes, &io, NULL,
+                                   0, ShareAccess, XBOX_FILE_OPEN, CreateOptions)))
+        return FALSE;
+    memset(&info, 0, sizeof info);
+    if (!NT_SUCCESS(xbox_NtQueryInformationFile(h, &io, &info, sizeof info,
+                                                XboxFileStandardInformation)) ||
+        info.EndOfFile.QuadPart <= 0 || info.EndOfFile.QuadPart > (1 << 20)) {
+        xbox_NtClose(h);
+        return FALSE;
+    }
+    size = (uint32_t)info.EndOfFile.QuadPart;
+    orig = (uint8_t *)malloc(size);
+    while (orig && got < size) {
+        if (!NT_SUCCESS(xbox_NtReadFile(h, NULL, NULL, NULL, &io, orig + got, size - got, NULL)) ||
+            io.Information == 0)
+            break;
+        got += (uint32_t)io.Information;
+    }
+    xbox_NtClose(h);
+    out = (orig && got == size) ? (uint8_t *)s_hook_rewrite[k](path, orig, size, &out_size) : NULL;
+    free(orig);
+    if (!out) return FALSE;
+
+    mh = iso_handle_alloc(0, out_size, FALSE);
+    ih = iso_handle_get(mh);
+    if (!ih) { free(out); return FALSE; }
+    ih->mem = out;
+    *FileHandle = mh;
+    if (IoStatusBlock) {
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        IoStatusBlock->Information = 1;      /* FILE_OPENED */
+    }
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE, "NtCreateFile: %s served rewritten by the host (%u -> %u bytes)",
+             path, size, out_size);
+    *status = STATUS_SUCCESS;
+    return TRUE;
+}
+
+NTSTATUS __stdcall xbox_NtCreateFile(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+    PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
+    ULONG CreateDisposition, ULONG CreateOptions)
+{
+    NTSTATUS st;
+    if (FileHandle && ObjectAttributes &&
+        !(DesiredAccess & (XBOX_GENERIC_WRITE | XBOX_GENERIC_ALL | XBOX_FILE_WRITE_DATA | XBOX_FILE_APPEND_DATA)) &&
+        hook_try_open(FileHandle, ObjectAttributes, IoStatusBlock, ShareAccess,
+                      CreateDisposition, CreateOptions, &st))
+        return st;
+    return nt_create_file(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
+                          AllocationSize, FileAttributes, ShareAccess,
+                          CreateDisposition, CreateOptions);
 }
 
 /* ======================================================================== */

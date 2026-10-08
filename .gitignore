@@ -32,6 +32,7 @@ xboxrecomp_output/
 # Builds, packages, runs, logs, captures
 build/
 dist/
+build-launcher/
 *.exe
 *.dll
 *.pdb

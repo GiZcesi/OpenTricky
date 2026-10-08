@@ -142,8 +142,8 @@ collisions by appending `_<addr>`, avoids C keywords, and reports counts by
 source (fidb/library, demangled, rtti, symbol). It also prints how many
 recovered addresses actually match the recompiler's `functions.json` `start`s.
 
-Apply into the recompiler (writes a `.bak` first) — **left to the human/main
-agent**, not run automatically:
+Apply into the recompiler (writes a `.bak` first) — **run by hand**, not
+automatically:
 
 ```bash
 py -3 tools/ghidra_naming/merge_names.py --apply

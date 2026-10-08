@@ -1,0 +1,8 @@
+/* The launcher's resources: its icon (OpenTricky.ico, the "OT" badge drawn by
+ * make_icon.py: our own picture, nothing of the game) and the version block
+ * shared with the game (port/src/opentricky_version.rc, on the include path).
+ * The icon is resource 1, the first one: Explorer shows it for the exe and
+ * SDL loads it for the window (title bar, task bar). */
+#define IDI_ICON1 1
+IDI_ICON1 ICON "OpenTricky.ico"
+#include "opentricky_version.rc"

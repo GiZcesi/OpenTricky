@@ -10,3 +10,86 @@
 
 1 ICON "@SSX_APP_ICON@"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "@SSX_MANIFEST@"
+
+/* Version (version.h), shown in Explorer's Properties > Details. */
+#define OT_FILE_DESCRIPTION  "SSX Tricky"
+#define OT_ORIGINAL_FILENAME "SSX Tricky.exe"
+#include "@SSX_SRC_DIR@/version_info.rc"
+
+/* The HD texture index (hashes and file names, no picture), read
+ * when the player turns HD textures on with their own pack. */
+HDTEX_INDEX RCDATA "@SSX_HDTEX_INDEX@"
+
+/* Button icons (nv2a_btnicons.c): CC0 drawings, see assets/btnicons/juliocacko/License.txt,
+ * and the PlayStation D-pad drawn for this fork (assets/btnicons/drawn/draw_ps_dpad.py). */
+BTN_X_A         RCDATA "@SSX_BTNICONS@/T_X_A_Color.png"
+BTN_X_B         RCDATA "@SSX_BTNICONS@/T_X_B_Color.png"
+BTN_X_X         RCDATA "@SSX_BTNICONS@/T_X_X_Color.png"
+BTN_X_Y         RCDATA "@SSX_BTNICONS@/T_X_Y_Color.png"
+BTN_X_LB        RCDATA "@SSX_BTNICONS@/T_X_LB.png"
+BTN_X_RB        RCDATA "@SSX_BTNICONS@/T_X_RB.png"
+BTN_X_LT        RCDATA "@SSX_BTNICONS@/T_X_LT.png"
+BTN_X_RT        RCDATA "@SSX_BTNICONS@/T_X_RT.png"
+BTN_X_VIEW      RCDATA "@SSX_BTNICONS@/T_X_Share.png"
+BTN_X_MENU      RCDATA "@SSX_BTNICONS@/T_X_X.png"
+BTN_X_DLEFT     RCDATA "@SSX_BTNICONS@/T_X_Dpad_Left.png"
+BTN_X_DRIGHT    RCDATA "@SSX_BTNICONS@/T_X_Dpad_Right.png"
+BTN_X_DUP       RCDATA "@SSX_BTNICONS@/T_X_Dpad_Up.png"
+BTN_X_DDOWN     RCDATA "@SSX_BTNICONS@/T_X_Dpad_Down.png"
+BTN_X_DPAD      RCDATA "@SSX_BTNICONS@/T_X_Dpad.png"
+BTN_X_LSTICK    RCDATA "@SSX_BTNICONS@/T_X_L.png"
+BTN_X_RSTICK    RCDATA "@SSX_BTNICONS@/T_X_R.png"
+BTN_P_CROSS     RCDATA "@SSX_BTNICONS@/T_P4_Cross_Color_Retro.png"
+BTN_P_CIRCLE    RCDATA "@SSX_BTNICONS@/T_P4_Circle_Color_Retro.png"
+BTN_P_SQUARE    RCDATA "@SSX_BTNICONS@/T_P4_Square_Color_Retro.png"
+BTN_P_TRIANGLE  RCDATA "@SSX_BTNICONS@/T_P4_Triangle_Color_Retro.png"
+BTN_P_L1        RCDATA "@SSX_BTNICONS@/T_P4_L1_Retro.png"
+BTN_P_R1        RCDATA "@SSX_BTNICONS@/T_P4_R1_Retro.png"
+BTN_P_L2        RCDATA "@SSX_BTNICONS@/T_P4_L2_Retro.png"
+BTN_P_R2        RCDATA "@SSX_BTNICONS@/T_P4_R2_Retro.png"
+BTN_P_SELECT    RCDATA "@SSX_BTNICONS@/ps_select_retro.png"
+BTN_P_START     RCDATA "@SSX_BTNICONS@/ps_start_retro.png"
+BTN_P_DLEFT     RCDATA "@SSX_BTNICONS_DRAWN@/ps_dpad_left.png"
+BTN_P_DRIGHT    RCDATA "@SSX_BTNICONS_DRAWN@/ps_dpad_right.png"
+BTN_P_DUP       RCDATA "@SSX_BTNICONS_DRAWN@/ps_dpad_up.png"
+BTN_P_DDOWN     RCDATA "@SSX_BTNICONS_DRAWN@/ps_dpad_down.png"
+BTN_P_DPAD      RCDATA "@SSX_BTNICONS_DRAWN@/ps_dpad_full.png"
+BTN_P_LSTICK    RCDATA "@SSX_BTNICONS@/T_P4_L_Retro.png"
+BTN_P_RSTICK    RCDATA "@SSX_BTNICONS@/T_P4_R_Retro.png"
+
+/* The trick tutorial's pads of the modern styles: DualShock 4 and Xbox One
+ * drawings (CC0) and their gold markers, see assets/btnicons/pads/make_pads.py
+ * and pads/src/Readme.txt. */
+PSM_LESSON_PAD     RCDATA "@SSX_BTNICONS_PADS@/ps_lesson_pad.png"
+PSM_LESSON_RING    RCDATA "@SSX_BTNICONS_PADS@/ps_lesson_ring.png"
+PSM_LESSON_L1      RCDATA "@SSX_BTNICONS_PADS@/ps_lesson_l1.png"
+PSM_LESSON_L2      RCDATA "@SSX_BTNICONS_PADS@/ps_lesson_l2.png"
+PSM_LESSON_DPAD_V  RCDATA "@SSX_BTNICONS_PADS@/ps_lesson_dpad_v.png"
+PSM_LESSON_DPAD_H  RCDATA "@SSX_BTNICONS_PADS@/ps_lesson_dpad_h.png"
+XBM_LESSON_PAD     RCDATA "@SSX_BTNICONS_PADS@/xb_lesson_pad.png"
+XBM_LESSON_RING    RCDATA "@SSX_BTNICONS_PADS@/xb_lesson_ring.png"
+XBM_LESSON_L1      RCDATA "@SSX_BTNICONS_PADS@/xb_lesson_l1.png"
+XBM_LESSON_L2      RCDATA "@SSX_BTNICONS_PADS@/xb_lesson_l2.png"
+XBM_LESSON_DPAD_V  RCDATA "@SSX_BTNICONS_PADS@/xb_lesson_dpad_v.png"
+XBM_LESSON_DPAD_H  RCDATA "@SSX_BTNICONS_PADS@/xb_lesson_dpad_h.png"
+PSM_CONFIG         RCDATA "@SSX_BTNICONS_PADS@/ps_config.png"
+XBM_CONFIG         RCDATA "@SSX_BTNICONS_PADS@/xb_config.png"
+
+/* The PS2 button pictures (XBOX_BUTTON_ICONS=ps2, assets/btnicons/ps2/),
+ * unless -DSSX_PS2_BUTTONS=OFF. */
+@SSX_BTNICONS_PS2_RC@
+
+/* The first-run window, a plain Windows dialog that asks for the
+ * disc image before the launcher opens (ids: launcher.c, iso_dialog). */
+200 DIALOGEX 0, 0, 320, 106
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "OpenTricky"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "Select your SSX Tricky (Xbox, USA) disc image (.iso).", 204, 10, 10, 300, 10
+    EDITTEXT        201, 10, 25, 240, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "&Browse...", 202, 256, 24, 54, 16
+    LTEXT           "", 203, 10, 45, 300, 30
+    DEFPUSHBUTTON   "OK", IDOK, 196, 82, 54, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 256, 82, 54, 16
+END

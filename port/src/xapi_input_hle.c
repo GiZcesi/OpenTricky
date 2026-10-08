@@ -31,13 +31,14 @@
  * title is drivable without a pad. Both the keyboard and the controller go
  * through the player's bindings (controls.c); by default Enter =
  * Start, Space = A, Esc = B, C = X, V = Y, Tab = Back, Q/E = triggers,
- * R/F = Black/White, arrows = D-pad and left stick.
+ * R/F = Black/White, X = L3, arrows = D-pad and left stick.
  */
 
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include "netplay/np_racebench.h"
 #include <stdlib.h>
 
 #include "recomp/recomp_types.h"
@@ -141,17 +142,23 @@ static int port_of(uint32_t handle)
 /* XBOX_INPUT_AUTOPRESS=A@20,START@35,DOWN@40 -- hold a button on port 0 for
  * 300 ms at each time (seconds after the first poll). Lets a test run walk
  * through screens without anyone at the controller. Names: A B X Y BLACK
- * WHITE START BACK UP DOWN LEFT RIGHT.
+ * WHITE LT RT START BACK UP DOWN LEFT RIGHT L3 R3, and LSLEFT LSRIGHT LSUP
+ * LSDOWN (the left stick pushed all the way; UP..RIGHT are the D-pad);
+ * several joined by '+' are held together ("LT+WHITE@30").
  *
  * NAME@T+DxN repeats: N presses, D seconds apart, from T -- "A@18+1.5x40"
  * taps A through every default menu choice to a race in about a minute
  * instead of the two that spaced single presses took. */
 static const struct { const char *name; WORD bit; int analog; } names[] = {
     { "A", 0, 0 }, { "B", 0, 1 }, { "X", 0, 2 }, { "Y", 0, 3 },
-    { "BLACK", 0, 4 }, { "WHITE", 0, 5 },
+    { "BLACK", 0, 4 }, { "WHITE", 0, 5 }, { "LT", 0, 6 }, { "RT", 0, 7 },
     { "START", 0x10, -1 }, { "BACK", 0x20, -1 }, { "UP", 0x01, -1 },
     { "DOWN", 0x02, -1 }, { "LEFT", 0x04, -1 }, { "RIGHT", 0x08, -1 },
+    { "L3", 0x40, -1 }, { "R3", 0x80, -1 },
+    /* analog >= STICK: the left stick, analog - STICK = left, right, up, down */
+    { "LSLEFT", 0, 100 }, { "LSRIGHT", 0, 101 }, { "LSUP", 0, 102 }, { "LSDOWN", 0, 103 },
 };
+#define STICK 100
 #define NNAMES (sizeof(names) / sizeof(names[0]))
 
 /* Live presses from the diag port (`press A 150`): the tick each button is
@@ -169,25 +176,49 @@ int xinput_hle_press(const char *name, int ms)
     return 0;
 }
 
+/* `list` ("LT+WHITE") names `one`. */
+#define AUTOPRESS_MAX 2048            /* held combinations repeat every 250 ms in long scripts */
+
+static int name_has(const char *list, const char *one)
+{
+    size_t n = strlen(one);
+    while (*list) {
+        const char *e = strchr(list, '+');
+        size_t len = e ? (size_t)(e - list) : strlen(list);
+        if (len == n && !_strnicmp(list, one, n)) return 1;
+        if (!e) break;
+        list = e + 1;
+    }
+    return 0;
+}
+
+static void autopress_hold(hle_state_t *s, WORD bit, int analog)
+{
+    static const SHORT x[4] = { -32767, 32767, 0, 0 }, y[4] = { 0, 0, 32767, -32767 };
+    if (analog >= STICK) {
+        if (x[analog - STICK]) s->Gamepad.sThumbLX = x[analog - STICK];
+        if (y[analog - STICK]) s->Gamepad.sThumbLY = y[analog - STICK];
+    } else if (analog >= 0) s->Gamepad.bAnalogButtons[analog] = 0xFF;
+    else s->Gamepad.wButtons |= bit;
+}
+
 static void autopress_into(hle_state_t *s)
 {
     static int parsed = 0, n = 0;
-    static struct { DWORD at_ms; WORD bit; int analog; } ev[256];
+    static struct { DWORD at_ms; WORD bit; int analog; } ev[AUTOPRESS_MAX];
     static DWORD t0 = 0;
     DWORD now = GetTickCount();
     int i;
     unsigned k;
     for (k = 0; k < NNAMES; k++)
-        if ((LONG)(g_live_until[k] - now) > 0) {
-            if (names[k].analog >= 0) s->Gamepad.bAnalogButtons[names[k].analog] = 0xFF;
-            else s->Gamepad.wButtons |= names[k].bit;
-        }
+        if ((LONG)(g_live_until[k] - now) > 0)
+            autopress_hold(s, names[k].bit, names[k].analog);
     if (!parsed) {
         const char *e = getenv("XBOX_INPUT_AUTOPRESS");
         parsed = 1;
         t0 = now;
-        while (e && *e && n < 256) {
-            char name[16]; double sec;
+        while (e && *e && n < AUTOPRESS_MAX) {
+            char name[48]; double sec;
             k = 0;
             while (*e && *e != '@' && k < sizeof(name) - 1) name[k++] = *e++;
             name[k] = 0;
@@ -201,9 +232,9 @@ static void autopress_into(hle_state_t *s)
                     if (*e == 'x' || *e == 'X') reps = strtol(e + 1, (char **)&e, 10);
                     if (reps < 1) reps = 1;
                 }
-                for (r = 0; r < reps && n < 256; r++)
+                for (r = 0; r < reps && n < AUTOPRESS_MAX; r++)
                     for (k = 0; k < NNAMES; k++)
-                        if (!_stricmp(name, names[k].name)) {
+                        if (name_has(name, names[k].name) && n < AUTOPRESS_MAX) {
                             ev[n].at_ms = (DWORD)((sec + step * (double)r) * 1000.0);
                             ev[n].bit = names[k].bit;
                             ev[n].analog = names[k].analog;
@@ -216,10 +247,8 @@ static void autopress_into(hle_state_t *s)
     }
     for (i = 0; i < n; i++) {
         DWORD t = now - t0;
-        if (t >= ev[i].at_ms && t < ev[i].at_ms + 300) {
-            if (ev[i].analog >= 0) s->Gamepad.bAnalogButtons[ev[i].analog] = 0xFF;
-            else s->Gamepad.wButtons |= ev[i].bit;
-        }
+        if (t >= ev[i].at_ms && t < ev[i].at_ms + 300)
+            autopress_hold(s, ev[i].bit, ev[i].analog);
     }
 }
 
@@ -316,6 +345,7 @@ void sub_00180B89(void)   /* XInputGetState */
         s.Gamepad.sThumbRX = cp.rx;
         s.Gamepad.sThumbRY = cp.ry;
         if (port == 0) autopress_into(&s);
+        if (port == 0 && np_rb_pad_muted()) memset(&s.Gamepad, 0, sizeof s.Gamepad);
         if (port == 1 && pad2_test()) {
             rc = 0;
             autopress_into(&s);

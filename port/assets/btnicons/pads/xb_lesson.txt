@@ -1,0 +1,21 @@
+pad 206 x 155 texels
+at pad     0 0 206 x 155
+at ring    0 157 21 x 20
+at l2      80 157 22 x 15
+at l1      23 157 55 x 23
+at dpad_v  104 157 15 x 17
+at dpad_h  121 157 16 x 16
+marker L2       29 -3
+marker R2       155 -3
+marker cross    146 47
+marker circle   161 33
+marker square   132 33
+marker triangle 146 19
+marker L1       26 -2
+marker R1       125 -2
+marker left     57 74
+marker right    78 74
+marker down     68 84
+marker up       68 63
+C at:   { 0, 0, 206, 155 }, { 0, 157, 21, 20 }, { 80, 157, 22, 15 }, { 23, 157, 55, 23 }, { 104, 157, 15, 17 }, { 121, 157, 16, 16 }
+C mark: { 29, -3 }, { 155, -3 }, { 146, 47 }, { 161, 33 }, { 132, 33 }, { 146, 19 }, { 26, -2 }, { 125, -2 }, { 57, 74 }, { 78, 74 }, { 68, 84 }, { 68, 63 }

@@ -20,7 +20,9 @@
 #include "d3d8_post.h"
 #include "d3d8_gpuprof.h"
 #include "d3d8_softshadow.h"
+#include "d3d8_sync.h"
 #include "../kernel/xbox_perf.h"
+#include <intrin.h>
 #include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
 #include <wincodec.h>
@@ -331,8 +333,13 @@ unsigned d3d8_BackbufferHash(void)
  * title's own frame (before the post) beside each dump as <name>_pre.bmp:
  * the same frame with and without the effect, for exact comparisons. */
 static int s_dump_scene_only;
+static ID3D11Texture2D *s_dump_override;    /* XBOX_PUMPLAG_SHOTS: dump this texture instead */
 static int  dac_active(void);
 static void dac_lut_copy(unsigned char out[256][3]);
+
+static int  present_box_cols(unsigned w, unsigned *x0, unsigned *bw);
+static void present_box_row(const unsigned char *src, unsigned char *dst, unsigned w,
+                            unsigned x0, unsigned bw);
 
 void d3d8_DumpBackbuffer(const char *path)
 {
@@ -360,7 +367,8 @@ void d3d8_DumpBackbuffer(const char *path)
             s_dump_scene_only = 0;
         }
     }
-    if (FAILED((s_dump_scene_only ? scene_texture_get : shown_texture_get)(&back)) || !back)
+    if (s_dump_override) { back = s_dump_override; ID3D11Texture2D_AddRef(back); }
+    else if (FAILED((s_dump_scene_only ? scene_texture_get : shown_texture_get)(&back)) || !back)
         return;
     ID3D11Texture2D_GetDesc(back, &td);
     td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0;
@@ -375,6 +383,10 @@ void d3d8_DumpBackbuffer(const char *path)
         row = (row + 3) & ~3u;              /* BMP rows are 4-byte aligned */
         imgsz = row * h;
         f = fopen(path, "wb");
+        unsigned bx0 = 0, bw = 0;
+        int boxed = present_box_cols(w, &bx0, &bw);     /* as shown */
+        unsigned char *rb = boxed ? (unsigned char *)malloc((size_t)w * 6u) : NULL;
+        if (!rb) boxed = 0;
         if (f) {
             memset(hdr, 0, sizeof hdr);
             hdr[0] = 'B'; hdr[1] = 'M';
@@ -407,14 +419,21 @@ void d3d8_DumpBackbuffer(const char *path)
                         bgr[1] = dlut[bgr[1]][1];
                         bgr[2] = dlut[bgr[2]][0];
                     }
-                    fwrite(bgr, 1, 3, f);
+                    if (boxed) memcpy(rb + x * 3, bgr, 3);
+                    else fwrite(bgr, 1, 3, f);
+                }
+                if (boxed) {
+                    present_box_row(rb, rb + (size_t)w * 3u, w, bx0, bw);
+                    fwrite(rb + (size_t)w * 3u, 1, (size_t)w * 3u, f);
                 }
                 fwrite(pad, 1, row - w * 3, f);
             }
             fclose(f);
-            fprintf(stderr, "  [D3D] wrote %ux%u frame to %s\n", w, h, path);
+            fprintf(stderr, "  [D3D] wrote %ux%u frame to %s%s\n", w, h, path,
+                    boxed ? (s_video_frame ? " (video frame)" : " (16:9 frame)") : "");
             fflush(stderr);
         }
+        free(rb);
         ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
             (ID3D11Resource *)stage, 0);
     }
@@ -513,6 +532,13 @@ void d3d8_NoteGuestFramebufferLock(void)
     g_guest_fb_locks++;
 }
 
+/* Video frames the title has written so far (the freeze watchdog, port
+ * crashreport.c, counts them as progress: a video issues no draws). */
+unsigned d3d8_GuestFramebufferLockCount(void)
+{
+    return *(volatile unsigned *)&g_guest_fb_locks;
+}
+
 static int guest_fb_active(void)
 {
     static int was_active = 0;
@@ -597,6 +623,11 @@ static const void *guest_fb_freshest(void)
     }
     return pick;
 }
+
+/* XBOX_PUMPLAG: the frame being drawn has a part drawn from a rewritten
+ * constant block (set by the translator, same thread). */
+static int s_plag_req;
+void d3d8_PlagShot(void) { s_plag_req = 1; }
 
 /* Presents so far; draws issued now belong to dump frame f<this>. */
 unsigned d3d8_PresentSeq(void)
@@ -718,6 +749,74 @@ void d3d8_PresentFrame(void)
                 }
             }
             seen++;
+        }
+    }
+
+    /* XBOX_PUMPLAG_SHOTS=<prefix> (diagnostic, port/src/pumplag.c): a frame
+     * with a mesh part drawn from a rewritten constant block is saved as
+     * <prefix>fNNNNN_bad.bmp, with the frame before (_before, kept on the GPU
+     * every frame) and the one after (_after). At most 40 such frames. */
+    {
+        static int on = -1;
+        static char pre[400];
+        static ID3D11Texture2D *prev;
+        static unsigned prev_f = 0xFFFFFFFFu, next_due = 0xFFFFFFFFu, last_saved = 0xFFFFFFFFu, events;
+        unsigned f = g_present_seq - 1u;
+        {   /* XBOX_PUMPLAG_SLOW=<ms> (stress test): the pump stalls this long
+             * every present, as a slower GPU would; the title then runs as far
+             * ahead as its own throttle lets it. */
+            static int slow = -1;
+            if (slow < 0) { const char *e = getenv("XBOX_PUMPLAG_SLOW"); slow = e ? atoi(e) : 0; }
+            if (slow > 0) Sleep((DWORD)slow);
+        }
+        if (on < 0) {
+            const char *e = getenv("XBOX_PUMPLAG_SHOTS");
+            on = e && e[0];
+            if (on) snprintf(pre, sizeof pre, "%s", e);
+        }
+        if (on && g_device_state.d3d11_device) {
+            char path[512];
+            ID3D11Texture2D *cur = NULL;
+            if (s_plag_req && events < 40u) {
+                events++;
+                if (prev && prev_f + 1u == f && last_saved != prev_f) {
+                    snprintf(path, sizeof path, "%sf%05u_before.bmp", pre, prev_f);
+                    s_dump_override = prev;
+                    d3d8_DumpBackbuffer(path);
+                    s_dump_override = NULL;
+                }
+                snprintf(path, sizeof path, "%sf%05u_bad.bmp", pre, f);
+                d3d8_DumpBackbuffer(path);
+                fprintf(stderr, "[PLAG] shot %s\n", path);
+                last_saved = f;
+                next_due = f + 1u;
+            } else if (f == next_due) {
+                snprintf(path, sizeof path, "%sf%05u_after.bmp", pre, f);
+                d3d8_DumpBackbuffer(path);
+                last_saved = f;
+            }
+            s_plag_req = 0;
+            if (SUCCEEDED(shown_texture_get(&cur)) && cur) {
+                if (!prev) {
+                    D3D11_TEXTURE2D_DESC td;
+                    ID3D11Texture2D_GetDesc(cur, &td);
+                    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = 0;
+                    td.CPUAccessFlags = 0; td.MiscFlags = 0;
+                    if (FAILED(ID3D11Device_CreateTexture2D(g_device_state.d3d11_device, &td, NULL, &prev)))
+                        prev = NULL;
+                }
+                if (prev) {
+                    D3D11_TEXTURE2D_DESC a, b;
+                    ID3D11Texture2D_GetDesc(cur, &a);
+                    ID3D11Texture2D_GetDesc(prev, &b);
+                    if (a.Width == b.Width && a.Height == b.Height && a.Format == b.Format) {
+                        ID3D11DeviceContext_CopyResource(g_device_state.d3d11_context,
+                            (ID3D11Resource *)prev, (ID3D11Resource *)cur);
+                        prev_f = f;
+                    } else { ID3D11Texture2D_Release(prev); prev = NULL; }
+                }
+                ID3D11Texture2D_Release(cur);
+            }
         }
     }
 
@@ -855,6 +954,13 @@ int d3d8_OcclusionPoll(int h, unsigned long long *samples)
     return hr == S_FALSE ? 0 : -1;
 }
 
+/* Fork: submit what is queued (the occlusion queries a report waits for). */
+void d3d8_OcclusionFlush(void)
+{
+    ID3D11DeviceContext *ctx = g_device_state.d3d11_context;
+    if (ctx) ID3D11DeviceContext_Flush(ctx);
+}
+
 void d3d8_OcclusionRelease(int h)
 {
     if (h >= 0 && h < OCC_POOL) s_occ_busy[h] = 0;
@@ -922,7 +1028,7 @@ HWND d3d8_GetHostWindow(void)            { return s_host_window; }
  * Set by the launcher before the title creates its device. The title always
  * renders its own 640x480 frame; render_w x render_h is the size of the scene
  * target that frame is rasterised into, so the 3D is drawn at that
- * resolution rather than upscaled afterwards. The aspect is the shape the
+ * resolution rather than scaled up afterwards. The aspect is the shape the
  * frame is shown at: 16:9 is only right when the title has itself been told
  * the display is widescreen, because it then renders anamorphic -- a wider
  * field of view squeezed into 640x480, for the TV to stretch back out (see
@@ -974,6 +1080,89 @@ double d3d8_HostAspect(void)
     return s_cfg_widescreen ? 16.0 / 9.0 : 4.0 / 3.0;
 }
 
+/* Fork: the image about to be presented is shown in a centred 16:9
+ * frame (black bars), set by the translator per image. */
+static volatile LONG s_present_box;
+
+void d3d8_SetPresentBox(int on)
+{
+    InterlockedExchange(&s_present_box, on ? 1 : 0);
+}
+
+/* The frame's shape, 16:9 (default) or 4:3 (menus whole at 4:3). */
+static double s_present_box_shape = 16.0 / 9.0;
+
+void d3d8_SetPresentBoxShape(double shape)
+{
+    s_present_box_shape = shape > 1.0 ? shape : 16.0 / 9.0;
+}
+
+/* Fork: video frames keep the shape they were authored for.
+ *
+ * The title's video player copies its decoded MPEG pictures 1:1 into the
+ * guest framebuffer (576x448 for almost every movie, 640x448 for two, inside
+ * a 640x480 buffer -- see hook_lockrect_0016B1C0 and the guest framebuffer
+ * note in nv2a_pgraph_d3d11.c). That buffer is a 4:3 picture: a 4:3 TV shows
+ * the movies with their own proportions. Presenting it across a 16:9 or wider
+ * window stretched every movie by a third or more. With this on, a present
+ * that shows a video frame is shown at the guest framebuffer's own shape,
+ * centred with black bars; nothing about the player, its timing or its
+ * buffers changes, only the rectangle the finished image is drawn into.
+ * XBOX_FIX_VIDEO_ASPECT=0 restores the stretched picture. */
+static int video_aspect_fix(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XBOX_FIX_VIDEO_ASPECT");
+        on = !(e && e[0] == '0');
+        fprintf(stderr, "[D3D] XBOX_FIX_VIDEO_ASPECT=%d (videos %s)\n", on,
+                on ? "at their own 4:3 shape" : "stretched to the window");
+        fflush(stderr);
+    }
+    return on;
+}
+
+/* The shape the current image is shown at. */
+static double present_aspect(void)
+{
+    double a = d3d8_HostAspect();
+    if (s_video_frame && g_guest_fb_w && g_guest_fb_h && video_aspect_fix()) {
+        double va = (double)g_guest_fb_w / (double)g_guest_fb_h;
+        if (a > va + 0.005) return va;  /* narrower windows: as before */
+    }
+    return s_present_box && a > s_present_box_shape + 0.005 ? s_present_box_shape : a;
+}
+
+/* Columns of a w-wide capture the image covers when framed (x0, width);
+ * 0 when it covers them all. */
+static int present_box_cols(unsigned w, unsigned *x0, unsigned *bw)
+{
+    double a = d3d8_HostAspect(), pa = present_aspect();
+    if (!(pa < a)) return 0;
+    *bw = (unsigned)(w * pa / a + 0.5);
+    if (*bw >= w || !*bw) return 0;
+    *x0 = (w - *bw) / 2;
+    return 1;
+}
+
+/* One captured row (B, G, R) as shown: squeezed into [x0, x0 + bw) with
+ * linear filtering, black elsewhere. */
+static void present_box_row(const unsigned char *src, unsigned char *dst, unsigned w,
+                            unsigned x0, unsigned bw)
+{
+    unsigned x, c;
+    for (x = 0; x < w; x++) {
+        if (x < x0 || x >= x0 + bw) { dst[x * 3] = dst[x * 3 + 1] = dst[x * 3 + 2] = 0; continue; }
+        {
+            double u = ((double)(x - x0) + 0.5) * (double)w / (double)bw - 0.5;
+            unsigned i0 = u <= 0.0 ? 0u : (unsigned)u, i1 = i0 + 1u < w ? i0 + 1u : i0;
+            double t = u <= 0.0 ? 0.0 : u - (double)i0;
+            for (c = 0; c < 3; c++)
+                dst[x * 3 + c] = (unsigned char)(src[i0 * 3 + c] * (1.0 - t) + src[i1 * 3 + c] * t + 0.5);
+        }
+    }
+}
+
 static float s_point_zoom = 1.0f;
 
 void d3d8_SetPointZoom(float zoom)
@@ -1019,6 +1208,12 @@ void d3d8_RequestScreenshot(const wchar_t *path)
     LeaveCriticalSection(&s_shot_lock);
 }
 
+/* 1 while a requested screenshot has not been taken yet (bench tools). */
+int d3d8_ScreenshotPending(void)
+{
+    return ((volatile WCHAR *)s_shot_path)[0] != 0;
+}
+
 /* A short note in the title bar for a few seconds ("Screenshot saved"). */
 void d3d8_HostToast(const wchar_t *text)
 {
@@ -1031,6 +1226,7 @@ void d3d8_HostToast(const wchar_t *text)
  * left the window unclosable -- WM_CLOSE used to set a flag nothing read. */
 void d3d8_HostExit(void)
 {
+    d3d8_sync_report();                 /* bilan [PACING] */
     fflush(stdout);
     fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 0);
@@ -1763,11 +1959,13 @@ static void host_output_resize(void)
 
     if (s->swap_rtv) { ID3D11RenderTargetView_Release(s->swap_rtv); s->swap_rtv = NULL; }
     if (s->swap_tex) { ID3D11Texture2D_Release(s->swap_tex); s->swap_tex = NULL; }
-    hr = IDXGISwapChain_ResizeBuffers(s->swap_chain, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+    /* the creation flags (latency, tearing) must be passed again */
+    hr = IDXGISwapChain_ResizeBuffers(s->swap_chain, 0, cw, ch, DXGI_FORMAT_UNKNOWN, d3d8_sync_swap_flags());
     if (FAILED(hr))
         fprintf(stderr, "D3D8: resizing the output to %ux%u failed: 0x%08lX\n",
                 cw, ch, (unsigned long)hr);
     swap_targets_create(s);
+    d3d8_sync_window_changed();         /* the display may have changed */
 }
 
 /* PNG encoders for screenshots. Both take top-down BGR rows,
@@ -1966,6 +2164,18 @@ static HRESULT save_scene_png(D3D8DeviceState *s, ID3D11Texture2D *img, const WC
     ID3D11DeviceContext_Unmap(s->d3d11_context, (ID3D11Resource *)stage, 0);
     ID3D11Texture2D_Release(stage);
     if (!bgr) return E_OUTOFMEMORY;
+    {   /* fork: the image as shown, in its frame (16:9 box or 4:3 video) */
+        unsigned bx0, bw;
+        unsigned char *rb;
+        if (present_box_cols(td.Width, &bx0, &bw) && (rb = (unsigned char *)malloc((size_t)td.Width * 3u))) {
+            for (y = 0; y < td.Height; y++) {
+                BYTE *row = bgr + (size_t)y * stride;
+                present_box_row(row, rb, td.Width, bx0, bw);
+                memcpy(row, rb, (size_t)td.Width * 3u);
+            }
+            free(rb);
+        }
+    }
 
     /* Encode in memory first, write the file only once that worked
      * (a WIC failure used to leave a 0-byte .png), and fall back to a plain
@@ -2061,11 +2271,11 @@ IDirect3DTexture8 *d3d8_PrevFrameTexture(void)
     return g_prev_frame;
 }
 
-/* XBOX_PERF=1 : durée de host_present, du Present DXGI, et
- * durée GPU entre deux Presents (requêtes timestamp, relues 3 images plus
- * tard sans attendre). La durée GPU va du retour du Present précédent au
- * début de celui-ci : elle inclut d'éventuels trous quand le CPU n'alimente
- * pas le GPU, c'est donc un majorant du travail GPU de l'image. */
+/* XBOX_PERF=1: duration of host_present, of the DXGI Present,
+ * and GPU time between two Presents (timestamp queries, read back 3 frames
+ * later without waiting). The GPU time runs from the return of the previous
+ * Present to the start of this one: it includes any gaps when the CPU does
+ * not feed the GPU, so it is an upper bound of the frame's GPU work. */
 static HRESULT host_present_impl(void);
 static double s_perf_dxgi_ms;
 static HRESULT host_present(void)
@@ -2078,7 +2288,7 @@ static HRESULT host_present(void)
     ID3D11Device *dev = g_device_state.d3d11_device;
     double t0, gpu = -1.0;
     HRESULT hr;
-    {   /* compteur d'images pour XBOX_FIX_PUMP_ALT */
+    {   /* frame counter for XBOX_FIX_PUMP_ALT */
         extern void d3d8_pump_frame_tick(void);
         d3d8_pump_frame_tick();
     }
@@ -2106,7 +2316,7 @@ static HRESULT host_present(void)
     perf_add(PZ_PRESENT, perf_now() - t0);
     perf_add(PZ_DXGI, s_perf_dxgi_ms);
     if (ok == 1 && ctx) {
-        int old = (int)((n + 1) % NQ);          /* la plus ancienne, 3 images avant */
+        int old = (int)((n + 1) % NQ);          /* the oldest, 3 frames back */
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
         UINT64 a, b;
         if (n >= NQ
@@ -2157,7 +2367,7 @@ static HRESULT host_present_impl(void)
 
         host_output_resize();
         if (s->swap_rtv && s->swap_tex && s->swap_w && s->swap_h) {
-            const double aspect = d3d8_HostAspect();
+            const double aspect = present_aspect();
             UINT w = s->swap_w, h = s->swap_h, rw, rh, rx, ry;
             if ((double)w / (double)h > aspect) {
                 rh = h; rw = (UINT)(h * aspect + 0.5);
@@ -2196,18 +2406,15 @@ static HRESULT host_present_impl(void)
          * flips fell inside one refresh -- the thread the title's fences
          * wait on -- and cost frames. The window is composed by the desktop,
          * so presenting without waiting does not tear. XBOX_VSYNC=1 waits. */
-        static int vsync = -1;
-        if (vsync < 0) { const char *e = getenv("XBOX_VSYNC"); vsync = e && e[0] == '1'; }
+        /* XBOX_SYNC chooses the presentation (d3d8_sync.h); its
+         * default, legacy, is the above unchanged. */
         static int plog = -1;
+        double dxgi_ms = 0.0;
         LARGE_INTEGER p0, p1, pf;
         if (plog < 0) { const char *e = getenv("XBOX_FLIP_LOG"); plog = e && e[0] == '1'; }
-        if (plog || g_perf_on) QueryPerformanceCounter(&p0);
-        hr = IDXGISwapChain_Present(s->swap_chain, vsync ? 1 : 0, 0);
-        if (g_perf_on) {
-            QueryPerformanceCounter(&p1);
-            QueryPerformanceFrequency(&pf);
-            s_perf_dxgi_ms = (double)(p1.QuadPart - p0.QuadPart) * 1000.0 / (double)pf.QuadPart;
-        }
+        if (plog) QueryPerformanceCounter(&p0);
+        hr = d3d8_sync_present(s->swap_chain, &dxgi_ms);
+        if (g_perf_on) s_perf_dxgi_ms = dxgi_ms;
         if (plog) {     /* XBOX_FLIP_LOG=1: how long Present itself blocks */
             QueryPerformanceCounter(&p1);
             QueryPerformanceFrequency(&pf);
@@ -2355,6 +2562,7 @@ static HRESULT d3d11_create_device_and_swap_chain(
      * Fullscreen is a borderless window instead (host_window_set_fullscreen). */
     scd.Windowed = TRUE;
     scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    d3d8_sync_swap_desc(&scd);          /* flip model according to XBOX_SYNC */
 
     hr = D3D11CreateDeviceAndSwapChain(
         NULL,
@@ -2369,6 +2577,12 @@ static HRESULT d3d11_create_device_and_swap_chain(
         &feature_level,
         &state->d3d11_context
     );
+    if (FAILED(hr) && d3d8_sync_mode() != D3D8_SYNC_LEGACY) {
+        d3d8_sync_fallback(&scd, hr);   /* flip model refused: the original chain */
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, create_flags,
+                                           NULL, 0, D3D11_SDK_VERSION, &scd, &state->swap_chain,
+                                           &state->d3d11_device, &feature_level, &state->d3d11_context);
+    }
 
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
@@ -2376,6 +2590,7 @@ static HRESULT d3d11_create_device_and_swap_chain(
     }
 
     state->hwnd = scd.OutputWindow;
+    d3d8_sync_created(state->swap_chain, state->hwnd);
 
     /* Alt+Enter is ours (borderless toggle in host_wnd_proc); DXGI's would
      * switch to exclusive mode behind the renderer's back. */
@@ -2530,6 +2745,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         if (s->scene_ms) { ID3D11Texture2D_Release(s->scene_ms); s->scene_ms = NULL; }
         if (s->swap_rtv) { ID3D11RenderTargetView_Release(s->swap_rtv); s->swap_rtv = NULL; }
         if (s->swap_tex) { ID3D11Texture2D_Release(s->swap_tex); s->swap_tex = NULL; }
+        d3d8_sync_release();
         if (s->swap_chain) { IDXGISwapChain_Release(s->swap_chain); s->swap_chain = NULL; }
         if (s->d3d11_context) { ID3D11DeviceContext_Release(s->d3d11_context); s->d3d11_context = NULL; }
         if (s->d3d11_device) { ID3D11Device_Release(s->d3d11_device); s->d3d11_device = NULL; }
@@ -2993,15 +3209,23 @@ static UINT up_ring_upload(const void *data, UINT size)
         map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
     }
 
-    hr = ID3D11DeviceContext_Map(g_device_state.d3d11_context,
-        (ID3D11Resource *)g_up_ring_buffer, 0, map_type, 0, &mapped);
+    {
+        unsigned long long t = g_perf_maptime ? __rdtsc() : 0;   /* XBOX_PERF_MAPTIME */
+        hr = ID3D11DeviceContext_Map(g_device_state.d3d11_context,
+            (ID3D11Resource *)g_up_ring_buffer, 0, map_type, 0, &mapped);
+        if (g_perf_maptime) g_perf_map_cyc += __rdtsc() - t;
+    }
     if (FAILED(hr)) return (UINT)-1;
 
     offset = g_up_ring_offset;
     memcpy((BYTE *)mapped.pData + offset, data, size);
 
-    ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
-        (ID3D11Resource *)g_up_ring_buffer, 0);
+    {
+        unsigned long long t = g_perf_maptime ? __rdtsc() : 0;
+        ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
+            (ID3D11Resource *)g_up_ring_buffer, 0);
+        if (g_perf_maptime) { g_perf_map_cyc += __rdtsc() - t; g_perf_map_pairs++; }
+    }
 
     g_up_ring_offset = (offset + size + 15) & ~15;  /* 16-byte align */
     return offset;

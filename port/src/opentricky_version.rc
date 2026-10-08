@@ -1,0 +1,5 @@
+/* The launcher's (OpenTricky.exe) version resource, for its CMake target:
+ * add this file to its sources with port/src on the resource include path. */
+#define OT_FILE_DESCRIPTION  "OpenTricky launcher"
+#define OT_ORIGINAL_FILENAME "OpenTricky.exe"
+#include "version_info.rc"

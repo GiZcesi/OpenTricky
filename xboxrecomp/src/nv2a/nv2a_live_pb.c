@@ -452,7 +452,7 @@ void nv2a_live_pb_tick(uint8_t *mem_base)
 
     /* Occlusion reports whose queries completed since the last tick. */
     if (g_ready) pgraph_d3d11_poll_reports();
-    {   /* nouveau tour = nouvelles signatures de textures */
+    {   /* new round = new texture signatures */
         extern void pgraph_d3d11_tick_begin(void);
         pgraph_d3d11_tick_begin();
     }

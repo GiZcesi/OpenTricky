@@ -530,7 +530,38 @@ extern __thread int      g_cmp_test;   /* 1 = `test` (CF/OF clear), 0 = `cmp` */
 #define SPLIT_JLE   (g_cmp_test ? ((int32_t)SPLIT_AND <= 0)                                 : ((int32_t)g_cmp_a <= (int32_t)g_cmp_b))
 #define SPLIT_JG    (!SPLIT_JLE)
 
+/*
+ * Fast path (fork, FORK_FAST_RESOLVE, default on): every guest memory access
+ * goes through this function, and in the huge generated functions GCC stops
+ * inlining it -- each access became a call through ~12 instructions (15 % of
+ * the game thread's samples in a race). Ordinary addresses, 0x100 up to the
+ * uncached alias at 0x80000000, are returned unchanged by every branch of the
+ * full resolver below, so they take one inlined compare; so do the uncached
+ * (0x80000000) and write-combined (0xF0000000) aliases, the same masks as
+ * below; anything else goes to the full resolver, kept out of line. Same
+ * result for every address (checked over all 2^32).
+ * Build with -DFORK_FAST_RESOLVE=0 for the old code.
+ */
+#ifndef FORK_FAST_RESOLVE
+#define FORK_FAST_RESOLVE 1
+#endif
+#if FORK_FAST_RESOLVE
+static uint32_t xbox_resolve_uncached_alias_slow(uint32_t va) __attribute__((noinline, unused));
+static inline __attribute__((always_inline)) uint32_t xbox_resolve_uncached_alias(uint32_t va) {
+    if (__builtin_expect((uint32_t)(va - 0x100u) < 0x80000000u - 0x100u, 1))
+        return va;
+    /* The D3D runtime writes the push buffer through the uncached and
+     * write-combined aliases: as hot as ordinary addresses in a race. */
+    if ((va & 0xFC000000u) == 0x80000000u && (va & 0xFFFFF000u) != 0x80010000u)
+        return va & 0x7FFFFFFFu;
+    if ((va & 0xFC000000u) == 0xF0000000u)
+        return va & 0x03FFFFFFu;
+    return xbox_resolve_uncached_alias_slow(va);
+}
+static __attribute__((noinline, unused)) uint32_t xbox_resolve_uncached_alias_slow(uint32_t va) {
+#else
 static inline uint32_t xbox_resolve_uncached_alias(uint32_t va) {
+#endif
     /* fs:-relative access -- see g_xbox_tib_va above. First test because it is
      * the cheapest and, for ordinary addresses, always false. */
     /*
@@ -694,7 +725,7 @@ typedef union recomp_xmm_u {
  * a fall-through into a split fragment was lost -- the fragment read an
  * uninitialised local (27 functions, the terrain/physics maths among them:
  * sub_00030CA0 took rcpps of garbage and wrote NaN into the rider). Same
- * cure as the x87 stack in part 179: one register file, as on the CPU.
+ * cure as the x87 stack: one register file, as on the CPU.
  * Defined in recomp_manual.c. */
 extern __thread recomp_xmm_t g_xmm[8];
 extern __thread uint64_t g_mm[8];
@@ -1083,6 +1114,15 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * Your .text section typically spans 0x00010000 to ~0x003XXXXX.
  * Any VA outside .text and below 0xFE000000 is likely garbage.
  */
+/*
+ * Indirect-call target: hooks (recomp_lookup_manual), then the dispatch table
+ * (binary search), then kernel thunks. Fork: a per-thread direct-mapped cache
+ * of resolved targets in front (recomp_manual.c; XBOX_FIX_ICALL_CACHE=0 turns
+ * it off). Every hook decision is taken at start-up, before the title runs,
+ * so a resolved target never changes; misses are not cached.
+ */
+void (*recomp_resolve_icall(uint32_t va))(void);
+
 #define RECOMP_ICALL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
@@ -1092,9 +1132,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
         g_esp += 4; eax = 0; break; \
     } \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    void (*_fn)(void) = recomp_resolve_icall(_va); \
     if (_fn) _fn(); \
     else { g_esp += 4; eax = 0; } \
 } while(0)
@@ -1115,9 +1153,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
         g_esp = (saved_esp); eax = 0; break; \
     } \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    void (*_fn)(void) = recomp_resolve_icall(_va); \
     if (_fn) _fn(); \
     else { g_esp = (saved_esp); eax = 0; recomp_icall_miss_log_at(_va, __FILE__, __LINE__); } \
 } while(0)
@@ -1141,9 +1177,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  */
 #define RECOMP_ITAIL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
-    recomp_func_t _fn = recomp_lookup_manual(_va); \
-    if (!_fn) _fn = recomp_lookup(_va); \
-    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    void (*_fn)(void) = recomp_resolve_icall(_va); \
     if (_fn) _fn(); \
     else { eax = 0; recomp_icall_miss_log_at(_va, __FILE__, __LINE__); } \
 } while(0)

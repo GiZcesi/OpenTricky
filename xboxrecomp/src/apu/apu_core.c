@@ -265,10 +265,15 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.stream = NULL;
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
+    d->monitor.channels = 2;    /* waveOut, and XAudio2 unless it opened 5.1 */
 
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
-        fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+        /* Set before the APU thread starts (mcpx_apu_init_standalone), so
+         * every frame of the run uses the same layout. */
+        d->monitor.channels = xa2_channels();
+        fprintf(stderr, "[APU] Using XAudio2 audio backend (%s output)\n",
+                d->monitor.channels == APU_OUT_MAX_CHANNELS ? "5.1" : "stereo");
         return;
     }
     fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
@@ -335,11 +340,16 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
  * sample the emulated APU produced was discarded, and a title that drives the
  * APU through its own statically linked DirectSound (SSX Tricky does) stayed
  * silent however far its audio got.
+ *
+ * `out` is interleaved, d->monitor.channels per sample. With stereo output
+ * that is the old [n][2] layout, value for value. With 5.1 the test tone and
+ * the software mixer (both stereo) go to FL/FR; the other four channels carry
+ * the APU's own output alone.
  */
-static void monitor_render_block(MCPXAPUState *d,
-                                 int16_t out[MIXER_FRAME_SAMPLES][2])
+static void monitor_render_block(MCPXAPUState *d, int16_t *out)
 {
     int16_t extra[MIXER_FRAME_SAMPLES][2];
+    int nch = d->monitor.channels;
     int i, c;
 
     memset(extra, 0, sizeof(extra));
@@ -358,10 +368,10 @@ static void monitor_render_block(MCPXAPUState *d,
     }
 
     for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
-        for (c = 0; c < 2; c++) {
+        for (c = 0; c < nch; c++) {
             int v = g_audio_muted ? 0
-                  : (int)d->monitor.frame_buf[i][c] + (int)extra[i][c];
-            out[i][c] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+                  : (int)d->monitor.frame_buf[i][c] + (c < 2 ? (int)extra[i][c] : 0);
+            out[i * nch + c] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
     }
 
@@ -400,10 +410,12 @@ static void waveout_submit(MCPXAPUState *d, int16_t src[][2])
  */
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
-    static int16_t acc[WAVEOUT_BUF_SAMPLES][2];
+    /* Interleaved, d->monitor.channels per sample (stereo: the old [n][2]). */
+    static int16_t acc[WAVEOUT_BUF_SAMPLES * APU_OUT_MAX_CHANNELS];
     static int acc_n = 0;
-    int16_t block[MIXER_FRAME_SAMPLES][2];
-    int want, i;
+    int16_t block[MIXER_FRAME_SAMPLES * APU_OUT_MAX_CHANNELS];
+    int nch = d->monitor.channels;
+    int want, i, c;
 
     if ((d->ep_frame_div + 1) % 8) {
         return;
@@ -421,15 +433,15 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     monitor_render_block(d, block);
 
     for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
-        acc[acc_n][0] = block[i][0];
-        acc[acc_n][1] = block[i][1];
+        for (c = 0; c < nch; c++)
+            acc[acc_n * nch + c] = block[i * nch + c];
         if (++acc_n < want)
             continue;
         acc_n = 0;
         if (xa2_is_active())
-            xa2_submit_samples((const int16_t *)acc, want);
+            xa2_submit_samples(acc, want);
         else
-            waveout_submit(d, acc);
+            waveout_submit(d, (int16_t (*)[2])acc);   /* waveOut is always stereo */
     }
 }
 
@@ -523,7 +535,7 @@ static void throttle(MCPXAPUState *d)
      * drain one. The wall-clock pacing below ran at 1,499.4 frames/s against
      * the device's 1,500, rounded every wait to whole milliseconds and threw
      * time away when behind, so the queue alternately ran dry and overflowed
-     * -- the "slight noise" heard in part 179. */
+     * -- an audible slight noise. */
     if (xa2_is_active()) {
         while (!d->pause_requested && xa2_queued() >= xa2_target_queued())
             qemu_cond_timedwait(&d->cond, &d->lock, 2);
@@ -794,8 +806,8 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
      * linked DirectSound drives the hardware (SSX Tricky) started voices on a
      * voice processor that never ran a single frame.
      *
-     * RUNS BY DEFAULT since part 178; XBOX_APU_RUN=0 holds it. It was held in
-     * part 177 because running it let EA's stream mixer write PCM from guest
+     * RUNS BY DEFAULT; XBOX_APU_RUN=0 holds it. It was held at first
+     * because running it let EA's stream mixer write PCM from guest
      * address 0 across .text, the kernel thunk table and .data -- which looked
      * like a heap overlap. It was a chain of translation defects in the mixer
      * and its codecs: a jcc taking flags from the wrong block (0x184C5), a

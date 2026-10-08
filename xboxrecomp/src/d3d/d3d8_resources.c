@@ -448,7 +448,7 @@ static HRESULT __stdcall tex_LockRect(IDirect3DTexture8 *self, UINT Level, D3DLO
     (void)pRect; (void)Flags;
 
     if (!pLockedRect || Level >= tex->levels) return E_INVALIDARG;
-    if (tex->locked) return E_FAIL;
+    if (tex->locked || !tex->sys_mem) return E_FAIL;    /* !sys_mem: immutable */
 
     if (Level == 0) {
         pLockedRect->Pitch = (INT)tex->pitch;
@@ -585,6 +585,71 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
     tex->iface.lpVtbl = &g_tex_vtbl;
     tex->ref_count = 1;
 
+    *ppTex = &tex->iface;
+    return S_OK;
+}
+
+/* See d3d8_xbox.h. One CreateTexture2D with every level as initial
+ * data; no level-0 copy is kept in system memory (an HD texture is 4 to 64
+ * times the guest one), which is why LockRect refuses it. */
+HRESULT d3d8_CreateTextureFromLevels(UINT Width, UINT Height, UINT Levels,
+                                     const void *const *level_bits, IDirect3DTexture8 **ppTex)
+{
+    D3D11_SUBRESOURCE_DATA init[16];
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
+    D3D8Texture *tex;
+    HRESULT hr;
+    UINT i;
+
+    if (!ppTex || !level_bits || !Width || !Height || !Levels || Levels > 16) return E_INVALIDARG;
+    *ppTex = NULL;
+    for (i = 0; i < Levels; i++) {
+        UINT lw = Width >> i ? Width >> i : 1;
+        init[i].pSysMem = level_bits[i];
+        init[i].SysMemPitch = lw * 4;
+        init[i].SysMemSlicePitch = 0;
+    }
+
+    tex = (D3D8Texture *)calloc(1, sizeof(*tex));
+    if (!tex) return E_OUTOFMEMORY;
+    tex->d3d8_format = D3DFMT_LIN_A8R8G8B8;
+    tex->dxgi_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    tex->width = Width;
+    tex->height = Height;
+    tex->levels = Levels;
+    tex->pitch = Width * 4;
+
+    memset(&td, 0, sizeof(td));
+    td.Width = Width;
+    td.Height = Height;
+    td.MipLevels = Levels;
+    td.ArraySize = 1;
+    td.Format = tex->dxgi_format;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, init, &tex->d3d11_texture);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: CreateTexture2D (levels) failed: 0x%08lX (%ux%u)\n", hr, Width, Height);
+        free(tex);
+        return hr;
+    }
+
+    memset(&srvd, 0, sizeof(srvd));
+    srvd.Format = tex->dxgi_format;
+    srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvd.Texture2D.MipLevels = Levels;
+    hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
+        (ID3D11Resource *)tex->d3d11_texture, &srvd, &tex->srv);
+    if (FAILED(hr)) {
+        ID3D11Texture2D_Release(tex->d3d11_texture);
+        free(tex);
+        return hr;
+    }
+
+    tex->iface.lpVtbl = &g_tex_vtbl;
+    tex->ref_count = 1;
     *ppTex = &tex->iface;
     return S_OK;
 }

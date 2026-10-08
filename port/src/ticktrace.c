@@ -1,5 +1,5 @@
 /*
- * ticktrace -- trace par tick de course (fork). Voir ticktrace.h.
+ * ticktrace -- per race tick trace. See ticktrace.h.
  */
 #include <windows.h>
 #include <stdio.h>
@@ -9,8 +9,8 @@
 #include "recomp/recomp_types.h"
 #include "ticktrace.h"
 
-void sub_000AD4A0(void);    /* InGameState vt+0x14 : tick de course (thiscall, ret) */
-void sub_0012A610(void);    /* cœur RNG, ecx = objet (A 0x1FAD70, B 0x1FAD88) */
+void sub_000AD4A0(void);    /* InGameState vt+0x14: race tick (thiscall, ret) */
+void sub_0012A610(void);    /* RNG core, ecx = object (A 0x1FAD70, B 0x1FAD88) */
 
 int g_ticktrace_on;
 
@@ -22,9 +22,9 @@ static struct {
     int      rng;
     FILE    *f;
     CRITICAL_SECTION lock;
-    DWORD    tid;                       /* thread de la boucle (celui des ticks) */
+    DWORD    tid;                       /* loop thread (the one running the ticks) */
     volatile int in_tick;
-    unsigned seq;                       /* n° de tick de course vu par la trace */
+    unsigned seq;                       /* race tick number seen by the trace */
     uint32_t extra_va[8], extra_len[8];
     int      n_extra;
     DWORD    last_flush;
@@ -47,17 +47,17 @@ static uint32_t race_ptr(void)
     return MEM32(lvl + 0x1Cu);
 }
 
-/* Caméra de course: bloc de la vue 0 dans InGameState, matrice de
- * vue +0xC0 (64 o, passée à SetViewMatrix vt+0x74 par 0xDDF30 au rendu) et
- * paramètres de projection +0x100 / +0x104. */
+/* Race camera: block of view 0 in InGameState, view matrix +0xC0 (64 bytes,
+ * passed to SetViewMatrix vt+0x74 by 0xDDF30 at render) and projection
+ * parameters +0x100 / +0x104. */
 static uint32_t cam_hash(void)
 {
     uint32_t app = MEM32(APP_GLOBAL), st = app >= 0x1000u ? MEM32(app + 4u) : 0;
     return st >= 0x1000u ? fnv(st + 0xC0u, 0x48u) : 0;
 }
 
-/* Rider : cinématique (position +0x170, vitesse +0x180, état RiderEvent +0x458,
- * facteur de vitesse +0x15C, jauge +0x1C). */
+/* Rider: kinematics (position +0x170, velocity +0x180, RiderEvent state
+ * +0x458, speed factor +0x15C, gauge +0x1C). */
 static uint32_t rider_kin(uint32_t r)
 {
     uint32_t h = fnv(r + 0x170u, 0x1Cu) ^ 0x9E3779B9u;
@@ -66,10 +66,10 @@ static uint32_t rider_kin(uint32_t r)
     return (h ^ MEM32(r + 0x1Cu)) * 16777619u;
 }
 
-/* ── appelants invités depuis la pile host ─────────────────────────
- * Les fonctions traduites s'appellent directement en C : la pile host EST la
- * chaîne d'appels invitée (l'emplacement de retour invité vaut 0). Table
- * inverse (pointeur host -> VA invitée) construite une fois avec recomp_lookup. */
+/* ── guest callers from the host stack ─────────────────────────────
+ * Translated functions call each other directly in C: the host stack IS the
+ * guest call chain (the guest return slot is 0). Reverse table (host pointer
+ * -> guest VA) built once with recomp_lookup. */
 typedef struct { uintptr_t host; uint32_t va; } Rev;
 static Rev   *s_rev;
 static size_t s_nrev;
@@ -106,11 +106,11 @@ static uint32_t rev_va(uintptr_t host)
     return lo ? s_rev[lo - 1].va : 0;
 }
 
-/* ── watch : qui écrit quoi (XBOX_TICKTRACE_WATCH) ─────────────────
- * Régions relatives à une base : st (InGameState [app+4]), r0..r7 (riders
- * [race+0xC4+4i]), race, app, ou une VA absolue (0x...). Pour chaque mot :
- * nombre de ticks où il a changé PENDANT le tick, et de rendus où il a changé
- * PENDANT le rendu (0xAB610). Bilan à la sortie, par plages contiguës. */
+/* ── watch: who writes what (XBOX_TICKTRACE_WATCH) ─────────────────
+ * Regions relative to a base: st (InGameState [app+4]), r0..r7 (riders
+ * [race+0xC4+4i]), race, app, or an absolute VA (0x...). For each word:
+ * number of ticks where it changed DURING the tick, and of renders where it
+ * changed DURING the render (0xAB610). Summary at exit, per contiguous range. */
 enum { WB_ABS, WB_ST, WB_RACE, WB_APP, WB_CAM, WB_R0 };
 typedef struct {
     int      base;      /* WB_*, WB_R0 + i */
@@ -190,7 +190,7 @@ static void watch_report(void)
     for (i = 0; i < s_nw; i++) {
         uint32_t k, n = s_w[i].len / 4, start = 0;
         int open = 0, kind = 0;
-        fprintf(s.f, "# watch %s (%llu ticks, %llu rendus) : plages +off..+fin [t=changé pendant le tick, r=pendant le rendu, nb max]\n",
+        fprintf(s.f, "# watch %s (%llu ticks, %llu renders): ranges +off..+end [t=changed during the tick, r=during the render, max count]\n",
                 s_w[i].name, s_w_ticks, s_w_rends);
         for (k = 0; k <= n; k++) {
             int kk = k < n ? ((s_w[i].n_tick[k] != 0) | (s_w[i].n_rend[k] != 0) << 1) : 0;
@@ -206,24 +206,24 @@ static void watch_report(void)
     }
 }
 
-/* ── lectures du rendu (XBOX_TICKTRACE_READS) ──────────────────────
- * Une région (même syntaxe que WATCH). Un rendu sur XBOX_TICKTRACE_READS_EVERY
- * (défaut 30) : ses pages host passent en PAGE_NOACCESS ; chaque accès lève une
- * exception, notée (mot lu / écrit dans la région, fonction invitée d'après
- * RIP), puis la page est rendue le temps d'une instruction (pas à pas) et
- * reprotégée. Lent : outil d'enquête seulement. */
+/* ── render reads (XBOX_TICKTRACE_READS) ───────────────────────────
+ * One region (same syntax as WATCH). One render in XBOX_TICKTRACE_READS_EVERY
+ * (default 30): its host pages become PAGE_NOACCESS; each access raises an
+ * exception, recorded (word read / written in the region, guest function from
+ * RIP), then the page is opened for one instruction (single step) and
+ * protected again. Slow: investigation tool only. */
 static Watch     s_rd;
 static int       s_rd_on, s_rd_every = 30;
-static uint32_t *s_rd_nr, *s_rd_nw;           /* par mot : rendus où lu / écrit */
-static uint32_t *s_rd_seen;                   /* marque « vu dans ce rendu » */
+static uint32_t *s_rd_nr, *s_rd_nw;           /* per word: renders where read / written */
+static uint32_t *s_rd_seen;                   /* "seen in this render" mark */
 static uint32_t  s_rd_gen;
 static volatile LONG s_rd_armed;
-static uintptr_t s_rd_lo, s_rd_hi, s_rd_va_host;   /* pages protégées ; base host de la région */
+static uintptr_t s_rd_lo, s_rd_hi, s_rd_va_host;   /* protected pages; host base of the region */
 static unsigned long long s_rd_renders, s_rd_faults;
 typedef struct { uint32_t va, lo, hi; unsigned long long n; } RdFn;
-static RdFn s_rd_fn[48], s_wr_fn[48];           /* lecteurs, écrivains */
-static int  s_rd_tick;                           /* XBOX_TICKTRACE_READS_PHASE=tick : tracer les ticks */
-static DWORD s_rd_prot = PAGE_READWRITE;         /* protection d'origine des pages */
+static RdFn s_rd_fn[48], s_wr_fn[48];           /* readers, writers */
+static int  s_rd_tick;                           /* XBOX_TICKTRACE_READS_PHASE=tick: trace the ticks */
+static DWORD s_rd_prot = PAGE_READWRITE;         /* original protection of the pages */
 static __thread uintptr_t t_rd_page;
 
 static void rd_note_fn(RdFn *t, uint32_t va, uint32_t off)
@@ -258,7 +258,7 @@ static LONG CALLBACK rd_veh(EXCEPTION_POINTERS *x)
         pg = a & ~(uintptr_t)0xFFF;
         VirtualProtect((void *)pg, 0x1000, s_rd_prot, &old);
         t_rd_page = pg;
-        x->ContextRecord->EFlags |= 0x100;          /* une instruction, puis reprotéger */
+        x->ContextRecord->EFlags |= 0x100;          /* one instruction, then protect again */
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (code == EXCEPTION_SINGLE_STEP && t_rd_page) {
@@ -298,8 +298,8 @@ static void rd_report(void)
     uint32_t k, n = s_rd.len / 4, start = 0;
     int open = 0, kind = 0, i;
     if (!s_rd_on) return;
-    fprintf(s.f, "# reads %s (%llu %s tracés, %llu fautes) : plages lues (R) / écrites (W) PENDANT le %s, nb max\n",
-            s_rd.name, s_rd_renders, s_rd_tick ? "ticks" : "rendus", s_rd_faults, s_rd_tick ? "tick" : "rendu");
+    fprintf(s.f, "# reads %s (%llu %s traced, %llu faults): ranges read (R) / written (W) DURING the %s, max count\n",
+            s_rd.name, s_rd_renders, s_rd_tick ? "ticks" : "renders", s_rd_faults, s_rd_tick ? "tick" : "render");
     for (k = 0; k <= n; k++) {
         int kk = k < n ? ((s_rd_nr[k] != 0) | (s_rd_nw[k] != 0) << 1) : 0;
         if (open && kk != kind) {
@@ -310,10 +310,10 @@ static void rd_report(void)
         }
         if (!open && kk) { open = 1; kind = kk; start = k; }
     }
-    fprintf(s.f, "# reads %s : fonctions lectrices (va:nb[+premier..+dernier offset lu])", s_rd.name);
+    fprintf(s.f, "# reads %s: reading functions (va:count[+first..+last offset read])", s_rd.name);
     for (i = 0; i < 48 && s_rd_fn[i].va; i++)
         fprintf(s.f, " %06X:%llu[+%X..+%X]", s_rd_fn[i].va, s_rd_fn[i].n, s_rd_fn[i].lo, s_rd_fn[i].hi);
-    fprintf(s.f, "\n# reads %s : fonctions écrivaines (va:nb[+premier..+dernier offset écrit])", s_rd.name);
+    fprintf(s.f, "\n# reads %s: writing functions (va:count[+first..+last offset written])", s_rd.name);
     for (i = 0; i < 48 && s_wr_fn[i].va; i++)
         fprintf(s.f, " %06X:%llu[+%X..+%X]", s_wr_fn[i].va, s_wr_fn[i].n, s_wr_fn[i].lo, s_wr_fn[i].hi);
     fputc('\n', s.f);
@@ -324,8 +324,8 @@ static void rd_report(void)
 void sub_000AB610(void);
 extern void (*fps_cap_lookup(unsigned int xbox_va))(void);
 
-/* Rendu InGameState (seulement avec XBOX_TICKTRACE_WATCH) ; enchaîne sur le
- * hook de fps_cap s'il y en a un (mode DUP). */
+/* InGameState render (only with XBOX_TICKTRACE_WATCH); chains to the fps_cap
+ * hook if there is one (DUP mode). */
 static void hook_tt_AB610(void)
 {
     uint32_t va[8];
@@ -345,7 +345,7 @@ static void maybe_flush(void)
     if (t - s.last_flush > 2000u) { fflush(s.f); s.last_flush = t; }
 }
 
-/* Non statique : la passe 13 y routerait un appel direct (aucun aujourd'hui). */
+/* Not static: pass 13 would route a direct call here (none today). */
 void hook_tt_AD4A0(void)
 {
     uint32_t a0 = MEM32(RNG_A + 0x14u), b0 = MEM32(RNG_B + 0x14u), race, i, n, va[8];
@@ -365,7 +365,7 @@ void hook_tt_AD4A0(void)
     }
     if (w) { watch_diff(va, 0); s_w_ticks++; }
     race = race_ptr();
-    /* bilan cumulé périodique : un processus tué ne passe pas par atexit */
+    /* periodic cumulative summary: a killed process does not go through atexit */
     if ((s_nw || s_rd_on) && s.seq % 1800u == 0u) { EnterCriticalSection(&s.lock); watch_report(); rd_report(); LeaveCriticalSection(&s.lock); }
     EnterCriticalSection(&s.lock);
     s.seq++;
@@ -388,8 +388,8 @@ void hook_tt_AD4A0(void)
     LeaveCriticalSection(&s.lock);
 }
 
-/* Routé aussi depuis les appels directs (passe 13) : sans XBOX_TICKTRACE_RNG,
- * appelle l'original sans rien faire d'autre. */
+/* Also routed from direct calls (pass 13): without XBOX_TICKTRACE_RNG, calls
+ * the original and does nothing else. */
 void hook_tt_12A610(void)
 {
     uint32_t obj = g_ecx;
@@ -415,7 +415,7 @@ void hook_tt_12A610(void)
 
 /* ── init ──────────────────────────────────────────────────────── */
 
-/* Le « _local » le plus haut au-dessus du dossier de l'exe, + \ticktrace (règle de np_cmdlog). */
+/* The highest "_local" above the exe's folder, + \ticktrace (np_cmdlog's rule). */
 static void default_dir(char *out, size_t cap)
 {
     char dir[MAX_PATH], probe[MAX_PATH], *p;
@@ -454,7 +454,7 @@ void ticktrace_init(void)
     snprintf(path, sizeof path, "%s\\ticktrace_%04u%02u%02u_%02u%02u%02u_%lu.txt", dir,
              t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, GetCurrentProcessId());
     s.f = fopen(path, "w");
-    if (!s.f) { fprintf(stderr, "[TICKTRACE] impossible d'ouvrir %s : off\n", path); return; }
+    if (!s.f) { fprintf(stderr, "[TICKTRACE] cannot open %s: off\n", path); return; }
     setvbuf(s.f, NULL, _IOFBF, 1 << 20);
     e = getenv("XBOX_TICKTRACE_EXTRA");
     while (e && *e && s.n_extra < 8) {
@@ -465,7 +465,7 @@ void ticktrace_init(void)
         if (*e == ',') e++;
     }
     watch_parse(getenv("XBOX_TICKTRACE_WATCH"));
-    {   /* XBOX_TICKTRACE_READS : une région, même syntaxe ; lue par le dernier emplacement de watch */
+    {   /* XBOX_TICKTRACE_READS: one region, same syntax; read through the last watch slot */
         int n0 = s_nw;
         watch_parse(getenv("XBOX_TICKTRACE_READS"));
         if (s_nw > n0) {
@@ -485,12 +485,12 @@ void ticktrace_init(void)
     e = getenv("XBOX_TICKTRACE_RNG");
     s.rng = e && e[0] == '1';
     if (s.rng && !s_rev) rev_build();
-    fprintf(s.f, "# ticktrace v1 : T seq course_tick etat nA nB dA dB rngA rngB course cam nriders riders(cinematique)... [xEXTRA]%s\n",
-            s.rng ? " ; R seq A|B n phase(t/h/o) appelant1 appelant2 appelant3" : "");
+    fprintf(s.f, "# ticktrace v1: T seq race_tick state nA nB dA dB rngA rngB race cam nriders riders(kinematics)... [xEXTRA]%s\n",
+            s.rng ? "; R seq A|B n phase(t/h/o) caller1 caller2 caller3" : "");
     g_ticktrace_on = 1;
     atexit(ticktrace_atexit);
-    fprintf(stderr, "[TICKTRACE] trace par tick -> %s%s (%zu fonctions dans la table inverse)\n",
-            path, s.rng ? " ; tirages RNG" : "", s_nrev);
+    fprintf(stderr, "[TICKTRACE] per tick trace -> %s%s (%zu functions in the reverse table)\n",
+            path, s.rng ? "; RNG draws" : "", s_nrev);
 }
 
 void (*ticktrace_lookup(unsigned int xbox_va))(void)

@@ -3,7 +3,7 @@
 
 fixfpret.py inserted `fp_push(g_x87_st0);` after calls whose ST(0) result the
 caller consumes. That was right while every function had its own `_fp_stack`.
-Since part 179 the x87 stack is one per thread, so a callee's result is
+Now the x87 stack is one per thread, so a callee's result is
 already on it -- and `g_x87_st0` is only the value of the callee's *last
 fp_push*, not its ST(0). The angle wrapper sub_0001E600 ends
 `fld x; fld 2pi; fmulp; fsubr [a]`: its last push is the constant, so every

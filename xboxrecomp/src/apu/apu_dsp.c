@@ -82,7 +82,23 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         downmix = !(e && e[0] == '0');
     }
 
-    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+    /* 5.1 output (the host device has the speakers, see apu_xaudio2.c): the
+     * six speaker bins go out as they are, one channel each -- nothing to
+     * fold, the LFE included. This is what the console's encoder stage was
+     * fed. Each channel is clamped and converted exactly as the stereo pair
+     * below. */
+    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP &&
+        d->monitor.channels == APU_OUT_MAX_CHANNELS) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            for (int c = 0; c < APU_OUT_MAX_CHANNELS; c++) {
+                float v = mixbins[c][i];
+                if (v > 1.0f) v = 1.0f;
+                if (v < -1.0f) v = -1.0f;
+                d->monitor.frame_buf[off + i][c] = (int16_t)(v * 32767.0f);
+            }
+        }
+    } else if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        /* Stereo output: unchanged, bit for bit. */
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Clamp to [-1, 1] range */
             float left = mixbins[0][i];

@@ -15,8 +15,16 @@ void xa2_shutdown(void);
 /* Returns 1 if XAudio2 is active. */
 int xa2_is_active(void);
 
-/* Submit interleaved stereo 16-bit samples. Returns 1 if accepted. */
+/* Submit interleaved 16-bit samples, xa2_channels() per sample frame.
+ * Returns 1 if accepted. */
 int xa2_submit_samples(const int16_t *samples, int num_samples);
+
+/* Channels of the source voice opened by xa2_init: 2 (stereo) or 6 (5.1:
+ * FL FR C LFE SL SR). Chosen once from XBOX_AUDIO_OUTPUT (auto, stereo, 5.1;
+ * unset = auto) and the speakers of the Windows output device: auto opens
+ * 5.1 only when the device has the 5.1 speakers, and otherwise the stereo
+ * output exactly as before the option existed. */
+int xa2_channels(void);
 
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);

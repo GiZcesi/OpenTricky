@@ -1,0 +1,104 @@
+<rml>
+<head>
+    <title>OpenTricky settings</title>
+    <link type="text/rcss" href="launcher.rcss"/>
+</head>
+<body data-model="ot" class="settings">
+    <div class="bg">
+        <img class="grad" src="ot:bg/$track$"/>
+        <div class="carpet" data-if="have_disc"><span data-for="c : carpet"><img data-attr-src="'ot:carpet/' + c"/></span></div>
+        <div class="shade"></div>
+    </div>
+
+    <div class="stage" id="stage">
+
+        <div class="pill disc" data-class-warn="disc_state == 'warn'" data-class-bad="disc_state == 'bad'"
+             data-event-click="choose_disc"><span class="dt"></span><b>{{disc_title}}</b>&nbsp; <span class="pb" data-class-plain="have_disc">{{disc_note}}</span></div>
+        <div class="pill ver" id="ver" data-class-upd="upd_state == 'update'" data-event-click="upd('pill')"><span class="ck" data-if="upd_state == 'latest'">&#x2713;</span>{{version_text}}</div>
+
+        <div class="title">Settings</div>
+        <div class="presets">
+            <span class="pl">Preset</span>
+            <div class="seg"><span data-for="p : presets" data-class-on="it_index == preset" data-event-click="preset(it_index)">{{p}}</span></div>
+        </div>
+
+        <!-- Tabs and rows are built from the settings registry (settings.h). -->
+        <div class="stabs">
+            <span class="stab" data-for="t : tabs" data-class-on="it_index == tab" data-attr-id="'tab' + it_index" data-event-click="set_tab(it_index)">{{t}}</span>
+        </div>
+
+        <div class="rows" id="rows">
+            <div data-for="r : rows"><div data-class-grp="r.is_group" data-class-row="!r.is_group" data-attr-rid="r.id"
+                 data-attr-id="'r' + r.id" data-event-click="row_click(r.id)">
+                <span data-if="r.is_group">{{r.label}}</span>
+                <span class="mod" data-if="r.changed"></span>
+                <span class="lab" data-if="!r.is_group">{{r.label}}</span>
+                <span class="pc" data-if="r.pc">PC</span>
+                <span class="val" data-if="r.arrows"><span class="left">&#x25C4;</span>{{r.value}}<span class="right">&#x25BA;</span></span>
+                <span class="tog" data-if="r.toggle" data-class-on="r.on"><span class="knob"></span></span>
+                <span class="plainv" data-if="r.plain">{{r.value}}</span>
+                <span class="act" data-if="r.button != ''"><span class="av" data-if="r.value != ''">{{r.value}}</span><span class="ab">{{r.button}}</span></span>
+            </div></div>
+
+            <!-- CONTROLS: the remapping table, one line per PS2 button. -->
+            <div class="ctl" data-if="tab == 3">
+                <div class="grp">MAPPING &#xB7; PS2 LAYOUT</div>
+                <div class="chead"><span class="h1">PS2 BUTTON</span><span class="h2">KEYBOARD</span><span class="h3">CONTROLLER</span></div>
+                <div data-for="c : ctls"><div class="crow">
+                    <img class="ci" data-attr-src="c.icon"/><span class="cl">{{c.label}}</span>
+                    <span class="cell ck" data-class-chg="c.kchg" data-attr-rid="2000 + c.k * 2" data-attr-id="'k' + c.k"
+                          data-event-click="ctl_click(c.k, 0)">{{c.key}}</span>
+                    <span class="cell cp" data-if="c.has_pad" data-class-chg="c.pchg" data-attr-rid="2001 + c.k * 2" data-attr-id="'c' + c.k"
+                          data-event-click="ctl_click(c.k, 1)">{{c.pad}}</span>
+                </div></div>
+            </div>
+        </div>
+
+        <div class="help" data-class-styles="tab == 3">
+            <!-- CONTROLS: the four button styles, drawn with the game's own pictures. -->
+            <div class="styles" data-if="tab == 3">
+                <div class="st" data-class-on="bstyle == 0" data-event-click="style_pick(0)"><span class="sn">AUTO</span>
+                    <span class="si"><img src="icons/jc/T_X_A_Color.png"/><img src="icons/jc/T_X_B_Color.png"/><img src="icons/jc/T_X_X_Color.png"/><img src="icons/jc/T_X_Y_Color.png"/></span></div>
+                <div class="st" data-class-on="bstyle == 1" data-event-click="style_pick(1)"><span class="sn">XBOX MODERN</span>
+                    <span class="si"><img src="icons/jc/T_X_A_Color.png"/><img src="icons/jc/T_X_B_Color.png"/><img src="icons/jc/T_X_X_Color.png"/><img src="icons/jc/T_X_Y_Color.png"/></span></div>
+                <div class="st" data-class-on="bstyle == 2" data-event-click="style_pick(2)"><span class="sn">PLAYSTATION MODERN</span>
+                    <span class="si"><img src="icons/jc/T_P4_Cross_Color_Retro.png"/><img src="icons/jc/T_P4_Circle_Color_Retro.png"/><img src="icons/jc/T_P4_Square_Color_Retro.png"/><img src="icons/jc/T_P4_Triangle_Color_Retro.png"/></span></div>
+                <div class="st" data-class-on="bstyle == 3" data-event-click="style_pick(3)"><span class="sn">PS2 ORIGINAL</span>
+                    <span class="si"><img src="icons/ps2/ps2_cross.png"/><img src="icons/ps2/ps2_circle.png"/><img src="icons/ps2/ps2_square.png"/><img src="icons/ps2/ps2_triangle.png"/></span></div>
+            </div>
+            <h3>{{help_title}}</h3>
+            <p>{{help_text}}</p>
+            <p class="extra" data-if="help_extra != ''">{{help_extra}}</p>
+            <div class="def" data-if="help_default != ''">Default: <b>{{help_default}}</b></div>
+            <div class="og" data-if="help_pc"><b>PC</b> = not on the original Xbox. The <b>Original Xbox</b> preset turns these off.</div>
+            <div class="env" data-if="help_env != ''">{{help_env}}</div>
+        </div>
+
+    </div>
+
+    <!-- Sidebar and footer hold the window's edges; the stage is centred. -->
+    <div class="side">
+        <img class="emblem" data-if="have_disc" src="ot:emblem/$track$"/>
+        <div class="otb" data-if="!have_disc"><img src="ot:otbadge"/><span>OT</span></div>
+        <div class="nav n1" id="nav-home" data-event-click="go('home')"><img src="ot:icon/home"/></div>
+        <div class="nav n2 on"><div class="bar"></div><img src="ot:icon/settings"/></div>
+        <div class="nav n3 soon"><img src="ot:icon/online"/><span>SOON</span></div>
+        <div class="nav nbug" id="nav-bug" data-event-click="bug"><img src="ot:icon/bug"/></div>
+    </div>
+
+    <div class="foot sfoot">
+        <div class="fin" id="fin">
+            <div class="l rn" data-event-click="open('releases')">Release notes</div>
+            <div class="l gh" data-event-click="open('github')">GitHub</div>
+            <div class="btn reset" id="reset" data-event-click="reset_tab">Reset tab</div>
+            <div class="btn save" id="save" data-event-click="save">Save</div>
+            <div class="note">{{saved_note}}</div>
+            <div class="hints" data-if="pad_active" style="left: 760dp;">
+                <span class="hs" data-if="hint_style == 0"><span class="kb ka">A</span>Select<span class="kb kbk">B</span>Back<span class="kb kl">LB</span><span class="kb kl" style="margin-left: 0dp;">RB</span>Tab<span class="kb kyy">Y</span>Save</span>
+                <span class="hs" data-if="hint_style == 1"><img class="pi pj" src="icons/jc/T_P4_Cross_Color_Retro.png"/>Select<img class="pi pj" src="icons/jc/T_P4_Circle_Color_Retro.png"/>Back<img class="pi pj" src="icons/jc/T_P4_L1_Retro.png"/><img class="pi pj pn" src="icons/jc/T_P4_R1_Retro.png"/>Tab<img class="pi pj" src="icons/jc/T_P4_Triangle_Color_Retro.png"/>Save</span>
+                <span class="hs" data-if="hint_style == 2"><img class="pi" src="icons/ps2/ps2_cross.png"/>Select<img class="pi" src="icons/ps2/ps2_circle.png"/>Back<img class="pi pl" src="icons/ps2/ps2_l1.png"/><img class="pi pl pn" src="icons/ps2/ps2_r1.png"/>Tab<img class="pi" src="icons/ps2/ps2_triangle.png"/>Save</span>
+            </div>
+        </div>
+    </div>
+</body>
+</rml>

@@ -5,6 +5,7 @@
 #include "xbox_xdvdfs.h"
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -37,6 +38,27 @@ static BOOL raw_read(uint64_t offset, void *buf, uint32_t len)
         return FALSE;
     got = fread(buf, 1, len, s_iso);
     return got == len;
+}
+
+/* XBOX_FIX_XDVDFS_CASE (default 1): walk directory trees with the uppercase
+ * ordering the disc is mastered with. 0 = old lowercase walk, which misorders
+ * '_' against letters and misses files such as data/textures/tbc_*.xsh. */
+static int xdvdfs_fold_upper(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XBOX_FIX_XDVDFS_CASE");
+        on = !(e && e[0] == '0');
+        fprintf(stderr, "[XDVDFS] XBOX_FIX_XDVDFS_CASE=%d\n", on);
+    }
+    return on;
+}
+
+/* Case folding used for tree ordering; ASCII only, independent of locale. */
+static int fold_char(int c, int up)
+{
+    if (up) return (c >= 'a' && c <= 'z') ? c - ('a' - 'A') : c;
+    return tolower(c);
 }
 
 /* Case-insensitive compare of a counted on-disc name against a NUL- or
@@ -96,14 +118,16 @@ static BOOL dir_find_component(uint32_t sector, uint32_t size,
 
         if (p + 14 + nlen > size) break;   /* malformed entry */
 
-        /* The tree is ordered by a case-insensitive name comparison. */
+        /* The tree is ordered by a case-insensitive byte comparison of the
+         * names folded to uppercase ('_' sorts after the letters). */
         {
             size_t n = (nlen < comp_len) ? nlen : comp_len;
             size_t i;
+            const int up = xdvdfs_fold_upper();
             cmp = 0;
             for (i = 0; i < n && cmp == 0; i++) {
-                int a = tolower((unsigned char)nm[i]);
-                int b = tolower((unsigned char)comp[i]);
+                int a = fold_char((unsigned char)nm[i], up);
+                int b = fold_char((unsigned char)comp[i], up);
                 cmp = (a > b) - (a < b);
             }
             if (cmp == 0) cmp = (nlen > comp_len) - (nlen < comp_len);

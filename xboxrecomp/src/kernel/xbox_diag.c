@@ -145,13 +145,17 @@ int xbox_diag_watch_add_ex(uint32_t va, uint32_t len)
      * whatever was zeroing guest .text at 0x000FB030 -- the value changed
      * while the watch reported no writes at all. */
     {
-        int m, mirrors = xbox_GetMirrorCount();
+        /* Walk the slots, not the count of mapped views: a slot in the
+         * middle may have no view (or only part of one), and whatever else
+         * occupies it must not have its protection changed. */
+        int m, mirrors = xbox_GetMirrorSlotCount();
         size_t stride = xbox_GetMemorySize();
         for (m = 0; m < mirrors; m++) {
             DWORD mo = 0;
             void *alias = (void *)((uintptr_t)diag_native(page)
                                    + (uintptr_t)(m + 1) * stride);
-            VirtualProtect(alias, 0x1000, PAGE_READONLY, &mo);
+            if (xbox_IsMirrorAddress(alias))
+                VirtualProtect(alias, 0x1000, PAGE_READONLY, &mo);
         }
     }
     g_watch[g_watch_n].page_va = page;
@@ -196,7 +200,7 @@ void xbox_diag_watch_clear(void)
     int i;
     for (i = 0; i < g_watch_n; i++)
         if (g_watch[i].active) {
-            int m, mirrors = xbox_GetMirrorCount();
+            int m, mirrors = xbox_GetMirrorSlotCount();
             size_t stride = xbox_GetMemorySize();
             VirtualProtect(diag_native(g_watch[i].page_va), 0x1000,
                            g_watch[i].old_prot, &old);
@@ -204,7 +208,8 @@ void xbox_diag_watch_clear(void)
                 DWORD mo = 0;
                 void *alias = (void *)((uintptr_t)diag_native(g_watch[i].page_va)
                                        + (uintptr_t)(m + 1) * stride);
-                VirtualProtect(alias, 0x1000, g_watch[i].old_prot, &mo);
+                if (xbox_IsMirrorAddress(alias))
+                    VirtualProtect(alias, 0x1000, g_watch[i].old_prot, &mo);
             }
         }
     g_watch_n = 0;

@@ -1,0 +1,87 @@
+<rml>
+<head>
+    <title>OpenTricky</title>
+    <link type="text/rcss" href="launcher.rcss"/>
+</head>
+<body data-model="ot" class="home">
+    <div class="bg">
+        <img class="grad" src="ot:bg/$track$"/>
+        <div class="carpet" data-if="have_disc"><span data-for="c : carpet"><img data-attr-src="'ot:carpet/' + c"/></span></div>
+        <div class="shade"></div>
+        <div class="shade2"></div>
+    </div>
+
+    <div class="stage" id="stage">
+
+        <div class="pill disc" id="disc" data-class-warn="disc_state == 'warn'" data-class-bad="disc_state == 'bad'"
+             data-event-click="choose_disc"><span class="dt"></span><b>{{disc_title}}</b>&nbsp; <span class="pb" data-class-plain="have_disc">{{disc_note}}</span></div>
+        <div class="pill ver" id="ver" data-class-upd="upd_state == 'update'" data-event-click="upd('pill')"><span class="ck" data-if="upd_state == 'latest'">&#x2713;</span>{{version_text}}</div>
+
+        <div class="logo">
+            <div class="word"><span class="open">Open</span><span class="tricky">Tricky</span></div>
+            <div class="sub">OPEN SEASON</div>
+        </div>
+
+        <div class="modes"><span class="on">OFFLINE</span><span>ONLINE<span class="soon">SOON</span></span></div>
+        <div class="play" id="play" data-class-off="!have_disc" data-event-click="play"><span>PLAY</span></div>
+        <div class="setb" id="settings-button" data-event-click="go('settings')">Settings</div>
+
+        <!-- With a good disc image: what's new in this version (built into the launcher), or in a newer one. -->
+        <div class="news" data-if="have_disc">
+            <img class="badge" src="ot:badge/$track$"/>
+            <div class="in">
+                <div class="k">WHAT'S NEW IN v{{notes_version}}</div>
+                <h3>{{notes_title}}</h3>
+                <div data-for="s : notes">
+                    <div class="sec">{{s.name}}</div>
+                    <ul><li data-for="i : s.items"><span class="bl"></span>{{i}}</li></ul>
+                </div>
+                <div class="lnk" id="notes-link" data-if="!upd_view" data-event-click="open('releases')">Full release notes &#x2192;</div>
+            </div>
+            <!-- A newer version's notes (the yellow pill was clicked): no installer yet, Update now opens its page. -->
+            <div class="acts" data-if="upd_view">
+                <div class="ubtn" id="upd-now" data-event-click="upd('now')">Update now</div>
+                <div class="ulnk" id="upd-later" data-event-click="upd('later')">Later</div>
+                <div class="ulnk" id="upd-skip" data-event-click="upd('skip')">Skip this version</div>
+            </div>
+        </div>
+
+        <!-- Without one (N1 / N2 / N3): the disc panel. -->
+        <div class="news discp" data-if="!have_disc" data-class-bad="disc_state == 'bad'">
+            <div class="k">{{disc_kicker}}</div>
+            <h3>{{disc_head}}</h3>
+            <p>{{disc_text}}</p>
+            <div class="path" data-if="disc_state == 'bad' &amp;&amp; disc_path != ''">{{disc_path}}</div>
+            <div class="drop" id="drop" data-event-click="choose_disc"><b>{{disc_drop1}}</b><span>{{disc_drop2}}</span></div>
+            <ul data-if="disc_state == 'warn'">
+                <li><span class="bl"></span>Xbox disc image (.iso or .xiso), USA release</li>
+                <li><span class="bl"></span>Your saves stay in Documents\My Games\SSX Tricky</li>
+            </ul>
+        </div>
+
+    </div>
+
+    <!-- Sidebar and footer hold the window's edges; the stage is centred. -->
+    <div class="side">
+        <img class="emblem" data-if="have_disc" src="ot:emblem/$track$"/>
+        <div class="otb" data-if="!have_disc"><img src="ot:otbadge"/><span>OT</span></div>
+        <div class="nav n1 on" id="nav-home"><div class="bar"></div><img src="ot:icon/home"/></div>
+        <div class="nav n2" id="nav-settings" data-event-click="go('settings')"><img src="ot:icon/settings"/></div>
+        <div class="nav n3 soon"><img src="ot:icon/online"/><span>SOON</span></div>
+        <div class="nav nbug" id="nav-bug" data-event-click="bug"><img src="ot:icon/bug"/></div>
+    </div>
+
+    <div class="foot">
+        <div class="fin" id="fin">
+            <div class="l rn" data-event-click="open('releases')">Release notes</div>
+            <div class="l gh" data-event-click="open('github')">GitHub</div>
+            <div class="l kf" id="kofi" data-event-click="open('kofi')">Buy me a coffee</div>
+            <div class="hints" data-if="pad_active">
+                <span class="hs" data-if="hint_style == 0"><span class="kb ka">A</span>Select<span class="kb kbk">B</span>Back<span class="kb kl kst">&#xA0;<span class="mb m1"></span><span class="mb m2"></span><span class="mb m3"></span></span>Play</span>
+                <span class="hs" data-if="hint_style == 1"><img class="pi pj" src="icons/jc/T_P4_Cross_Color_Retro.png"/>Select<img class="pi pj" src="icons/jc/T_P4_Circle_Color_Retro.png"/>Back<span class="kb kl kt">OPTIONS</span>Play</span>
+                <span class="hs" data-if="hint_style == 2"><img class="pi" src="icons/ps2/ps2_cross.png"/>Select<img class="pi" src="icons/ps2/ps2_circle.png"/>Back<img class="pi pw" src="icons/ps2/ps2_start.png"/>Play</span>
+            </div>
+        </div>
+    </div>
+</body>
+</rml>

@@ -1,0 +1,27 @@
+Button icon drawings: "FREE Input Prompts Pack" by JulioCacko
+("Default" style for the Xbox pad, "Retro" style for the PlayStation pad).
+
+  https://juliocacko.itch.io/free-input-prompts
+  (also https://juliocacko.gumroad.com/l/free-input-pack)
+
+License: Creative Commons Zero (CC0 1.0 Universal), as stated by the author:
+"can be used in any project, including commercial ones ... you do not need to
+give attribution". Credited here anyway, with thanks.
+
+Archive the files were taken from: Source.zip, 12999638 bytes,
+sha256 f6c75921b9d6ab2cb2b5249f547c7b7ba19e22da9f4f3b45693cf0912f25ded0.
+
+Files kept, unchanged:
+  T_X_*.png          Xbox Series pad, XGamepad/Default (A B X Y = T_X_*_Color,
+                     LB RB LT RT, View = T_X_Share, Menu = T_X_X,
+                     D-pad directions = T_X_Dpad_Left / Right / Up / Down)
+  T_P4_*_Retro.png   PlayStation pad, P4Gamepad/Retro (Cross Circle Square Triangle, L1 R1 L2 R2,
+                     D-pad directions = T_P4_Dpad_Left / Right / UP / Down)
+
+Drawn for this project in the PlayStation "Retro" style (also CC0):
+  ps_select_retro.png, ps_start_retro.png   PlayStation SELECT / START, which the
+  pack draws as small labelled pills that cannot be read at the game's 18 x 14
+  texel size.
+
+They are composed at run time into the game's own button atlases (the player's
+files); no picture of the game is stored here.

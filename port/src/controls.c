@@ -12,7 +12,8 @@
  * console-only buttons (LB = White, RB = Black, as xemu and Cxbx-Reloaded
  * place them); the keyboard keeps the part-178 keys (Enter = Start, Space = A,
  * Esc = B, C = X, V = Y, Tab = Back, arrows = D-pad and left stick) and adds
- * Q/E for the triggers and R/F for Black/White.
+ * Q/E for the triggers, R/F for Black/White and X for the left stick press
+ * (L3: cancels a jump in the PS2 layout, beside C = Square and V = Triangle).
  */
 #include <windows.h>
 #include <xinput.h>
@@ -21,17 +22,21 @@
 #include <stdlib.h>
 
 #include "controls.h"
+#include "settings.h"
 
 HWND d3d8_GetHostWindow(void);   /* xboxrecomp d3d8_device.c */
 
 /* ── Names ─────────────────────────────────────────────────────────── */
 
+/* .ini token (the console pad's button, kept for old files) and the name
+ * shown in the launcher: the PS2 button in that place, since the game uses
+ * the PS2 layout (ctlscheme.h). */
 static const struct { const char *ini; const WCHAR *label; } k_ctl[CTL_COUNT] = {
-    { "A", L"A" }, { "B", L"B" }, { "X", L"X" }, { "Y", L"Y" },
-    { "Black", L"Black" }, { "White", L"White" },
-    { "LeftTrigger", L"Left trigger" }, { "RightTrigger", L"Right trigger" },
-    { "Start", L"Start" }, { "Back", L"Back" },
-    { "LeftStickPress", L"Left stick press" }, { "RightStickPress", L"Right stick press" },
+    { "A", L"Cross" }, { "B", L"Circle" }, { "X", L"Square" }, { "Y", L"Triangle" },
+    { "Black", L"R1" }, { "White", L"L1" },
+    { "LeftTrigger", L"L2" }, { "RightTrigger", L"R2" },
+    { "Start", L"Start" }, { "Back", L"Select" },
+    { "LeftStickPress", L"L3  (left stick press)" }, { "RightStickPress", L"R3  (right stick press)" },
     { "DpadUp", L"D-pad up" }, { "DpadDown", L"D-pad down" },
     { "DpadLeft", L"D-pad left" }, { "DpadRight", L"D-pad right" },
     { "LeftStickUp", L"Left stick up" }, { "LeftStickDown", L"Left stick down" },
@@ -115,7 +120,7 @@ void controls_defaults(ControlMap *m)
     static const BYTE keys[CTL_COUNT] = {
         [CTL_A] = VK_SPACE, [CTL_B] = VK_ESCAPE, [CTL_X] = 'C', [CTL_Y] = 'V',
         [CTL_BLACK] = 'R', [CTL_WHITE] = 'F', [CTL_LT] = 'Q', [CTL_RT] = 'E',
-        [CTL_START] = VK_RETURN, [CTL_BACK] = VK_TAB,
+        [CTL_START] = VK_RETURN, [CTL_BACK] = VK_TAB, [CTL_L3] = 'X',
         [CTL_DUP] = VK_UP, [CTL_DDOWN] = VK_DOWN, [CTL_DLEFT] = VK_LEFT, [CTL_DRIGHT] = VK_RIGHT,
         [CTL_LS_UP] = VK_UP, [CTL_LS_DOWN] = VK_DOWN, [CTL_LS_LEFT] = VK_LEFT, [CTL_LS_RIGHT] = VK_RIGHT,
     };
@@ -129,41 +134,33 @@ void controls_defaults(ControlMap *m)
     memcpy(m->pad, pads, sizeof m->pad);
 }
 
-void controls_load(ControlMap *m, const char *ini)
+/* settings.h names one binding per control in the CTL_* order, and the
+ * controller inputs in the PAD_* order. */
+typedef char controls_settings_keys[(SETTINGS_KEY_CONTROLS == CTL_COUNT) ? 1 : -1];
+typedef char controls_settings_pads[(SETTINGS_PAD_CONTROLS == CTL_PAD_COUNT) ? 1 : -1];
+
+void controls_from_settings(ControlMap *m, const Settings *s)
 {
     int i, j;
-    char buf[64];
     controls_defaults(m);
-    if (!ini || GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) return;
-    for (i = 0; i < CTL_COUNT; i++) {
-        if (GetPrivateProfileStringA("Keyboard", k_ctl[i].ini, "\x01", buf, sizeof buf, ini) &&
-            buf[0] != '\x01')
-            m->key[i] = key_parse(buf);
-    }
+    for (i = 0; i < CTL_COUNT; i++)
+        m->key[i] = key_parse(settings_get(s, S_KEY_FIRST + i));
     for (i = 0; i < CTL_PAD_COUNT; i++) {
-        if (GetPrivateProfileStringA("Controller", k_ctl[i].ini, "\x01", buf, sizeof buf, ini) &&
-            buf[0] != '\x01') {
-            m->pad[i] = PAD_NONE;
-            for (j = 0; j < PAD_COUNT; j++)
-                if (!_stricmp(buf, k_pad[j].ini)) m->pad[i] = (BYTE)j;
-        }
+        j = settings_choice_index(s, S_PAD_FIRST + i);
+        m->pad[i] = (BYTE)(j > 0 && j < PAD_COUNT ? j : PAD_NONE);
     }
 }
 
-void controls_write(const ControlMap *m, FILE *f)
+void controls_to_settings(const ControlMap *m, Settings *s)
 {
     int i;
     char name[32];
-    fprintf(f, "\n[Keyboard]\n; One key per Xbox control: a letter or digit, F1-F24, Space, Enter,\n"
-               "; Escape, Tab, Up/Down/Left/Right, LeftShift, Num0-Num9 ... or None.\n");
     for (i = 0; i < CTL_COUNT; i++) {
         key_name(m->key[i], name, sizeof name);
-        fprintf(f, "%s=%s\n", k_ctl[i].ini, name[0] ? name : "None");
+        settings_set(s, S_KEY_FIRST + i, name[0] ? name : "None");
     }
-    fprintf(f, "\n[Controller]\n; The PC controller input for each Xbox control: A B X Y LB RB LT RT\n"
-               "; Start Back LS RS DpadUp DpadDown DpadLeft DpadRight, or None.\n");
     for (i = 0; i < CTL_PAD_COUNT; i++)
-        fprintf(f, "%s=%s\n", k_ctl[i].ini, k_pad[m->pad[i] < PAD_COUNT ? m->pad[i] : 0].ini);
+        settings_set(s, S_PAD_FIRST + i, k_pad[m->pad[i] < PAD_COUNT ? m->pad[i] : 0].ini);
 }
 
 /* ── The live mapping ──────────────────────────────────────────────── */

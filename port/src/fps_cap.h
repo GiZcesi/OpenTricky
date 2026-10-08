@@ -1,67 +1,73 @@
 /*
- * fps_cap -- cadence d'images host au-delà de 60 (fork).
+ * fps_cap -- host frame pacing above 60.
  *
- * Le jeu fait ses ticks logiques à 60 Hz (timer logiciel 0xB26B0) et, dans sa
- * boucle principale 0xAA1A0, « N ticks puis 1 rendu » : jamais de rendu sans
- * tick. Quand aucun tick n'est dû, il attend l'événement de frame
- * (XBoxExecutionMan_WaitForFrameEvent 0xB2750, appelé en 0xAA296).
+ * The game runs its logic ticks at 60 Hz (software timer 0xB26B0) and, in its
+ * main loop 0xAA1A0, "N ticks then 1 render": never a render without a tick.
+ * When no tick is due, it waits for the frame event
+ * (XBoxExecutionMan_WaitForFrameEvent 0xB2750, called at 0xAA296).
  *
- * Ce module remplace cette attente : tant qu'aucun tick n'est dû, il rappelle
- * le rendu de l'état courant (state->vt+0x18) au rythme du plafond host. Le
- * rendu sans tick reçoit dt = 0 (0xAB610 : [state+0x4C] = ticks depuis le
- * dernier rendu) et ne touche pas l'état logique (mesuré ici aussi).
+ * This module replaces that wait: while no tick is due, it calls the current
+ * state's render again (state->vt+0x18) at the pace of the host cap. A render
+ * without a tick gets dt = 0 (0xAB610: [state+0x4C] = ticks since the last
+ * render) and does not touch the logic state (measured).
  *
- * Interpolation (XBOX_FPS_INTERP=1 par défaut quand le cap != 60) :
- * chaque rendu d'InGameState (normal ou en plus) montre lerp(tick N-1, tick N,
- * alpha), alpha = temps depuis le début du tick N / 16,67 ms. Affichage
- * décalé d'un tick (+16,7 ms de latence) ; pas d'extrapolation.
- *   caméra : bloc de vue InGameState+0xB0 (+i×0x80, vues < [+0x298]) :
- *            position linéaire, rotation de la matrice de vue par slerp
- *            (déterminant -1 géré), projection +0x100/+0x104 linéaire ;
- *   riders : position +0x170 et pose +0x48B0 (21 matrices 4×4 en
- *            coordonnées MONDE) : translation linéaire, rotation slerp.
- *   Copie des états au tick (hook 0xAD4A0) ; avant un rendu, la mémoire doit
- *   être identique à la copie du tick N, sinon rien n'est écrit ; après le
- *   rendu, la copie du tick N est réécrite (au bit près). Riders entiers
- *   remis tels qu'avant après un rendu en plus. Téléportation (> 400 unités
- *   en un tick) ou coupe caméra (> 60°) : état N (doublon).
- *   Reste au tick : HUD, particules, foule, décor animé, dérivés de pose
- *   calculés par le rendu (+0x4DF0.., suivent la pose interpolée).
- *   XBOX_FPS_INTERP=0      doublons (sans interpolation)
- *   XBOX_FPS_INTERP_LOG=N[@t]  N rendus de course journalisés ([INTERP]) à partir du tick de course t
- *   XBOX_FPS_INTERP_SYNTH=1    (test, avec XBOX_FPS_CAP_DUP) alpha = k / (DUP + 1)
- *   XBOX_FPS_INTERP_DUMP=t     (enquête) vide caméra / rider 0 sur 4 ticks
- *   XBOX_FPS_CAP_CHECK=3       (test) rendu en plus refait sans interpolation :
- *                              mots écrits par le rendu qui dépendent de l'interpolation
- *   XBOX_FPS_CAP_STALL=s:ms    (test) une saccade simulée de ms dans un rendu normal à s secondes
+ * Interpolation (XBOX_FPS_INTERP=1 by default when the cap != 60): every
+ * InGameState render (normal or extra) shows lerp(tick N-1, tick N, alpha),
+ * alpha = time since tick N was produced by the game's 60 Hz timer / 16.67 ms
+ * (not since it was consumed: a tick consumed late, after a slow render or in
+ * a catch-up, would make the motion slow down, jump, then freeze). Display is
+ * one tick late (+16.7 ms latency); no extrapolation.
+ *   camera: view block InGameState+0xB0 (+i*0x80, views < [+0x298]):
+ *           linear position, view matrix rotation by slerp (determinant -1
+ *           handled), linear projection +0x100/+0x104;
+ *   riders: position +0x170 and pose +0x48B0 (21 4x4 matrices in WORLD
+ *           space): linear translation, slerp rotation.
+ *   State copied at the tick (hook 0xAD4A0); before a render, memory must
+ *   equal the copy of tick N, else nothing is written; after the render, the
+ *   copy of tick N is written back (bit exact). Whole riders restored as they
+ *   were after an extra render. Teleport (> 400 units in one tick) or camera
+ *   cut (> 60 deg): state N (duplicate).
+ *   Still at tick rate: HUD, particles, crowd, animated scenery, pose values
+ *   derived by the render (+0x4DF0.., they follow the interpolated pose).
+ *   XBOX_FPS_INTERP=0      duplicates (no interpolation)
+ *   XBOX_FPS_INTERP_LOG=N[@t]  N race renders logged ([INTERP]) from race tick t
+ *   XBOX_FPS_INTERP_SYNTH=1    (test, with XBOX_FPS_CAP_DUP) alpha = k / (DUP + 1)
+ *   XBOX_FPS_INTERP_DUMP=t     (investigation) dumps camera / rider 0 over 4 ticks
+ *   XBOX_FPS_CAP_CHECK=3       (test) extra render done again without interpolation:
+ *                              words written by the render that depend on the interpolation
+ *   XBOX_FPS_CAP_STALL=s:ms    (test) one simulated stall of ms in a normal render at s seconds
+ *   XBOX_FPS_INTERP_CLOCK=0    (comparison) old alpha clock: time the tick was consumed
+ *   XBOX_FPS_INTERP_JANK=n:ms  (test) a render slowed by ms every n race renders
+ *   XBOX_FPS_INTERP_TRACE=file (test) per render: time, tick, alpha, camera / rider 0 positions
  *
- * Cadence: la durée moyenne d'un rendu est mesurée
- * sur les rendus normaux (InGameState 0xAB610, menus 0x7CBD0) et en plus ;
- * les durées > 50 ms (chargements) sont ignorées. Avant, une seule saccade
- * figeait la moyenne et bloquait les images en plus jusqu'à la fin.
+ * Pacing: the average render duration is measured over normal renders
+ * (InGameState 0xAB610, menus 0x7CBD0) and extra ones; durations > 50 ms
+ * (loading) are ignored, so a single stall cannot freeze the average and
+ * stop the extra frames.
  *
- *   XBOX_FPS_CAP=60 (défaut) | 120 | 144 | 240 | N (60..1000) | 0 (sans limite)
- *       60 ou absent : hook non installé, comportement d'origine strict.
- *   XBOX_FPS_CAP_LOG=1     statistiques toutes les ~2 s ([FPSCAP])
- *   XBOX_FPS_CAP_NOSKIP=1  (test) rendre en plus même si le tick suivant en est retardé
- *   XBOX_FPS_CAP_CHECK=2   témoin : même attente sans rendu (attribue les écarts aux autres threads)
- *   XBOX_FPS_CAP_CHECK=1   instrument d'état : empreinte avant / après chaque
- *                          rendu en plus (RNG, course, riders entiers,
- *                          AudioSystem), diff de pages mémoire échantillonné
+ *   XBOX_FPS_CAP=60 (default) | 120 | 144 | 240 | N (60..1000) | 0 (no limit)
+ *       | monitor (refresh rate of the primary monitor, 60 if <= 61 Hz)
+ *       60 or unset: hook not installed, strict original behavior.
+ *   XBOX_FPS_CAP_LOG=1     statistics every ~2 s ([FPSCAP])
+ *   XBOX_FPS_CAP_NOSKIP=1  (test) extra render even if the next tick is delayed by it
+ *   XBOX_FPS_CAP_CHECK=2   control: same wait without a render (assigns differences to other threads)
+ *   XBOX_FPS_CAP_CHECK=1   state probe: fingerprint before / after each extra
+ *                          render (RNG, race, whole riders, AudioSystem),
+ *                          sampled diff of memory pages
  *
- * Fidélité : états RNG A/B sauvegardés et restaurés autour de chaque rendu en
- * plus (le rendu tire le RNG A pendant le survol d'intro) ; liste blanche des
- * rendus (course 0xAB610, menus 0x7CBD0) ; pas pendant le saut [état+0x6C].
+ * Fidelity: RNG A/B states saved and restored around each extra render (the
+ * render draws from RNG A during the intro fly-over); allow list of renders
+ * (race 0xAB610, menus 0x7CBD0); none during the frame skip [state+0x6C].
  *
- * Règles :
- *   - un tick dû passe toujours avant (attente de l'événement avec délai,
- *     sondage à 0 juste avant chaque rendu) ;
- *   - pas de rendu en plus qui finirait après le tick suivant attendu
- *     (estimation : durée moyenne d'un rendu) : les ticks ne sont pas retardés ;
- *   - jamais plus d'un rendu en retard (pas de rattrapage côté rendu) ;
- *   - seulement sur l'appel de 0xAA296 (edi = 0, esi = Application,
- *     ecx = [esi+0x2C]) ; l'attente de démarrage 0xAA1D0 (edi = 3) garde
- *     l'original.
+ * Rules:
+ *   - a due tick always goes first (wait on the event with a timeout, poll
+ *     at 0 right before each render);
+ *   - no extra render that would end after the next expected tick (estimate:
+ *     average render duration): ticks are not delayed;
+ *   - never more than one render late (no catch-up on the render side);
+ *   - only on the call at 0xAA296 (edi = 0, esi = Application,
+ *     ecx = [esi+0x2C]); the boot wait 0xAA1D0 (edi = 3) keeps the
+ *     original.
  */
 #ifndef FPS_CAP_H
 #define FPS_CAP_H

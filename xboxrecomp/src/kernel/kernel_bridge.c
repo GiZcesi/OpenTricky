@@ -76,9 +76,60 @@ static uint32_t g_dispatcher_handle_keys[XBOX_DISPATCHER_HANDLE_MAP_SIZE];
 static HANDLE   g_dispatcher_handle_values[XBOX_DISPATCHER_HANDLE_MAP_SIZE];
 static int      g_dispatcher_handle_count = 0;
 
-static HANDLE xbox_resolve_dispatcher_handle(uint32_t obj_va)
+/* XBOX_FIX_DISPATCHMAP (default 1; =0 restores the unlocked map).
+ * The map used to be read and extended with no lock. Two threads touching
+ * the same VA for the first time at once (the title's timer thread entering
+ * its first wait on its control event while the main thread signals that
+ * event to register the frame timer) each created their own Win32 event and
+ * appended it: the waiter and the signaller then used different events, the
+ * wake-up was lost, and the boot froze before the EA logo with the frame
+ * timer never armed. With the fix, lookup and insertion happen under one
+ * lock, so a VA always maps to exactly one event. The same lock covers the
+ * handle-token table below, which had the same check-then-insert race. */
+static SRWLOCK g_dispatch_lock = SRWLOCK_INIT;
+static volatile LONG g_dispatch_fix = -1;
+
+static int dispatch_fix_on(void)
+{
+    if (g_dispatch_fix < 0) {
+        const char *e = getenv("XBOX_FIX_DISPATCHMAP");
+        LONG v = (e && e[0] == '0') ? 0 : 1;
+        if (InterlockedCompareExchange(&g_dispatch_fix, v, -1) == -1)
+            fprintf(stderr, "[DISPATCHMAP] XBOX_FIX_DISPATCHMAP=%ld\n", (long)v);
+    }
+    return (int)g_dispatch_fix;
+}
+
+static HANDLE resolve_dispatcher_unlocked(uint32_t obj_va)
 {
     int i;
+    for (i = 0; i < g_dispatcher_handle_count; i++) {
+        if (g_dispatcher_handle_keys[i] == obj_va) return g_dispatcher_handle_values[i];
+    }
+    {
+        HANDLE h = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (g_dispatcher_handle_count < XBOX_DISPATCHER_HANDLE_MAP_SIZE) {
+            g_dispatcher_handle_keys[g_dispatcher_handle_count] = obj_va;
+            g_dispatcher_handle_values[g_dispatcher_handle_count] = h;
+            g_dispatcher_handle_count++;
+        } else {
+            /* Past the map size every call makes a new unregistered event,
+             * so a wait and a signal on such a VA never meet. */
+            static LONG warned = 0;
+            if (InterlockedExchange(&warned, 1) == 0) {
+                fprintf(stderr, "  [DISPATCHMAP] more than %d dispatcher objects: VA 0x%08X "
+                        "and later ones get an unshared event (waits on them can hang)\n",
+                        XBOX_DISPATCHER_HANDLE_MAP_SIZE, obj_va);
+                fflush(stderr);
+            }
+        }
+        return h;
+    }
+}
+
+static HANDLE xbox_resolve_dispatcher_handle(uint32_t obj_va)
+{
+    HANDLE h;
     if (!obj_va) return NULL;
 
     /* A real Win32 HANDLE (e.g. from a prior NtCreateEvent, read back and
@@ -92,18 +143,11 @@ static HANDLE xbox_resolve_dispatcher_handle(uint32_t obj_va)
      * its 0x80000000 alias or its plain address. */
     obj_va = xbox_fold_ram_alias(obj_va);
 
-    for (i = 0; i < g_dispatcher_handle_count; i++) {
-        if (g_dispatcher_handle_keys[i] == obj_va) return g_dispatcher_handle_values[i];
-    }
-    {
-        HANDLE h = CreateEventW(NULL, FALSE, FALSE, NULL);
-        if (g_dispatcher_handle_count < XBOX_DISPATCHER_HANDLE_MAP_SIZE) {
-            g_dispatcher_handle_keys[g_dispatcher_handle_count] = obj_va;
-            g_dispatcher_handle_values[g_dispatcher_handle_count] = h;
-            g_dispatcher_handle_count++;
-        }
-        return h;
-    }
+    if (!dispatch_fix_on()) return resolve_dispatcher_unlocked(obj_va);
+    AcquireSRWLockExclusive(&g_dispatch_lock);
+    h = resolve_dispatcher_unlocked(obj_va);
+    ReleaseSRWLockExclusive(&g_dispatch_lock);
+    return h;
 }
 
 /*
@@ -644,8 +688,25 @@ static void bridge_NtClose(void)
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
-        if (h && h != INVALID_HANDLE_VALUE)
+        if (h && h != INVALID_HANDLE_VALUE) {
+            /* Drop the directory scan bound to this handle before Windows
+             * hands the value out again. xbox_NtClose does this, but the
+             * translated code closes through here, so a scan the title stopped
+             * early (XFindFirstSaveGame + XFindClose on a match) stayed bound
+             * to the value. The next "U:\" open that got the same value then
+             * continued that old scan past the save folder, the save was not
+             * found, its folder-name buffer was never filled (0xDEADC0DE fill),
+             * and an overwrite -- which deletes the old files first -- failed
+             * with "Save Failed." and lost the save. XBOX_FIX_DIRCTX=0 restores
+             * the old behaviour. */
+            static int fix_dirctx = -1;
+            if (fix_dirctx < 0) {
+                const char *e = getenv("XBOX_FIX_DIRCTX");
+                fix_dirctx = !(e && e[0] == '0');
+            }
+            if (fix_dirctx) xbox_dir_context_release(h);
             CloseHandle(h);
+        }
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
@@ -1437,9 +1498,17 @@ static void bridge_HalRegisterShutdownNotification(void)
  * A no-op keeps the process running instead of trying to emulate an
  * actual Xbox reboot; only the missing 4-byte stdcall cleanup was a
  * real bug (same audit as above).
+ *
+ * The host may still act on it: g_hal_return_hook (set by the host, NULL by
+ * default) sees each call's Routine first. The title also gets here on its
+ * own (XAPI's start-up checks launch the dashboard and expect never to come
+ * back), so the hook must tell the player's request from those.
  */
+void (*g_hal_return_hook)(uint32_t routine) = NULL;
+
 static void bridge_HalReturnToFirmware(void)
 {
+    if (g_hal_return_hook) g_hal_return_hook(STACK_ARG(0));
     g_eax = 0;
 }
 
@@ -2061,10 +2130,9 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
  */
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
 
-static uint32_t bridge_handle_token(HANDLE h)
+static uint32_t bridge_handle_token_unlocked(HANDLE h)
 {
     int i;
-    if (!h || h == INVALID_HANDLE_VALUE) return 0;
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
         if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
@@ -2074,6 +2142,20 @@ static uint32_t bridge_handle_token(HANDLE h)
         }
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
+}
+
+/* Two threads storing a handle at once could both pick the same free slot
+ * (one token then names the other thread's handle): under
+ * XBOX_FIX_DISPATCHMAP the search and the store are done under the lock. */
+static uint32_t bridge_handle_token(HANDLE h)
+{
+    uint32_t tok;
+    if (!h || h == INVALID_HANDLE_VALUE) return 0;
+    if (!dispatch_fix_on()) return bridge_handle_token_unlocked(h);
+    AcquireSRWLockExclusive(&g_dispatch_lock);
+    tok = bridge_handle_token_unlocked(h);
+    ReleaseSRWLockExclusive(&g_dispatch_lock);
+    return tok;
 }
 
 /* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */
@@ -2128,8 +2210,12 @@ static HANDLE bridge_take_handle(uint32_t token)
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = s_handle_table[i];
+            HANDLE h;
+            int fix = dispatch_fix_on();
+            if (fix) AcquireSRWLockExclusive(&g_dispatch_lock);
+            h = s_handle_table[i];
             s_handle_table[i] = NULL;
+            if (fix) ReleaseSRWLockExclusive(&g_dispatch_lock);
             return h;
         }
     }
@@ -2199,6 +2285,13 @@ static NTSTATUS bridge_create_file_impl(
     fflush(stderr);
 
     if (NT_SUCCESS(st)) {
+        if (xbox_dir_context_bound(h)) {
+            /* Should never happen now that NtClose drops the scan; reported
+             * because it silently breaks directory listings (save lookup). */
+            fprintf(stderr, "  [DIRCTX] %s: handle %p inherits a live directory scan\n",
+                    name.Buffer, h);
+            fflush(stderr);
+        }
         file_ledger_open(h, name.Buffer);
         bridge_write_handle(handle_va, h);
         if (handle_va) hpath_set(BRIDGE_MEM32(handle_va), name.Buffer);
@@ -3920,7 +4013,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 302: return bridge_RtlRaiseException;
 
 
-    /* Ordinals the XBE imports that had no bridge until part thirty-six.
+    /* Ordinals the XBE imports that had no bridge at first.
      * 233 (NtWaitForSingleObject) and 205 (NtPulseEvent) are the two that
      * were actively breaking synchronisation; the rest returned 0. */
     case   4: return bridge_AvSetSavedDataAddress;
@@ -4303,7 +4396,7 @@ static void kernel_thunk_dispatch(void)
      * A native stack overflow leaves no usable backtrace -- by the time the
      * VEH handler runs the stack is gone and only a frame or two survive in
      * module range. Catching the runaway *early* is what identified the CRT
-     * lock recursion in part forty-two: every kernel call passes through here,
+     * lock recursion: every kernel call passes through here,
      * so watching the guest esp costs one compare, fires long before the guard
      * page, and still has a complete native stack to capture.
      *
@@ -4335,7 +4428,7 @@ static void kernel_thunk_dispatch(void)
     }
 
     /* A guest esp outside RAM on ANY thread. The check above only covers the
-     * main thread's stack; part 177 found a thread running with esp at the
+     * main thread's stack; a thread was once found running with esp at the
      * top of the APU aperture (0xFE87FFFC), so every push became an APU
      * register write and the emulator was fed stack data as FE methods.
      * Every thread passes through here often (the timer thread waits every
@@ -4400,7 +4493,7 @@ static void kernel_thunk_dispatch(void)
     g_esp += 4;
 
     if (bridge) {
-        if (g_perf_on) {                /* temps noyau du thread du jeu */
+        if (g_perf_on) {                /* kernel time of the game thread */
             double t0 = perf_now();
             bridge();
             perf_kernel(ordinal, perf_now() - t0);

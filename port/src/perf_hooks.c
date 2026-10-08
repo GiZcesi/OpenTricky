@@ -1,12 +1,12 @@
 /*
- * perf_hooks -- zones du thread du jeu pour XBOX_PERF.
- * Voir xboxrecomp/src/kernel/xbox_perf.h.
+ * perf_hooks -- game thread zones for XBOX_PERF.
+ * See xboxrecomp/src/kernel/xbox_perf.h.
  *
- * Boucle principale 0xAA1A0: N ticks (InGameState vt+0x14 = 0xAD4A0),
- * un rendu (vt+0x18 = 0xAB610), puis l'attente de l'événement de frame
- * (0xB2750). Chaque hook mesure l'appel et enchaîne sur le hook suivant de
- * recomp_lookup_manual (ticktrace, puis fps_cap) ou sur la fonction
- * d'origine. Sans XBOX_PERF=1, aucun hook n'est distribué.
+ * Main loop 0xAA1A0: N ticks (InGameState vt+0x14 = 0xAD4A0), one render
+ * (vt+0x18 = 0xAB610), then the wait on the frame event (0xB2750). Each hook
+ * times the call and chains to the next hook of recomp_lookup_manual
+ * (ticktrace, then fps_cap) or to the original function. Without
+ * XBOX_PERF=1, no hook is handed out.
  */
 #include <stdint.h>
 #include "recomp/recomp_types.h"

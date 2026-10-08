@@ -229,7 +229,7 @@ ptrdiff_t xbox_GetMemoryOffset(void);
  *     edx += 4; [edx-4] = edx ; publish the TLS array
  * so every thread needs its own KTHREAD *and* its own TlsData block, not just
  * its own KPCR. Sharing either one is what sent _threadstartex into a ~4 GB
- * memcpy in part forty-three.
+ * memcpy.
  */
 #define XBOX_TIB_POOL_VA    0x04110000
 #define XBOX_TIB_SIZE       0x800     /* KPCR + KTHREAD + TlsData per thread */
@@ -434,6 +434,8 @@ void xbox_HeapGetStats(uint32_t* out_used, uint32_t* out_total);
 HANDLE xbox_GetMappingHandle(void);
 size_t xbox_GetMemorySize(void);
 int xbox_GetMirrorCount(void);
+int xbox_GetMirrorSlotCount(void);
+BOOL xbox_IsMirrorAddress(const void *p);
 
 /**
  * Verify that the whole guest view is still exclusively ours.

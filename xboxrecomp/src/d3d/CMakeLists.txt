@@ -8,6 +8,7 @@ if(WIN32)
         d3d8_post.c
         d3d8_softshadow.c
         d3d8_gpuprof.c
+        d3d8_sync.c
         d3d8_resources.c
         d3d8_shaders.c
         d3d8_states.c

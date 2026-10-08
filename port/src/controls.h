@@ -4,8 +4,8 @@
  * Every Xbox control can be bound to one keyboard key and (for buttons,
  * triggers and the D-pad) one button of an XInput controller. The sticks are
  * passed straight through on a controller; on the keyboard each stick
- * direction is a key. Bindings are stored in the settings .ini
- * ([Keyboard] and [Controller]) and take effect immediately.
+ * direction is a key. Bindings are stored in settings.ini ([Keyboard] and
+ * [Controller], settings.h) and take effect immediately.
  */
 #ifndef SSX_CONTROLS_H
 #define SSX_CONTROLS_H
@@ -42,9 +42,12 @@ typedef struct ControlsPad {
     SHORT lx, ly, rx, ry;
 } ControlsPad;
 
+struct Settings;
 void controls_defaults(ControlMap *m);
-void controls_load(ControlMap *m, const char *ini);          /* defaults for anything missing */
-void controls_write(const ControlMap *m, FILE *f);            /* the two .ini sections */
+/* The bindings of settings.ini ([Keyboard] and [Controller], settings.h),
+ * one per control in the order above; a key name not known is None. */
+void controls_from_settings(ControlMap *m, const struct Settings *s);
+void controls_to_settings(const ControlMap *m, struct Settings *s);
 
 /* The live mapping the game reads (set once at start, and by the dialog). */
 void controls_set_current(const ControlMap *m);
@@ -60,8 +63,9 @@ void controls_set_suspended(BOOL on);
 BOOL controls_suspended(void);
 
 /* For the launcher's Controls page (it replaced the Controls
- * window). Readable names, as the old window showed them. */
-const WCHAR *controls_label(int ctl);                  /* "A", "Left trigger", ... */
+ * window). Readable names: a control is named after the PS2 button in its
+ * place (the game uses the PS2 layout, ctlscheme.h). */
+const WCHAR *controls_label(int ctl);                  /* "Cross", "L2", "Select", ... */
 const WCHAR *controls_pad_label(int pad);              /* "Left bumper", ...; "" for PAD_NONE */
 void controls_key_label(BYTE vk, WCHAR *out, int n);   /* "Space", "Q", ...; "" for none */
 /* The key a WM_KEYDOWN / WM_SYSKEYDOWN names (left / right Shift and Ctrl

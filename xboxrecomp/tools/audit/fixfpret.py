@@ -34,7 +34,7 @@ left it in ST(0).
     fixfpret.py --dry-run
     fixfpret.py
 
-Part 180 tried removing all 620 insertions on the theory that the shared x87
+An earlier attempt removed all 620 insertions on the theory that the shared x87
 stack already holds the callee's ST(0). It does not for every
 callee: the frontend UI vanished and x87 top drifted by -2 M. They were
 restored. The open question is which callees leave no value on the shared

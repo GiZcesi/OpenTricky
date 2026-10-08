@@ -13,6 +13,15 @@
  * Far multiplies the three by 1.5 and Max by 2, at every level, after the
  * title has set them.
  *
+ * Fog volumes (the FogMan / FogVolume cloud puffs, render group 8) are taken
+ * from the visible cells too, but FogMan_RenderFogVolumes (0xDFA00) drops any
+ * volume whose centre is 20000 units or more from the camera ([0x19CFCC]; the
+ * fade it computes from 12500, [0x19CFD0], is not used by the draw), so with
+ * the farther scenery they popped in mid-view. In Far / Max both distances
+ * follow the radius actually applied (x1.5 / x2, less where the cell cap
+ * bites), during a race only; the title's values come back outside it.
+ * Particle emitters have no distance of their own: they follow the cells.
+ *
  * The one hard limit: TerrainNode_BuildVisibleCellList (0x1420B0) writes the
  * visible cells into a 162-entry list (0x1FAF88+0x3C) with no bound -- the
  * 162nd entry overwrites the count. At each level the radius is capped so
@@ -25,7 +34,12 @@
  *                        pass through), 1 / far, 2 / max.  The launcher sets
  *                        it from [Fork] DrawDistance.
  *   XBOX_DRAW_DISTANCE_LOG=1  also count in Original (cells, terrain patch
- *                        cache) -- the [DRAWDIST] lines on stderr.
+ *                        cache, cloud record pool, view command list, and the
+ *                        distance at which fog volumes and emitters start
+ *                        being drawn) -- the [DRAWDIST] lines on stderr.
+ *                        =2 also prints each such appearance.
+ *   XBOX_DRAW_DISTANCE_FX=0  Far / Max leave the fog volume distance alone
+ *                        (the behaviour before it followed the radius).
  *
  * The terrain patch cache (BoardMesh_DrawAttachedPatches 0xF8F10, LRU of
  * [0x1BD158] slots, one re-tessellation 0xF8BA0 per miss) is watched: a slot

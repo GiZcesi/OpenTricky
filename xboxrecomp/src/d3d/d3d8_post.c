@@ -47,7 +47,7 @@ static void config_read(void)
         const char *e = getenv("XBOX_POST_SPLIT");
         const char *c = getenv("XBOX_POST_CYCLE");
         s_cycle = (c && atoi(c) > 0) ? atoi(c) : 0;
-        /* Human decision 2026-10-03: SMAA implies the split (HUD kept sharp);
+        /* SMAA implies the split (HUD kept sharp);
          * an explicit XBOX_POST_SPLIT=0 turns it off. */
         InterlockedCompareExchange(&s_split, (e && e[0]) ? (e[0] == '1') : (s_smaa > 0), -1);
     }
@@ -930,7 +930,7 @@ int d3d8_post_run(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     if (!base_init(dev) || !targets_ensure(dev, w, h)) return 0;
     if (smaa > 0 && !smaa_init(dev, smaa)) smaa = 0;
     stencil = smaa > 0 && fix_flag(&s_fix_stencil, "XBOX_FIX_POST_STENCIL") && stencil_ensure(dev, w, h);
-    gpuprof_note(stencil ? 1u : 0u);    /* XBOX_GPUPROF : A/B par image (XBOX_FIX_PUMP_ALT=1) */
+    gpuprof_note(stencil ? 1u : 0u);    /* XBOX_GPUPROF: A/B per frame (XBOX_FIX_PUMP_ALT=1) */
 
     tq = timing_begin(dev, ctx);
     state_save(ctx, &saved);

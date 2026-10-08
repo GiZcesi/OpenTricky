@@ -1,31 +1,31 @@
 /*
- * d3d8_statecache.c -- miroir des liaisons d'état du contexte D3D11.
- * Voir d3d8_statecache.h.
+ * d3d8_statecache.c -- mirror of the D3D11 context's state bindings.
+ * See d3d8_statecache.h.
  */
 #include "d3d8_internal.h"
 #include "../kernel/xbox_perf.h"
 #include <string.h>
 #include <stdlib.h>
 
-/* Appels réels, par la vtable (les macros sont redéfinies). */
+/* Real calls, through the vtable (the macros are redefined). */
 #define VT(c) ((c)->lpVtbl)
 
-static ID3D11DeviceContext *s_ctx;       /* le contexte immédiat, vu au premier appel */
+static ID3D11DeviceContext *s_ctx;       /* the immediate context, seen on the first call */
 
 static struct {
-    int valid;                          /* 0 = rien de connu (début, ClearState) */
+    int valid;                          /* 0 = nothing known (start, ClearState) */
     ID3D11BlendState *bs; FLOAT bf[4]; UINT mask; int bs_ok;
     ID3D11DepthStencilState *ds; UINT ref; int ds_ok;
     ID3D11RasterizerState *rs; int rs_ok;
-    D3D11_RECT sc; int sc_ok;           /* un seul rectangle suivi */
+    D3D11_RECT sc; int sc_ok;           /* a single rectangle tracked */
     ID3D11InputLayout *il; int il_ok;
     D3D11_PRIMITIVE_TOPOLOGY topo; int topo_ok;
-    ID3D11Buffer *vb[16]; UINT vst[16], voff[16]; unsigned vb_ok;     /* bit par slot */
+    ID3D11Buffer *vb[16]; UINT vst[16], voff[16]; unsigned vb_ok;     /* one bit per slot */
     ID3D11Buffer *ib; DXGI_FORMAT ibf; UINT iboff; int ib_ok;
     ID3D11VertexShader *vs; int vs_ok;
     ID3D11PixelShader *ps; int ps_ok;
     ID3D11SamplerState *smp[16]; unsigned smp_ok;
-    ID3D11Buffer *vcb[4]; UINT vfirst[4], vnum[4]; unsigned vcb_ok;   /* num 0 = lié sans décalage */
+    ID3D11Buffer *vcb[4]; UINT vfirst[4], vnum[4]; unsigned vcb_ok;   /* num 0 = bound without offset */
     ID3D11Buffer *pcb[4]; UINT pfirst[4], pnum[4]; unsigned pcb_ok;
 } S;
 
@@ -37,8 +37,8 @@ static int mine(ID3D11DeviceContext *c)
     return c == s_ctx;
 }
 
-/* Filtrer : seulement quand la bascule est active ; le miroir, lui, est
- * toujours tenu à jour. */
+/* Filter: only when the switch is on; the mirror itself is always kept up
+ * to date. */
 static int skip_ok(void) { return d3d8_pump_state_on(); }
 
 static void count(int skipped)
@@ -180,7 +180,7 @@ void sc_PSSetSamplers(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11SamplerS
     VT(c)->PSSetSamplers(c, start, n, s);
 }
 
-/* Constantes : num = 0 note une liaison sans décalage (l'appel classique). */
+/* Constants: num = 0 records a binding without offset (the classic call). */
 static int cb_same(ID3D11Buffer **sb, UINT *sf, UINT *sn, unsigned ok, UINT start, UINT n,
                    ID3D11Buffer *const *b, const UINT *first, const UINT *num)
 {
@@ -206,7 +206,7 @@ static void cb_note(ID3D11Buffer **sb, UINT *sf, UINT *sn, unsigned *ok, UINT st
         } else
             *ok &= ~(1u << (start + i));
     }
-    if (start + n > 4) *ok = 0;         /* au-delà de ce qu'on suit : on oublie tout */
+    if (start + n > 4) *ok = 0;         /* beyond what is tracked: forget everything */
 }
 
 void sc_VSSetConstantBuffers(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11Buffer *const *b)

@@ -90,6 +90,7 @@ static const char g_prelude[] =
     "    float4 flags;       /* specular enable, alpha from specular */\n"
     "    float4 vattr[16];   /* attributes with no array */\n"
     "    float4 ptparm;       /* size from oPts, fixed size, smooth */\n"
+    "    float4 hud;          /* HUD element: x scale, x anchor, y scale, y anchor; x scale < 0: a panel's ends, z w = its edges */\n"
     "};\n"
     "struct VSOut {\n"
     "    float4 pos : SV_POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n"
@@ -246,6 +247,8 @@ int nv2a_vsh_hlsl(const vshcpu_insn *p, int n, uint16_t inputs, const uint8_t ki
     sb(&b,
        "    VSOut o;\n"
        "    float x = trunc(O0.x * 16.0) / 16.0, y = trunc(O0.y * 16.0) / 16.0;\n"
+       "    if (hud.x > 0) { x = hud.y + (x - hud.y) * hud.x; y = hud.w + (y - hud.w) * hud.z; }\n"
+       "    else if (hud.x < 0) x = x <= hud.z ? 0 : x >= hud.w ? screen.x : hud.y - (x - hud.y) * hud.x;\n"
        "    float z = screen.z > 0 ? O0.z / screen.z : O0.z;\n"
        "    float w = O0.w;\n"
        "    if (w >= 0) w = clamp(w, 5.421011e-20, 1.8446744e19); else w = clamp(w, -1.8446744e19, -5.421011e-20);\n"

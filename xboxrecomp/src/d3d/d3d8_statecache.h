@@ -1,17 +1,18 @@
 /*
- * d3d8_statecache.h -- miroir des liaisons d'état du contexte D3D11.
+ * d3d8_statecache.h -- mirror of the D3D11 context's state bindings.
  *
- * Inclus par d3d8_internal.h après <d3d11.h> : les macros COBJMACROS des appels
- * d'état ci-dessous sont redéfinies pour passer par d3d8_statecache.c, qui
- * garde un miroir de ce qui est lié et, avec XBOX_FIX_PUMP_STATE=1, saute un
- * appel qui relierait exactement la même chose. Tous les fichiers d3d8_*.c
- * passent ainsi par le miroir : il reste exact sans invalidation à la main.
+ * Included by d3d8_internal.h after <d3d11.h>: the COBJMACROS macros of the
+ * state calls below are redefined to go through d3d8_statecache.c, which
+ * keeps a mirror of what is bound and, with XBOX_FIX_PUMP_STATE=1, skips a
+ * call that would bind exactly the same thing again. Every d3d8_*.c file
+ * goes through the mirror this way: it stays exact without hand-written
+ * invalidation.
  *
- * Jamais filtrés (passent tels quels) : textures (SRV) et cibles de rendu, que
- * le runtime délie de lui-même en cas de conflit lecture / écriture.
- * ClearState vide le miroir. Un objet lié est retenu par le contexte : son
- * adresse ne peut pas être réutilisée tant qu'il est lié, la comparaison de
- * pointeurs est donc sûre. Autre contexte que l'immédiat : passe sans miroir.
+ * Never filtered (passed as is): textures (SRV) and render targets, which
+ * the runtime unbinds by itself on a read / write conflict.
+ * ClearState empties the mirror. A bound object is held by the context: its
+ * address cannot be reused while it is bound, so comparing pointers is safe.
+ * A context other than the immediate one: passes without the mirror.
  */
 #ifndef D3D8_STATECACHE_H
 #define D3D8_STATECACHE_H

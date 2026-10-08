@@ -55,7 +55,7 @@ static void publish_irql(KIRQL level)
  * An IRQL above HIGH_LEVEL (31) cannot exist. Seeing one means the fastcall
  * argument in cl was never set by the translated caller and carries stack
  * debris -- which then sits in KPCR.Irql until something bugchecks on it
- * (IRQL_NOT_LESS_OR_EQUAL, part 177: 192 on the main thread). Report the host
+ * (IRQL_NOT_LESS_OR_EQUAL; 192 was seen on the main thread). Report the host
  * frames, which addr2line resolves to the generated caller, once per level.
  */
 static void irql_report_impossible(const char *what, KIRQL level, KIRQL prev)

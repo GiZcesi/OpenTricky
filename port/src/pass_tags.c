@@ -1,12 +1,12 @@
 /*
- * pass_tags -- étiquettes de passes de rendu (fork).
- * Voir pass_tags.h pour les modes, le format du tag et les conventions.
+ * pass_tags -- render pass tags.
+ * See pass_tags.h for the modes, the tag format and the conventions.
  *
- * Organisation :
- *   - noyau : état de la frame (thread du jeu seulement), dédoublonnage,
- *     distribution des événements aux sinks ;
- *   - hooks H1/H2/H3 ;
- *   - sink JOURNAL (bloc texte par frame, échantillonnage, plafond de taille).
+ * Layout:
+ *   - core: frame state (game thread only), de-duplication, dispatch of the
+ *     events to the sinks;
+ *   - hooks H1/H2/H3;
+ *   - LOG sink (text block per frame, sampling, size cap).
  */
 #ifdef _WIN32
 #include <windows.h>
@@ -17,10 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Même inclusion que recomp_manual.c : g_esp, MEM32, MEMF, sans les alias de
- * registres du code généré. */
+/* Same include as recomp_manual.c: g_esp, MEM32, MEMF, without the register
+ * aliases of the generated code. */
 #include "recomp/recomp_types.h"
 #include "pass_tags.h"
+#include "hud_anchor.h"
 
 extern void sub_00105CE0(void);     /* SceneRenderer_RenderFrame */
 extern void sub_000FAAE0(void);     /* GfxContext_ApplyStateBlock */
@@ -34,27 +35,27 @@ int g_pass_tags_mode = PASS_TAGS_OFF;
 static const pass_tags_sink *s_sinks[PT_MAX_SINKS];
 static int s_nsinks;
 
-/* Thread propriétaire : celui du dernier H1 (RenderFrame). Le jeu rend
- * depuis deux threads successifs (le premier pendant le démarrage, puis la
- * boucle principale ; l'ordre d'arrivée varie d'un run à l'autre) : la
- * propriété passe au thread qui entre dans H1 quand le propriétaire n'est pas
- * au milieu d'une frame. Les appels d'un thread non propriétaire passent tout
- * droit vers l'original et sont seulement comptés.
- * Tout l'état ci-dessous est protégé par s_lock, jamais tenu pendant l'appel
- * de l'original (pas d'attente croisée entre threads du jeu). */
+/* Owner thread: the one of the last H1 (RenderFrame). The game renders from
+ * two successive threads (the first during boot, then the main loop; the
+ * arrival order varies between runs): ownership moves to the thread that
+ * enters H1 when the owner is not in the middle of a frame. Calls from a
+ * non-owner thread go straight to the original and are only counted.
+ * All the state below is guarded by s_lock, never held while the original
+ * runs (no cross wait between game threads). */
 static CRITICAL_SECTION s_lock;
 static DWORD s_owner_tid;
 static unsigned s_owner_switches;
 
 static struct {
-    uint32_t frame;             /* n° de frame courant (0 = avant le 1er H1) */
-    uint32_t event;             /* rang de l'événement dans la frame */
+    uint32_t frame;             /* current frame number (0 = before the 1st H1) */
+    uint32_t event;             /* index of the event in the frame */
     int      in_frame;
     /* triplet H2 courant */
     int      grp_open;
     uint32_t grp_key;
     uint32_t grp_nrec;
     uint32_t frame_nrec;
+    uint32_t hud_tag, hud_tag_y;  /* last HUD tags emitted in the group */
     /* derniers arguments H3 */
     int      ortho_valid;
     uint32_t ortho_key[7];
@@ -62,11 +63,11 @@ static struct {
 
 static struct {
     unsigned long long h1, h2, h2_kept, h3, events;
-    unsigned long long foreign[3];      /* appels non propriétaires par hook */
-    DWORD foreign_tid[3];               /* dernier thread non propriétaire */
+    unsigned long long foreign[3];      /* non-owner calls per hook */
+    DWORD foreign_tid[3];               /* last non-owner thread */
 } s_cnt;
 
-static volatile LONG s_esp_bad;         /* atomique : vérifié hors verrou */
+static volatile LONG s_esp_bad;         /* atomic: checked outside the lock */
 
 int pass_tags_add_sink(const pass_tags_sink *s)
 {
@@ -75,16 +76,16 @@ int pass_tags_add_sink(const pass_tags_sink *s)
     return 1;
 }
 
-/* Prend le verrou et renvoie 1 si l'appelant est le propriétaire (verrou
- * gardé, à relâcher par pt_leave) ; sinon compte l'appel et renvoie 0
- * (verrou relâché). hook : 0 = H1, 1 = H2, 2 = H3. */
+/* Takes the lock and returns 1 if the caller is the owner (lock kept, to be
+ * released by pt_leave); otherwise counts the call and returns 0 (lock
+ * released). hook: 0 = H1, 1 = H2, 2 = H3. */
 static int pt_enter(int hook)
 {
     DWORD me = GetCurrentThreadId();
     EnterCriticalSection(&s_lock);
     if (hook == 0 && me != s_owner_tid && !s_st.in_frame) {
         if (s_owner_switches++ < 16)
-            fprintf(stderr, "[PASS-TAGS] thread du rendu : %lu -> %lu (frame %u)\n",
+            fprintf(stderr, "[PASS-TAGS] render thread: %lu -> %lu (frame %u)\n",
                     (unsigned long)s_owner_tid, (unsigned long)me, s_st.frame + 1);
         s_owner_tid = me;
         s_st.ortho_valid = 0;
@@ -102,15 +103,16 @@ static void pt_leave(void)
     LeaveCriticalSection(&s_lock);
 }
 
-/* Les sinks ne doivent pas toucher aux registres guest ; on les protège
- * quand même, un sink EMIT appellera du code guest. */
+/* Sinks must not touch the guest registers; they are protected anyway, an
+ * EMIT sink calls guest code. */
 static void pt_dispatch(pass_tag_event *ev)
 {
     uint32_t sv_eax = g_eax, sv_ecx = g_ecx, sv_edx = g_edx;
     int i;
     ev->seq_frame = s_st.frame;
-    /* GROUP_END n'a pas de tag : il ne consomme pas de rang. */
-    ev->seq_event = ev->type == PT_EV_GROUP_END ? s_st.event : s_st.event++;
+    /* GROUP_END has no tag: it uses no index (the HUD tag has its own
+     * format: no index either). */
+    ev->seq_event = (ev->type == PT_EV_GROUP_END || ev->type == PT_EV_HUD) ? s_st.event : s_st.event++;
     ev->thread = s_owner_tid;
     s_cnt.events++;
     for (i = 0; i < s_nsinks; i++)
@@ -141,7 +143,7 @@ static void pt_check_esp(uint32_t esp0, uint32_t popped)
 
 static void hook_105CE0(void)
 {
-    uint32_t gfx = g_ecx, esp0 = g_esp, refl = 0, p, i;
+    uint32_t gfx = g_ecx, esp0 = g_esp, refl = 0, p, i, frame_tag;
     pass_tag_event ev;
 
     if (!pt_enter(0)) {
@@ -151,13 +153,14 @@ static void hook_105CE0(void)
     }
     s_cnt.h1++;
 
-    /* Mêmes conditions que le bloc reflet de RenderFrame (0x105D34). */
+    /* Same conditions as the reflection block of RenderFrame (0x105D34). */
     p = MEM32(0x001E3C7Cu);
     if (gfx && p >= 0x1000u && MEM32(p + 0x72Cu) && MEM32(gfx + 0x22C928u)
         && !MEM32(0x001C0820u))
         refl = 1;
 
     s_st.frame++;
+    frame_tag = (g_hud_anchor_on || g_box_on || g_race2d_on || g_panel_on) ? hud_anchor_frame() : 0;   /* HUD tags recomputed per frame */
     s_st.event = 0;
     s_st.in_frame = 1;
     s_st.grp_open = 0;
@@ -170,6 +173,13 @@ static void hook_105CE0(void)
     ev.view  = PASS_TAG_VIEW_NONE;
     ev.extra = refl;
     pt_dispatch(&ev);
+    if (frame_tag) {                    /* wide or 16:9 frame */
+        memset(&ev, 0, sizeof ev);
+        ev.type  = PT_EV_HUD;
+        ev.view  = PASS_TAG_VIEW_NONE;
+        ev.extra = frame_tag;
+        pt_dispatch(&ev);
+    }
     if (s_st.frame % 60u == 0) {
         for (i = 0; i < (uint32_t)s_nsinks; i++)
             if (s_sinks[i]->flush) s_sinks[i]->flush();
@@ -195,11 +205,10 @@ static void hook_105CE0(void)
     pt_check_esp(esp0, 0);
 }
 
-/* ── H2 : GfxContext_ApplyStateBlock 0xFAAE0 (thiscall, 1 arg, ret 4) ──
+/* ── H2: GfxContext_ApplyStateBlock 0xFAAE0 (thiscall, 1 arg, ret 4) ──
  *
- * Seul le site de la boucle d'enregistrements de SceneView_RenderPass
- * (0xFFD92) passe le filtre : rec = blk - 4 doit être un enregistrement de la
- * vue courante. */
+ * Only the call site in the record loop of SceneView_RenderPass (0xFFD92)
+ * passes the filter: rec = blk - 4 must be a record of the current view. */
 
 static void pt_note_record(uint32_t gfx, uint32_t blk)
 {
@@ -223,21 +232,78 @@ static void pt_note_record(uint32_t gfx, uint32_t blk)
     ortho = MEMF(v + 0x80Cu) == 0.0f;
     key   = (view << 8) | (ortho << 7) | group;
 
-    if (s_st.grp_open && key == s_st.grp_key) { s_st.grp_nrec++; return; }
+    if (s_st.grp_open && key == s_st.grp_key) {
+        s_st.grp_nrec++;
+    } else {
+        pt_group_close();
+        s_st.grp_open = 1;
+        s_st.grp_key  = key;
+        s_st.grp_nrec = 1;
+        s_st.hud_tag  = 0;      /* the translator forgets the HUD tag at a GROUP marker */
 
-    pt_group_close();
-    s_st.grp_open = 1;
-    s_st.grp_key  = key;
-    s_st.grp_nrec = 1;
+        memset(&ev, 0, sizeof ev);
+        ev.type  = PT_EV_GROUP;
+        ev.view  = view;
+        ev.group = group;
+        ev.ortho = ortho;
+        obj = MEM32(rec);
+        ev.handler_va = obj >= 0x1000u ? MEM32(obj) : 0;
+        pt_dispatch(&ev);
+    }
 
-    memset(&ev, 0, sizeof ev);
-    ev.type  = PT_EV_GROUP;
-    ev.view  = view;
-    ev.group = group;
-    ev.ortho = ortho;
-    obj = MEM32(rec);
-    ev.handler_va = obj >= 0x1000u ? MEM32(obj) : 0;
-    pt_dispatch(&ev);
+    /* Race HUD element -> its two tags (x anchor, y anchor) before its
+     * draws; the next record outside the HUD sets the tag back to
+     * "none". */
+    if ((g_hud_anchor_on || g_box_on || g_race2d_on || g_panel_on) && ortho) {
+        uint32_t ty, t = hud_anchor_tag(MEM32(rec), v, &ty);
+        if (t != s_st.hud_tag || (t && ty != s_st.hud_tag_y)) {
+            memset(&ev, 0, sizeof ev);
+            ev.type  = PT_EV_HUD;
+            ev.view  = view;
+            ev.extra = t ? t : HUD_TAG_MAGIC << 16;
+            pt_dispatch(&ev);
+            if (t) {
+                ev.extra = ty;
+                pt_dispatch(&ev);
+            }
+            s_st.hud_tag = t;
+            s_st.hud_tag_y = ty;
+        }
+    }
+}
+
+/* A draw that keeps the stretch whatever its record's tag says.
+ * fullfade.c calls it from the world-quads draw (0x1009D0), before the
+ * title's method, when it has just widened a full-screen fade quad. The
+ * record's tag is worked out earlier (above, hud_anchor_tag), from the
+ * quads it reads in the first 2D vertex buffer; the title picks the buffer
+ * only when it draws, and in the trick tutorial the respawn flash comes
+ * from the second one while the first holds other, smaller quads at the
+ * same place: the flash was taken for a menu record and framed at 4:3.
+ * Here the draw gets "as the title drew it" (BOX_OFF: no frame, no HUD
+ * scale, no panel) when the current tag says otherwise; the next record's
+ * tag differs again and is written again. In a race the marker is written
+ * too (the flash was already drawn stretched there: same image before and
+ * after). Only draws that fullfade widens are concerned. */
+int pass_tags_draw_stretched(void)
+{
+    pass_tag_event ev;
+    int written = 0;
+    const uint32_t off = (HUD_TAG_MAGIC_BOX << 16) | HUD_BOX_OFF;
+    if (g_pass_tags_mode == PASS_TAGS_OFF) return 0;
+    if (!(g_hud_anchor_on || g_box_on || g_race2d_on || g_panel_on)) return 0;
+    if (!pt_enter(1)) return 0;
+    if (s_st.in_frame && s_st.hud_tag && s_st.hud_tag != off) {
+        memset(&ev, 0, sizeof ev);
+        ev.type  = PT_EV_HUD;
+        ev.extra = off;
+        pt_dispatch(&ev);
+        s_st.hud_tag = off;
+        s_st.hud_tag_y = 0;
+        written = 1;
+    }
+    pt_leave();
+    return written;
 }
 
 static void hook_FAAE0(void)
@@ -261,7 +327,7 @@ static void hook_FE940(void)
     uint32_t gfx = g_ecx, esp0 = g_esp, a[7], i, same = 1;
 
     for (i = 0; i < 7; i++) a[i] = MEM32(esp0 + 4u + 4u * i);
-    a[6] &= 0xFFu;                      /* le 7e argument est un octet */
+    a[6] &= 0xFFu;                      /* the 7th argument is a byte */
 
     if (!pt_enter(2)) goto call;
     s_cnt.h3++;
@@ -295,13 +361,13 @@ void (*pass_tags_lookup(uint32_t xbox_va))(void)
     return 0;
 }
 
-/* ── Sink JOURNAL ────────────────────────────────────────────────
+/* ── LOG sink ────────────────────────────────────────────────────
  *
- * Les événements d'une frame (de FRAME_BEGIN au FRAME_BEGIN suivant, donc
- * aussi ce qui est dessiné hors de RenderFrame) sont mis en forme dans un
- * bloc mémoire. Au début de la frame suivante le bloc est écrit ou jeté :
- * écrit en entier pour les FULL premières frames, puis une frame sur EVERY,
- * plus toute frame dont la séquence est nouvelle. */
+ * The events of a frame (from FRAME_BEGIN to the next FRAME_BEGIN, so also
+ * what is drawn outside RenderFrame) are formatted into a memory block. At
+ * the start of the next frame the block is written or dropped: written in
+ * full for the first FULL frames, then one frame in EVERY, plus any frame
+ * whose sequence is new. */
 
 #define LOG_BLOCK_CAP   (64 * 1024)
 #define LOG_RECENT_SIGS 16
@@ -315,7 +381,7 @@ static struct {
     char     blk[LOG_BLOCK_CAP];
     size_t   len;
     int      truncated;
-    size_t   pend_n;            /* position du « n=      » du GROUP ouvert */
+    size_t   pend_n;            /* position of the "n=      " of the open GROUP */
     int      pend_valid;
     uint32_t blk_frame;
     uint32_t sig;
@@ -350,7 +416,7 @@ static void log_write(const char *s, size_t n)
 {
     if (!s_log.f || s_log.capped) return;
     if (s_log.bytes + n > s_log.max_bytes) {
-        fprintf(s_log.f, "# plafond de %llu octets atteint : plus de détail, bilans seulement\n",
+        fprintf(s_log.f, "# cap of %llu bytes reached: no more detail, summaries only\n",
                 s_log.max_bytes);
         s_log.capped = 1;
         return;
@@ -365,9 +431,9 @@ static void log_summary(void)
     int n;
     if (!s_log.f) return;
     n = snprintf(line, sizeof line,
-                 "# bilan frame %u : h1=%llu h2=%llu h2_retenus=%llu h3=%llu evenements=%llu "
-                 "esp_bad=%ld thread=%lu changements=%u non_proprio=H1:%llu,H2:%llu,H3:%llu (tid %lu/%lu/%lu) "
-                 "blocs_ecrits=%llu blocs_jetes=%llu octets=%llu\n",
+                 "# summary frame %u: h1=%llu h2=%llu h2_kept=%llu h3=%llu events=%llu "
+                 "esp_bad=%ld thread=%lu changes=%u non_owner=H1:%llu,H2:%llu,H3:%llu (tid %lu/%lu/%lu) "
+                 "blocks_written=%llu blocks_dropped=%llu bytes=%llu\n",
                  s_st.frame, s_cnt.h1, s_cnt.h2, s_cnt.h2_kept, s_cnt.h3, s_cnt.events,
                  (long)s_esp_bad, (unsigned long)s_owner_tid, s_owner_switches,
                  s_cnt.foreign[0], s_cnt.foreign[1], s_cnt.foreign[2],
@@ -375,7 +441,7 @@ static void log_summary(void)
                  (unsigned long)s_cnt.foreign_tid[2], s_log.blocks_written,
                  s_log.blocks_skipped, s_log.bytes);
     if (n > 0) {
-        /* Les bilans passent même après le plafond. */
+        /* Summaries go on even past the cap. */
         fwrite(line, 1, (size_t)n, s_log.f);
         s_log.bytes += (size_t)n;
     }
@@ -395,13 +461,13 @@ static void log_block_finish(void)
     int isnew;
     if (!s_log.len) return;
     isnew = log_sig_is_new(s_log.sig);
-    if (s_log.blk_frame <= s_log.full)              why = "debut";
-    else if (isnew)                                 why = "nouvelle";
-    else if (s_log.blk_frame % s_log.every == 0)    why = "echantillon";
+    if (s_log.blk_frame <= s_log.full)              why = "start";
+    else if (isnew)                                 why = "new";
+    else if (s_log.blk_frame % s_log.every == 0)    why = "sample";
     if (why) {
         char hdr[96];
         int n = snprintf(hdr, sizeof hdr, "\n= frame %u [%s] sig=%08X%s\n", s_log.blk_frame,
-                         why, s_log.sig, s_log.truncated ? " TRONQUE" : "");
+                         why, s_log.sig, s_log.truncated ? " TRUNCATED" : "");
         log_write(hdr, (size_t)n);
         log_write(s_log.blk, s_log.len);
         s_log.blocks_written++;
@@ -420,7 +486,7 @@ static void log_block_finish(void)
     s_log.sig = 2166136261u;
 }
 
-/* ~ toutes les 60 frames : vidage du fichier ; bilan toutes les 600. */
+/* ~ every 60 frames: file flush; summary every 600. */
 static void log_flush(void)
 {
     if (!s_log.f) return;
@@ -435,17 +501,17 @@ static void log_event(const pass_tag_event *ev)
         log_block_finish();
         s_log.blk_frame = ev->seq_frame;
         log_sig(0xB0u | ev->extra);
-        log_append("F%u BEGIN reflet=%u thread=%u tag=%08X\n", ev->seq_frame, ev->extra,
+        log_append("F%u BEGIN reflection=%u thread=%u tag=%08X\n", ev->seq_frame, ev->extra,
                    ev->thread, pass_tags_tag(ev));
         break;
     case PT_EV_FRAME_END:
         log_sig(0xE0u);
-        log_append("F%u END enregistrements=%u evenements=%u tag=%08X\n", ev->seq_frame,
+        log_append("F%u END records=%u events=%u tag=%08X\n", ev->seq_frame,
                    ev->extra, ev->seq_event + 1, pass_tags_tag(ev));
         break;
     case PT_EV_GROUP:
         log_sig(0x1000000u | (ev->view << 8) | (ev->ortho << 7) | ev->group);
-        log_append("  #%-3u G vue=%u groupe=%2u %s handler=%08X ", ev->seq_event,
+        log_append("  #%-3u G view=%u group=%2u %s handler=%08X ", ev->seq_event,
                    ev->view, ev->group, ev->ortho ? "ORTHO" : "persp", ev->handler_va);
         if (!s_log.truncated) { s_log.pend_n = s_log.len; s_log.pend_valid = 1; }
         log_append("n=      tag=%08X\n", pass_tags_tag(ev));
@@ -463,8 +529,8 @@ static void log_event(const pass_tag_event *ev)
         uint32_t i, b;
         for (i = 0; i < 6; i++) { memcpy(&b, &ev->ortho_args[i], 4); log_sig(b); }
         log_sig(0x0F000000u | ev->extra);
-        log_append("  #%-3u O %s gauche=%g haut=%g largeur=%g hauteur=%g near=%g far=%g flag=%u tag=%08X\n",
-                   ev->seq_event, s_st.in_frame ? "dans-frame" : "HORS-FRAME",
+        log_append("  #%-3u O %s left=%g top=%g width=%g height=%g near=%g far=%g flag=%u tag=%08X\n",
+                   ev->seq_event, s_st.in_frame ? "in-frame" : "OUT-OF-FRAME",
                    ev->ortho_args[0], ev->ortho_args[1], ev->ortho_args[2],
                    ev->ortho_args[3], ev->ortho_args[4], ev->ortho_args[5],
                    ev->extra, pass_tags_tag(ev));
@@ -487,8 +553,9 @@ static unsigned env_uint(const char *name, unsigned def)
     return def;
 }
 
-/* Le dossier « _local » le plus haut en remontant depuis le dossier de l'exe,
- * + \logs. À défaut, le dossier de l'exe. */
+/* The highest "_local" walking up from the exe's folder: a worktree under
+ * _local often has its own _local, the log still goes to the top
+ * _local/logs. Failing that, the exe's folder. */
 static void log_default_dir(char *out, size_t cap)
 {
     char dir[MAX_PATH], probe[MAX_PATH];
@@ -524,12 +591,12 @@ static void log_open(void)
     if (snprintf(s_log.path, sizeof s_log.path, "%s\\pass_tags_%04u%02u%02u_%02u%02u%02u.log",
                  dir, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
         >= (int)sizeof s_log.path) {
-        fprintf(stderr, "[PASS-TAGS] chemin du journal trop long : journal désactivé\n");
+        fprintf(stderr, "[PASS-TAGS] log path too long: log disabled\n");
         return;
     }
     s_log.f = fopen(s_log.path, "wb");
     if (!s_log.f) {
-        fprintf(stderr, "[PASS-TAGS] impossible d'ouvrir %s : journal désactivé\n", s_log.path);
+        fprintf(stderr, "[PASS-TAGS] cannot open %s: log disabled\n", s_log.path);
         return;
     }
     setvbuf(s_log.f, NULL, _IOFBF, 256 * 1024);
@@ -537,29 +604,30 @@ static void log_open(void)
     s_log.every = env_uint("XBOX_PASS_TAGS_EVERY", 60);
     s_log.max_bytes = (unsigned long long)env_uint("XBOX_PASS_TAGS_MAXMB", 64) << 20;
     s_log.sig = 2166136261u;
-    fprintf(s_log.f, "# pass_tags, mode log. full=%u every=%u max=%llu octets\n"
-                     "# G = enregistrement(s) H2 d'un triplet (vue, groupe, ortho), n = nombre ;"
-                     " O = appel H3 (ortho) ; tag = valeur 32 bits du futur marqueur NOP\n",
+    fprintf(s_log.f, "# pass_tags, log mode. full=%u every=%u max=%llu bytes\n"
+                     "# G = H2 record(s) of a triple (view, group, ortho), n = count;"
+                     " O = H3 call (ortho); tag = 32-bit value of the NOP marker\n",
             s_log.full, s_log.every, s_log.max_bytes);
     fprintf(stderr, "[PASS-TAGS] mode log -> %s\n", s_log.path);
     pass_tags_add_sink(&s_sink_log);
 }
 
-/* ── Sink EMIT ───────────────────────────────────────────
+/* ── EMIT sink ───────────────────────────────────────────────────
  *
- * Chaque FRAME_BEGIN, GROUP et FRAME_END devient un NOP NV2A
- * `0x00040100, tag` écrit dans le pushbuffer du jeu, à sa place dans le flux :
- * le traducteur (nv2a_pgraph_d3d11.c, case NV097_NO_OPERATION) le lit dans
- * l'ordre exact des commandes. ORTHO et GROUP_END ne sont pas émis.
+ * Each FRAME_BEGIN, GROUP and FRAME_END becomes an NV2A NOP
+ * `0x00040100, tag` written into the game's pushbuffer, in place in the
+ * stream: the translator (nv2a_pgraph_d3d11.c, case NV097_NO_OPERATION)
+ * reads it in the exact order of the commands. ORTHO and GROUP_END are not
+ * emitted.
  *
- * Appelé sous le verrou, sur le thread propriétaire, depuis un hook
- * (H1 avant/après l'original, H2 avant) : jamais au milieu d'une séquence
- * D3D. Uniquement dans une frame H1 (in_frame), et jamais pendant
- * l'enregistrement d'un pushbuffer ([ctx+0xC] & 4). pt_dispatch sauvegarde
- * et restaure g_eax/g_ecx/g_edx autour des sinks ; sub_0016B920 est stdcall,
- * ret 4 : il dépile l'argument et l'adresse de retour fictive. */
+ * Called under the lock, on the owner thread, from a hook (H1 before/after
+ * the original, H2 before): never in the middle of a D3D sequence. Only
+ * inside an H1 frame (in_frame), and never while a pushbuffer is recorded
+ * ([ctx+0xC] & 4). pt_dispatch saves and restores g_eax/g_ecx/g_edx around
+ * the sinks; sub_0016B920 is stdcall, ret 4: it pops the argument and the
+ * dummy return address. */
 
-extern void sub_0016B920(void);     /* garantit wp < limite (+0x200 de marge) */
+extern void sub_0016B920(void);     /* guarantees wp < limit (+0x200 margin) */
 
 static struct {
     unsigned long long written, skipped_recording, skipped_noframe, skipped_noctx, esp_bad;
@@ -570,8 +638,8 @@ static void emit_event(const pass_tag_event *ev)
     uint32_t tag, ctx, wp, esp0;
 
     if (ev->type != PT_EV_FRAME_BEGIN && ev->type != PT_EV_FRAME_END &&
-        ev->type != PT_EV_GROUP) return;
-    tag = pass_tags_tag(ev);
+        ev->type != PT_EV_GROUP && ev->type != PT_EV_HUD) return;
+    tag = ev->type == PT_EV_HUD ? ev->extra : pass_tags_tag(ev);
     if (!tag) return;
     if (!s_st.in_frame) { s_emit.skipped_noframe++; return; }
     ctx = MEM32(0x001776C0u);
@@ -579,23 +647,23 @@ static void emit_event(const pass_tag_event *ev)
     if (MEM32(ctx + 0x0Cu) & 4u) { s_emit.skipped_recording++; return; }
 
     esp0 = g_esp;
-    PUSH32(g_esp, ctx);                 /* argument : le contexte pushbuffer */
-    PUSH32(g_esp, 0);                   /* adresse de retour fictive */
-    sub_0016B920();                     /* ret 4 : dépile les 8 octets */
+    PUSH32(g_esp, ctx);                 /* argument: the pushbuffer context */
+    PUSH32(g_esp, 0);                   /* dummy return address */
+    sub_0016B920();                     /* ret 4: pops the 8 bytes */
     if (g_esp != esp0) { s_emit.esp_bad++; g_esp = esp0; }
     wp = g_eax;
-    MEM32(wp) = 0x00040100u;            /* NV097_NO_OPERATION, 1 paramètre, sous-canal 0 */
+    MEM32(wp) = 0x00040100u;            /* NV097_NO_OPERATION, 1 parameter, subchannel 0 */
     MEM32(wp + 4u) = tag;
-    MEM32(ctx) = wp + 8u;               /* publication APRÈS les données */
+    MEM32(ctx) = wp + 8u;               /* published AFTER the data */
     s_emit.written++;
 }
 
 static void emit_flush(void)
 {
     static unsigned n;
-    if (++n % 10u) return;              /* ~ toutes les 600 frames */
-    fprintf(stderr, "[PASS-TAGS] emit : %llu marqueurs écrits ; ignorés : %llu hors frame, "
-            "%llu en recording, %llu sans contexte ; esp_bad %llu\n",
+    if (++n % 10u) return;              /* ~ every 600 frames */
+    fprintf(stderr, "[PASS-TAGS] emit: %llu markers written; skipped: %llu out of frame, "
+            "%llu while recording, %llu without context; esp_bad %llu\n",
             s_emit.written, s_emit.skipped_noframe, s_emit.skipped_recording,
             s_emit.skipped_noctx, s_emit.esp_bad);
 }
@@ -615,10 +683,12 @@ void pass_tags_init(void)
         const char *sp = getenv("XBOX_POST_SPLIT"), *cy = getenv("XBOX_POST_CYCLE");
         const char *po = getenv("XBOX_POST"), *sm = getenv("XBOX_SMAA");
         int post = (po && po[0] == '1') || (sm && sm[0] == '1');
-        /* SMAA implies the split unless XBOX_POST_SPLIT=0 (decision 2026-10-03) */
+        /* SMAA implies the split unless XBOX_POST_SPLIT=0 */
         int want_split = (sp && sp[0]) ? (sp[0] == '1') : (sm && sm[0] == '1');
         split = (want_split && post) || (cy && atoi(cy) > 0);
     }
+    /* Proportional HUD needs the markers (phase + HUD tags). */
+    if (g_hud_anchor_on || g_box_on || g_race2d_on || g_panel_on) split = 1;
     if (!split && (!e || !*e || !strcmp(e, "0") || !strcmp(e, "off"))) {
         g_pass_tags_mode = PASS_TAGS_OFF;
         return;
@@ -628,17 +698,18 @@ void pass_tags_init(void)
     want_emit = !strcmp(e, "emit") || !strcmp(e, "log+emit") || !strcmp(e, "emit+log");
     if (split && !want_emit) {
         want_emit = 1;
-        fprintf(stderr, "[PASS-TAGS] emit activé par XBOX_POST_SPLIT (post 3D au marqueur FRAME_END)\n");
+        fprintf(stderr, "[PASS-TAGS] emit turned on by %s\n", g_hud_anchor_on
+                ? "the proportional HUD" : "XBOX_POST_SPLIT (3D post at the FRAME_END marker)");
     }
     if (!want_log && !want_emit) {
-        fprintf(stderr, "[PASS-TAGS] XBOX_PASS_TAGS=%s inconnu (0 | log | emit | log+emit) : off\n", e);
+        fprintf(stderr, "[PASS-TAGS] XBOX_PASS_TAGS=%s unknown (0 | log | emit | log+emit): off\n", e);
         g_pass_tags_mode = PASS_TAGS_OFF;
         return;
     }
     if (want_log) log_open();
     if (want_emit) {
         pass_tags_add_sink(&s_sink_emit);
-        fprintf(stderr, "[PASS-TAGS] mode emit : marqueurs NOP 0x5358xxxx dans le pushbuffer\n");
+        fprintf(stderr, "[PASS-TAGS] emit mode: NOP markers 0x5358xxxx in the pushbuffer\n");
     }
     g_pass_tags_mode = !s_nsinks ? PASS_TAGS_OFF : want_emit ? PASS_TAGS_EMIT : PASS_TAGS_LOG;
 }

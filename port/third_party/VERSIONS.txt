@@ -1,0 +1,12 @@
+Third-party sources used by the launcher (OpenTricky.exe), copied unmodified
+from their official repositories; each folder keeps its licence file.
+
+  rmlui/     RmlUi 6.3            https://github.com/mikke89/RmlUi            MIT (LICENSE.txt)
+             (Include, Source, CMake, and the SDL platform + GL3 renderer backends only)
+  sdl3/      SDL release-3.4.8    https://github.com/libsdl-org/SDL           zlib (LICENSE.txt)
+             (CMakeLists.txt, cmake, include, src, wayland-protocols, build-scripts/*.cmake)
+  freetype/  FreeType 2.14.3      https://github.com/freetype/freetype        FTL or GPLv2 (LICENSE.TXT, docs/FTL.TXT)
+             (used under the FTL, which asks for a credit in the documentation)
+
+Fonts in port/launcher/app/ui/fonts: Inter, Bebas Neue, Exo 2 (SIL Open Font
+License 1.1, OFL-*.txt beside them), from https://github.com/google/fonts.

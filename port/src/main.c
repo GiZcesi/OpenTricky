@@ -47,8 +47,10 @@
 #include <xbox/xboxrecomp.h>
 #include "kernel/xbox_xdvdfs.h"
 #include "launcher.h"
+#include "version.h"
 #include "hostui.h"
 #include "controls.h"
+#include "crashreport.h"
 /* NV2A DAC palette trap (nv2a/nv2a_mmio_hook.c). */
 #include <stdbool.h>
 bool nv2a_dac_trap_install(unsigned char *mem_base);
@@ -56,11 +58,48 @@ bool nv2a_dac_handle_mmio(PCONTEXT ctx, unsigned int fault_xbox_va, int is_write
 #include "pass_tags.h"
 #include "netplay/np_cmdlog.h"
 #include "netplay/np_ghost.h"
+#include "netplay/np_net.h"
+#include "netplay/np_racebench.h"
 /* Read by the generated code (fix_kickwait.py), set in main(). */
 int g_fix_kickwait = 1;
+/* Read by the generated code (fix_riderlist.py), set in main(). */
+int g_fix_riderlist = 1;
+/* List sizes stored by the generated code after the split (0x2FBC5). */
+uint32_t g_riderlist_ai_n, g_riderlist_pl_n;
+/* Called by the generated code (fix_riderlist.py) when, in sub_0002F800,
+ * the rider lists disagree with the race's counts (kind 0) or a guard stops the
+ * walk (kind 1 = AI list short, 2 = Player list short). One stderr line per kind
+ * and per race (a new race = another race object or its tick going back), so the
+ * "stable" campaign sees it in run.log without a line every 6 ticks. Game thread only. */
+void fork_riderlist_note(uint32_t kind, uint32_t race, uint32_t tick, uint32_t riders,
+                         uint32_t ai_exp, uint32_t pl_exp, uint32_t at)
+{
+    static const char *const what[3] = { "lists differ from the race counts",
+                                         "guard: AI list short, walk stopped",
+                                         "guard: Player list short, walk stopped" };
+    static uint32_t last_race, last_tick, done, hits;
+    if (kind > 2) kind = 0;
+    if (race != last_race || tick < last_tick) done = 0;
+    last_race = race; last_tick = tick;
+    hits++;
+    if (done & (1u << kind)) return;
+    done |= 1u << kind;
+    fprintf(stderr, "[RIDERLIST] %s: ai=%u/%u players=%u/%u riders=%u at=%u tick=%u race=0x%08X (hits=%u)\n",
+            what[kind], (unsigned)g_riderlist_ai_n, (unsigned)ai_exp, (unsigned)g_riderlist_pl_n,
+            (unsigned)pl_exp, (unsigned)riders, (unsigned)at, (unsigned)tick, (unsigned)race, (unsigned)hits);
+    fflush(stderr);
+}
 #include "fps_cap.h"
 #include "aspect.h"
 #include "drawdist.h"
+#include "ctlscheme.h"
+#include "ps2legend.h"
+#include "fullfade.h"
+#include "pumplag.h"
+#include "strmwalk.h"
+#include "chantfix.h"
+#include "hud_anchor.h"
+#include "nv2a/nv2a_hdtex.h"
 #include "ticktrace.h"
 
 /* Host display and EEPROM hooks; see d3d8_device.c and
@@ -180,11 +219,43 @@ static BOOL has_flag(const WCHAR *flag)
 }
 
 /*
+ * No good disc image in settings.ini (a first start by double-click, a disc
+ * image moved): start the launcher, OpenTricky.exe beside this executable,
+ * where the player chooses one; without it, say what is missing.
+ */
+static void open_launcher_instead(const char *why)
+{
+    WCHAR exe[MAX_PATH], *slash;
+    DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (n > 0 && n < MAX_PATH && (slash = wcsrchr(exe, L'\\')) != NULL &&
+        (size_t)(slash - exe) + 16 < MAX_PATH) {
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        wcscpy(slash + 1, L"OpenTricky.exe");
+        ZeroMemory(&si, sizeof si);
+        si.cb = sizeof si;
+        if (GetFileAttributesW(exe) != INVALID_FILE_ATTRIBUTES &&
+            CreateProcessW(exe, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            printf("No good disc image (%s): OpenTricky.exe started\n", why);
+            return;
+        }
+    }
+    {
+        char msg[768];
+        snprintf(msg, sizeof msg, "%s\n\nChoose your SSX Tricky (USA) Xbox disc image in OpenTricky.exe, "
+                 "the launcher beside the game.", why);
+        MessageBoxA(NULL, msg, "SSX Tricky", MB_ICONWARNING);
+    }
+}
+
+/*
  * TRUE when standard output goes somewhere other than a person: a pipe, a
  * file or NUL. Every test harness launches the game that way, and none of
  * them can click through a launcher. A double-clicked GUI executable has no
  * standard output at all, and a real console answers GetConsoleMode, so both
- * of those still get the launcher.
+ * of those still use settings.ini.
  */
 static BOOL output_is_redirected(void)
 {
@@ -285,8 +356,26 @@ extern size_t recomp_dispatch_init(void);
  *   - Add dumps of game-specific globals (heap handles, state flags)
  *   - Add SEH simulation if your game uses __try/__except
  */
+/* End of the stack scan below: 8 KB above the faulting rsp, but never past
+ * the top of the thread's stack. A fault near the top of a shallow stack (a
+ * thread that just started) otherwise faulted again inside this handler,
+ * and that second fault is the one that got reported. */
+static uintptr_t veh_stack_end(PEXCEPTION_POINTERS ep)
+{
+    uintptr_t end = (uintptr_t)ep->ContextRecord->Rsp + 0x2000;
+    uintptr_t top = (uintptr_t)((NT_TIB *)NtCurrentTeb())->StackBase;
+    return (top && top < end) ? top : end;
+}
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
+    /* A stack overflow leaves too little stack for the lines below and for
+     * the unhandled-exception filter: the process used to die of a second
+     * fault with nothing reported. Hand it to the crash report first (it ends
+     * the process; it returns only when reports are off). */
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW)
+        crashreport_fatal_overflow(ep);
+
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
         /*
          * Added to diagnose the PsTerminateSystemThread fall-through crash:
@@ -314,7 +403,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             uintptr_t mod_lo = mod_base;
             uintptr_t mod_hi = mod_base + 0x08000000ULL; /* generous module-size bound */
             fprintf(stderr, "  Native stack (first 256 slots, filtered to code range, shown as link addr for nm):\n");
-            for (int i = 0; i < 256 && (uintptr_t)(sp + i) < (uintptr_t)(ep->ContextRecord->Rsp) + 0x2000; i++) {
+            for (int i = 0; i < 256 && (uintptr_t)(sp + i) < veh_stack_end(ep); i++) {
                 if (sp[i] >= mod_lo && sp[i] < mod_hi) {
                     fprintf(stderr, "    [%d] 0x%llX\n", i,
                         (unsigned long long)(0x140000000ULL + (sp[i] - mod_base)));
@@ -404,7 +493,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             uintptr_t mod_lo = mod_base;
             uintptr_t mod_hi = mod_base + 0x08000000ULL;
             fprintf(stderr, "  Native stack (first 256 slots, filtered to code range, shown as link addr for nm):\n");
-            for (int i = 0; i < 256 && (uintptr_t)(sp + i) < (uintptr_t)(ep->ContextRecord->Rsp) + 0x2000; i++) {
+            for (int i = 0; i < 256 && (uintptr_t)(sp + i) < veh_stack_end(ep); i++) {
                 if (sp[i] >= mod_lo && sp[i] < mod_hi) {
                     fprintf(stderr, "    [%d] 0x%llX\n", i,
                         (unsigned long long)(0x140000000ULL + (sp[i] - mod_base)));
@@ -488,7 +577,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             {
                 uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
                 fprintf(stderr, "  Native stack (first 256 slots, filtered to code range, shown as link addr):\n");
-                for (int i = 0; i < 256 && (uintptr_t)(sp + i) < (uintptr_t)(ep->ContextRecord->Rsp) + 0x2000; i++) {
+                for (int i = 0; i < 256 && (uintptr_t)(sp + i) < veh_stack_end(ep); i++) {
                     if (sp[i] >= mod_base && sp[i] < mod_hi) {
                         fprintf(stderr, "    [%d] 0x%llX\n", i,
                             (unsigned long long)(0x140000000ULL + (sp[i] - mod_base)));
@@ -611,6 +700,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stderr, NULL, _IONBF, 0);
 
     printf("=== YOUR_GAME_NAME - Static Recompilation ===\n");
+    printf("OpenTricky %s\n", OT_VERSION);
     printf("Loading XBE...\n");
 
     /* Windows in real pixels: a 1280x960 setting is a 1280x960 window,
@@ -626,6 +716,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* Local ghost (XBOX_GHOST=<file.npcl>). Off by default. */
     np_ghost_init();
+
+    /* Two instances over UDP (XBOX_NET=host | join:IP:port). Off
+     * by default; exclusive with the ghost (which is switched off). */
+    np_net_init();
+    if (g_np_net_on && g_np_ghost_on) {
+        fprintf(stderr, "[NET] XBOX_GHOST ignored: exclusive with XBOX_NET\n");
+        g_np_ghost_on = 0;
+    }
+
+    /* Replayed race for benchmarks (XBOX_RACEBENCH=<file.npcl>). Off by
+     * default; exclusive with the ghost and the network (both switched off). */
+    np_rb_init();
+    np_stuck_init();
+    if (g_np_rb_on && (g_np_ghost_on || g_np_net_on)) {
+        fprintf(stderr, "[RACEBENCH] XBOX_GHOST / XBOX_NET ignored: exclusive with XBOX_RACEBENCH\n");
+        g_np_ghost_on = 0;
+        g_np_net_on = 0;
+    }
 
     /* Ask for a 1 ms scheduler tick.
      *
@@ -649,24 +757,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     else
         fprintf(stderr, "warning: could not raise the timer resolution to 1 ms; "
                         "timer-driven waits will run at the ~15.6 ms default\n");
-    /* (this line had been inserted between the if and its else,
-     * so the warning above printed on every launch without XBOX_LOWACC_LOG
-     * while the 1 ms period was in fact granted.) */
     if (getenv("XBOX_LOWACC_LOG")) { g_lowacc_enabled = 1; atexit(xbox_lowaccess_report); }
 
     /* Step 0: choose the disc and the display.
      *
-     * A normal start opens the launcher (PLAY / SETTINGS / QUIT).
-     * Its settings -- disc image, save folder, resolution, 4:3 or 16:9,
-     * fullscreen -- are kept in "<exe name>.ini" beside the executable, and
-     * --play starts straight away with them. --direct, a disc image named on
+     * A normal start (a double-click, Steam) plays straight away with the
+     * settings of settings.ini (settings.h: beside the executables, or in
+     * Documents\My Games\SSX Tricky), the file the separate launcher
+     * (OpenTricky.exe) writes; --play (the launcher's PLAY) does the same.
+     * The launcher window that was built into this executable is
+     * gone: without a good disc image in settings.ini,
+     * OpenTricky.exe beside the game is started to choose one, or a message
+     * says what is missing. --direct, a disc image named on
      * the command line, or redirected output (every automated run) keep the
      * pre-launcher behaviour exactly: the ISO or extracted files beside the
      * executable, the title's own 640x480 at 4:3, and "hdd" beside the
      * executable -- so test runs and their captures never depend on what the
      * player configured. In that mode XBOX_RENDER=WxH, XBOX_WIDESCREEN=1 and
-     * XBOX_FULLSCREEN=1 exercise the display options. --launcher forces the
-     * launcher even with redirected output. */
+     * XBOX_FULLSCREEN=1 exercise the display options. */
     static LauncherConfig launch_cfg;   /* the menu keeps using it */
     BOOL use_config;
 
@@ -675,23 +783,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         const char *cli = find_iso_argument();
         BOOL direct = has_flag(L"--direct") || cli != NULL ||
-                      (output_is_redirected() && !has_flag(L"--launcher") &&
-                       !has_flag(L"--play"));
-        BOOL show_menu = !direct && !has_flag(L"--play");
+                      (output_is_redirected() && !has_flag(L"--play"));
         use_config = !direct;
 
         if (use_config) {
-            for (;;) {
-                char why[512];
-                if (show_menu && !launcher_run(&launch_cfg))
-                    return 0;                           /* closed the launcher */
-                if (launcher_check_iso(launch_cfg.iso, why, sizeof why) &&
-                    xdvdfs_mount(launch_cfg.iso))
-                    break;
-                if (!launch_cfg.iso[0])
-                    snprintf(why, sizeof why, "No disc image is set. Choose one in Settings.");
-                MessageBoxA(NULL, why, "SSX Tricky", MB_ICONWARNING);
-                show_menu = TRUE;                       /* --play with a bad disc */
+            char why[512];
+            if (!launcher_check_iso(launch_cfg.iso, why, sizeof why)) {
+                open_launcher_instead(why);
+                return 0;
+            }
+            if (!xdvdfs_mount(launch_cfg.iso)) {
+                open_launcher_instead("The disc image could not be opened.");
+                return 0;
             }
             printf("Game disc: %s (ISO)\n", launch_cfg.iso);
         } else {
@@ -733,7 +836,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     /* The log file, if the player asked for one: everything the game reports
-     * goes to "<exe name>.log" beside it, replacing the previous run's. The
+     * goes to "<exe name>.log" beside settings.ini, replacing the previous run's. The
      * executable has no console, so without this a crash leaves nothing. */
     if (use_config && launch_cfg.log_file) {
         FILE *t;
@@ -745,13 +848,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             setvbuf(stdout, NULL, _IONBF, 0);
             setvbuf(stderr, NULL, _IONBF, 0);
             GetLocalTime(&st);
-            printf("SSX Tricky log, %04u-%02u-%02u %02u:%02u:%02u\n",
-                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+            printf("SSX Tricky log, %04u-%02u-%02u %02u:%02u:%02u, OpenTricky %s\n",
+                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, OT_VERSION);
+            {   /* the lines printed before the log opened, again */
+                char ini[MAX_PATH];
+                launcher_config_path(ini, sizeof ini);
+                printf("Settings:  %s\n", ini);
+            }
         } else {
             s_log_path[0] = '\0';
         }
     }
-    s_crash_dialog = use_config;
+    /* Started by OpenTricky.exe's PLAY: the launcher shows the crash screen
+     * when the game ends (it finds the report folder), so no message here. */
+    s_crash_dialog = use_config && !getenv("OPENTRICKY_LAUNCHER");
+    /* Crash / freeze reports (crashreport.h): with no log file, a player's
+     * output is kept in memory for the report instead of going nowhere. */
+    crashreport_set_output(use_config, s_log_path, output_is_redirected());
 
     /* The display the launcher chose (or the test overrides). 16:9 also tells
      * the title its display is widescreen -- the dashboard setting on a real
@@ -764,10 +877,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         double shape = launcher_display_aspect(&launch_cfg);
         int wide;
         aspect_set_fov(launch_cfg.wide_fov);    /* XBOX_WIDE_FOV wins */
+        aspect_set_menus(launch_cfg.menus);     /* XBOX_WIDE_MENUS wins */
         wide = aspect_init(shape);
         d3d8_SetHostDisplay((unsigned)launch_cfg.width, (unsigned)launch_cfg.height,
                             wide, launch_cfg.fullscreen);
         if (g_aspect_hook_on) d3d8_SetHostAspect(shape);
+        hud_anchor_set(shape, launch_cfg.hud_shape, launch_cfg.hud_size);  /* XBOX_HUD_* win */
         xbox_SetVideoFlags(wide ? 0x00010000u : 0u);
         d3d8_SetMsaa(launch_cfg.msaa);
         d3d8_SetAnisotropy(launch_cfg.aniso);
@@ -792,10 +907,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (r && sscanf(r, "%ux%u", &rw, &rh) != 2) rw = rh = 0;
         shape = aspect_from_env(rw, rh);        /* XBOX_ASPECT */
         aspect_set_fov(ASPECT_FOV_NOSTRETCH);   /* XBOX_WIDE_FOV */
+        aspect_set_menus(ASPECT_MENUS_DEFAULT); /* XBOX_WIDE_MENUS */
         if (shape > 0.0) wide = aspect_init(shape);
+        else if (wide && g_aspect_menus43)      /* XBOX_WIDESCREEN=1 alone, menus at 4:3 */
+            aspect_init(shape = 16.0 / 9.0);    /* need the x-scale hook, as with XBOX_ASPECT=16:9 */
         if (rw || wide || full)
             d3d8_SetHostDisplay(rw, rh, wide, full);
         if (g_aspect_hook_on) d3d8_SetHostAspect(shape);
+        hud_anchor_set(shape > 0.0 ? shape : wide ? 16.0 / 9.0 : 4.0 / 3.0,
+                       HUD_SHAPE_PROPORTIONAL, HUD_SIZE_DEFAULT);   /* XBOX_HUD_* */
         if (wide)
             xbox_SetVideoFlags(0x00010000u);
         if (aa) d3d8_SetMsaa(atoi(aa));
@@ -839,11 +959,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Draw distance (XBOX_DRAW_DISTANCE, or DrawDistance in the
      * .ini through the launcher above). Original by default: no hook. */
     drawdist_init();
+    /* Control scheme: the button maps are served in the PS2 layout, lessons
+     * included (ctlscheme.h); XBOX_CONTROL_SCHEME=xbox (debug only, never set
+     * by the launcher) keeps the original files, nothing hooked. */
+    ctlscheme_init();
+    /* and the loading screens' pad legend in the same layout (ps2legend.h);
+     * the Basic Controls splash is always skipped. */
+    ps2legend_init();
+    /* Full-screen fades (the respawn flash) reach the screen edges instead of
+     * the TV safe area (XBOX_FULLSCREEN_FADES, on by default; see fullfade.h). */
+    fullfade_init();
+    /* Mesh parts drawn after their constant block was rewritten
+     * (XBOX_PUMPLAG, diagnostic, off by default; see pumplag.h). */
+    pumplag_init();
+    /* EA stream reader: block search bounded to the ring (XBOX_FIX_STRMWALK,
+     * on by default; see strmwalk.h). */
+    strmwalk_init();
+    /* Crowd chant names: no pick past the end of a list (XBOX_FIX_CHANT,
+     * on by default; see chantfix.h). */
+    chantfix_init();
+    /* HD textures (XBOX_HD_TEXTURES, or HdTextures + HdTexturesPath
+     * in the .ini through the launcher above). Off by default: the translator
+     * never looks at the index. The index the game carries is a resource. */
+    {
+        HRSRC r = FindResourceA(NULL, "HDTEX_INDEX", MAKEINTRESOURCEA(10) /* RT_RCDATA */);
+        HGLOBAL g = r ? LoadResource(NULL, r) : NULL;
+        const char *text = g ? (const char *)LockResource(g) : NULL;
+        if (text) hdtex_set_builtin_index(text, SizeofResource(NULL, r));
+    }
     /* No busy wait on the NV2A write-combine flush (XBOX_FIX_KICKWAIT,
      * default 1). The guard is in the generated code (fork pass fix_kickwait.py). */
     {
         const char *e = getenv("XBOX_FIX_KICKWAIT");
         g_fix_kickwait = !(e && e[0] == '0');
+    }
+    /* Bounded walk of the AI and Player lists in sub_0002F800
+     * (XBOX_FIX_RIDERLIST, default 1). The guards are in the generated code (fork pass
+     * fix_riderlist.py); when one acts, fork_riderlist_note writes a [RIDERLIST] line. */
+    {
+        const char *e = getenv("XBOX_FIX_RIDERLIST");
+        g_fix_riderlist = !(e && e[0] == '0');
+        if (!g_fix_riderlist) fprintf(stderr, "[RIDERLIST] XBOX_FIX_RIDERLIST=0 (original unchecked walk)\n");
     }
     /* Deliver the APU's front-end trap interrupt (XBOX_FIX_BOOTHANG,
      * default 1). See boothang_hook above. */
@@ -1097,7 +1253,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      */
     {
         extern void sub_00160DEE(void);   /* _mtinitlocks */
-        /* On by default since part forty-four: per-thread TIBs removed the
+        /* On by default: per-thread TIBs removed the
          * crash that enabling this used to expose. XBOX_CRT_MTINIT=0 skips it. */
         const char *e = getenv("XBOX_CRT_MTINIT");
         if (!e || e[0] != '0') {
@@ -1176,6 +1332,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("\nStarting game...\n");
     fflush(stdout);
 
+    {   /* Fork: indirect-call target cache, on from here -- every hook flag is
+         * set by now (recomp_manual.c, XBOX_FIX_ICALL_CACHE=0 keeps it off). */
+        extern void recomp_icall_cache_start(void);
+        recomp_icall_cache_start();
+    }
+    crashreport_game_start();   /* settings snapshot, freeze watchdog */
     xbe_entry_point();
 
     printf("\nGame returned. Cleaning up...\n");
@@ -1246,9 +1408,9 @@ static LONG WINAPI recomp_crash_filter(EXCEPTION_POINTERS *ep)
      * called "the guest location": it is a single global that every guest
      * thread stamps, so on a multi-threaded fault it names whichever thread
      * stored last, which need not be the one that faulted. It is also only a
-     * lower bound, since not every generated file carries the stamps. Part 145
-     * spent two dead ends on a crash this line attributed to sub_00179411 that
-     * addr2line placed in sub_00178DA8 on another thread. Trust the RVA. */
+     * lower bound, since not every generated file carries the stamps: a crash
+     * this line attributed to sub_00179411 was placed by addr2line in
+     * sub_00178DA8, on another thread. Trust the RVA. */
     HMODULE self = GetModuleHandle(NULL);
     fprintf(stderr, "CRASH: code=0x%08lX at host %p (module %p, rva 0x%08llX)"
                     " [tid %lu; last label stamped by any thread: loc_%08X]\n",
@@ -1261,6 +1423,31 @@ static LONG WINAPI recomp_crash_filter(EXCEPTION_POINTERS *ep)
                 (void *)r->ExceptionInformation[1]);
     }
     fflush(stderr);
+    {
+        /* The report folder (crashreport.h). What only this thread can see
+         * goes in: its guest registers (thread-local) and the last indirect
+         * calls. Static buffers: after a stack overflow there is little stack. */
+        static char details[1024];
+        static WCHAR dir[MAX_PATH];
+        extern volatile uint32_t g_icall_trace[16];
+        extern volatile uint32_t g_icall_trace_idx;
+        int len, k;
+        len = snprintf(details, sizeof details,
+                       "Guest:     eax=%08X ecx=%08X edx=%08X ebx=%08X\n"
+                       "           esp=%08X esi=%08X edi=%08X\n"
+                       "Last label stamped by any thread: loc_%08X\n"
+                       "Last 16 indirect-call targets (oldest first):\n ",
+                       g_eax, g_ecx, g_edx, g_ebx, g_esp, g_esi, g_edi, g_last_loc);
+        for (k = 0; k < 16 && len > 0 && len < (int)sizeof details - 12; k++)
+            len += snprintf(details + len, sizeof details - len, " %08X",
+                            g_icall_trace[(g_icall_trace_idx - 16 + k) & 15]);
+        if (len > 0 && len < (int)sizeof details - 2) { details[len++] = '\n'; details[len] = 0; }
+        if (crashreport_on_crash(ep, details, dir, MAX_PATH)) {
+            if (s_crash_dialog)
+                crashreport_crash_dialog(r->ExceptionCode, dir);
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+    }
     if (s_crash_dialog) {
         WCHAR msg[MAX_PATH + 256], path[MAX_PATH];
         if (s_log_path[0] && MultiByteToWideChar(CP_ACP, 0, s_log_path, -1, path, MAX_PATH))
@@ -1280,6 +1467,7 @@ static LONG WINAPI recomp_crash_filter(EXCEPTION_POINTERS *ep)
 
 int main(int argc, char **argv)
 {
+    crashreport_install();      /* XBOX_CRASH_REPORT=0: nothing */
     SetUnhandledExceptionFilter(recomp_crash_filter);
 
     (void)argc;

@@ -16,6 +16,7 @@
 #include "d3d8_internal.h"
 #include "d3d8_gpuprof.h"
 #include <d3dcompiler.h>
+#include <intrin.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -127,11 +128,11 @@ static double nv_now_ms(void)
     return (double)q.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 
-/* XBOX_FIX_PUMP_CACHE : index exact clé 64 bits -> position dans
- * un tableau de cache, à la place de la recherche linéaire faite à chaque
- * draw. Seule la première insertion d'une clé est gardée, comme la recherche
- * linéaire renvoie la première entrée : même résultat. Capacité puissance de
- * 2, au moins 2 fois le tableau indexé (jamais plein). */
+/* XBOX_FIX_PUMP_CACHE: exact index from a 64-bit key to a
+ * position in a cache table, instead of the linear search done on every
+ * draw. Only the first insertion of a key is kept, as the linear search
+ * returns the first entry: same result. Power-of-2 capacity, at least twice
+ * the indexed table (never full). */
 typedef struct { uint64_t key; int pos1; } KIdx;            /* pos1 = position + 1, 0 = libre */
 static int kidx_find(const KIdx *t, unsigned cap, uint64_t key)
 {
@@ -146,16 +147,16 @@ static void kidx_put(KIdx *t, unsigned cap, uint64_t key, int pos)
 {
     unsigned h = (unsigned)(key ^ (key >> 29) ^ (key >> 47)) & (cap - 1);
     while (t[h].pos1) {
-        if (t[h].key == key) return;                        /* première insertion gardée */
+        if (t[h].key == key) return;                        /* first insertion kept */
         h = (h + 1) & (cap - 1);
     }
     t[h].key = key;
     t[h].pos1 = pos + 1;
 }
 
-/* XBOX_FIX_PUMP_ALT=1 (test d'identité) : les optimisations du pump ne
- * sont actives qu'une image présentée sur deux ; pendant une pause (scène
- * figée), toutes les images capturées doivent alors être identiques. */
+/* XBOX_FIX_PUMP_ALT=1 (identity test): the pump optimizations are active on
+ * one presented frame in two only; during a pause (frozen scene), every
+ * captured frame must then be identical. */
 static unsigned g_pump_frame;
 static int pump_alt_off(void)
 {
@@ -164,26 +165,47 @@ static int pump_alt_off(void)
     return alt && (g_pump_frame & 1u);
 }
 void d3d8_pump_frame_tick(void) { g_pump_frame++; }
-int  d3d8_pump_alt_off(void) { return pump_alt_off(); }   /* aussi pour le post */
+int  d3d8_pump_alt_off(void) { return pump_alt_off(); }   /* also used by the post */
 
 int d3d8_pump_state_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_STATE"); on = !(e && e[0] == '0');   /* défaut 1 (prouvé) */ }
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_STATE"); on = !(e && e[0] == '0');   /* default 1 (proven identical) */ }
     return on && !pump_alt_off();
 }
 
 int d3d8_pump_cb_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_CB"); on = !(e && e[0] == '0');   /* défaut 1 (prouvé) */ }
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_CB"); on = !(e && e[0] == '0');   /* default 1 (proven identical) */ }
     return on && !pump_alt_off();
+}
+
+/* XBOX_FIX_PUMP_ONEMAP (default 1; =0 previous path): one Map per GPU draw for its vertices and indices.
+ * Constant attributes (stride 0) that sit close together in guest memory are
+ * uploaded as one block through one input slot; vertex groups and indices go
+ * to one ring bound as both vertex and index buffer, written with a single
+ * Map; the input layout and vertex shader lookups first compare with the
+ * previous draw. Same bytes and formats reach the shaders.
+ * XBOX_FIX_PUMP_ONEMAP_ALT=1 (identity test): active on one presented frame
+ * in two only. XBOX_FIX_PUMP_ALT turns it off with the other optimizations. */
+int d3d8_pump_onemap_on(void)
+{
+    static int on = -1, alt = -1;
+    if (on < 0) {
+        const char *e = getenv("XBOX_FIX_PUMP_ONEMAP");
+        on = !(e && e[0] == '0');       /* default 1 (proven identical); 0 = previous path */
+        e = getenv("XBOX_FIX_PUMP_ONEMAP_ALT");
+        alt = e && e[0] == '1';
+        fprintf(stderr, "[PUMP] XBOX_FIX_PUMP_ONEMAP=%d%s\n", on, alt ? " (ALT: one frame in two)" : "");
+    }
+    return on && !(alt && (g_pump_frame & 1u)) && !pump_alt_off();
 }
 
 int d3d8_pump_cache_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_CACHE"); on = !(e && e[0] == '0');   /* défaut 1 (prouvé) */ }
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_CACHE"); on = !(e && e[0] == '0');   /* default 1 (proven identical) */ }
     return on && !pump_alt_off();
 }
 
@@ -244,18 +266,44 @@ int d3d8_nv2a_add_ps(unsigned long long key, const char *hlsl, int len)
     return 1;
 }
 
-/* XBOX_FIX_PUMP_CB : un seul anneau de constantes pour les draws
- * GPU. Chaque draw y écrit ses constantes (VS seulement si elles ont changé,
- * paramètres, PS) en un Map NO_OVERWRITE, et les lie par décalage
- * (VSSetConstantBuffers1 / PSSetConstantBuffers1), au lieu de trois
- * Map DISCARD sur trois petits tampons. Mêmes octets pour les shaders.
- * Il faut le runtime 11.1 et les options ConstantBufferOffsetting et
- * MapNoOverwriteOnDynamicConstantBuffer ; sinon, l'ancien chemin. */
+/* Buffer Maps of this file, counted for XBOX_PERF (Maps per GPU draw) and
+ * timed under XBOX_PERF_MAPTIME. Same calls as before otherwise. */
+static unsigned g_nv_maps;
+
+static HRESULT nv_map(ID3D11DeviceContext *ctx, ID3D11Resource *r, D3D11_MAP how, D3D11_MAPPED_SUBRESOURCE *m)
+{
+    unsigned long long t;
+    HRESULT hr;
+    g_nv_maps++;
+    if (!g_perf_maptime) return ID3D11DeviceContext_Map(ctx, r, 0, how, 0, m);
+    t = __rdtsc();
+    hr = ID3D11DeviceContext_Map(ctx, r, 0, how, 0, m);
+    g_perf_map_cyc += __rdtsc() - t;
+    return hr;
+}
+
+static void nv_unmap(ID3D11DeviceContext *ctx, ID3D11Resource *r)
+{
+    unsigned long long t;
+    if (!g_perf_maptime) { ID3D11DeviceContext_Unmap(ctx, r, 0); return; }
+    t = __rdtsc();
+    ID3D11DeviceContext_Unmap(ctx, r, 0);
+    g_perf_map_cyc += __rdtsc() - t;
+    g_perf_map_pairs++;
+}
+
+/* XBOX_FIX_PUMP_CB: a single constant ring for the GPU draws.
+ * Each draw writes its constants there (VS only if they changed, parameters,
+ * PS) with one Map NO_OVERWRITE, and binds them by offset
+ * (VSSetConstantBuffers1 / PSSetConstantBuffers1), instead of three
+ * Map DISCARD on three small buffers. Same bytes for the shaders.
+ * Needs the 11.1 runtime and the ConstantBufferOffsetting and
+ * MapNoOverwriteOnDynamicConstantBuffer options; otherwise, the old path. */
 #define CBR_SIZE (4u * 1024u * 1024u)
 static ID3D11Buffer *g_cbr;
 static ID3D11DeviceContext1 *g_ctx1;
 static UINT g_cbr_off, g_cbr_vsc_off;
-static unsigned g_cbr_gen;              /* +1 à chaque DISCARD : les constantes VS déjà écrites sont perdues */
+static unsigned g_cbr_gen;              /* +1 on each DISCARD: the VS constants already written are lost */
 static unsigned g_cbr_vsc_gen;
 
 extern int d3d8_pump_cb_on(void);
@@ -271,7 +319,7 @@ static int cbr_ready(ID3D11Device *dev, ID3D11DeviceContext *ctx)
         memset(&o, 0, sizeof o);
         if (FAILED(ID3D11Device_CheckFeatureSupport(dev, D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof o))
             || !o.ConstantBufferOffsetting || !o.MapNoOverwriteOnDynamicConstantBuffer) {
-            fprintf(stderr, "[PUMP] anneau de constantes indisponible (options 11.1) : ancien chemin\n");
+            fprintf(stderr, "[PUMP] constant ring unavailable (11.1 options): old path\n");
             return 0;
         }
         if (FAILED(ID3D11DeviceContext_QueryInterface(ctx, &IID_ID3D11DeviceContext1, (void **)&g_ctx1)))
@@ -284,15 +332,15 @@ static int cbr_ready(ID3D11Device *dev, ID3D11DeviceContext *ctx)
         if (FAILED(ID3D11Device_CreateBuffer(dev, &bd, NULL, &g_cbr))) return 0;
         g_cbr_off = CBR_SIZE;           /* premier Map = DISCARD */
         ok = 1;
-        fprintf(stderr, "[PUMP] anneau de constantes actif (%u Ko)\n", CBR_SIZE / 1024u);
+        fprintf(stderr, "[PUMP] constant ring active (%u KB)\n", CBR_SIZE / 1024u);
     }
     return ok;
 }
 
-#define CBR_ALIGN(n) (((n) + 255u) & ~255u)     /* décalages en multiples de 16 constantes */
+#define CBR_ALIGN(n) (((n) + 255u) & ~255u)     /* offsets in multiples of 16 constants */
 
-/* Écrit les constantes d'un draw et les lie ; les constantes VS ne sont recopiées
- * que si elles ont changé (ou si l'anneau a rebouclé depuis). */
+/* Writes the constants of a draw and binds them; the VS constants are copied
+ * only if they changed (or if the ring wrapped since). */
 static UINT g_cbr_par_first, g_cbr_par_num;
 
 static int cbr_draw(ID3D11DeviceContext *ctx, const void *vsc, int vsc_changed, UINT vsc_size,
@@ -312,7 +360,7 @@ static int cbr_draw(ID3D11DeviceContext *ctx, const void *vsc, int vsc_changed, 
         write_vsc = 1;
         need = a_vsc + a_par + a_psc;
     }
-    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_cbr, 0, how, 0, &m))) return 0;
+    if (FAILED(nv_map(ctx, (ID3D11Resource *)g_cbr, how, &m))) return 0;
     if (write_vsc) {
         memcpy((uint8_t *)m.pData + g_cbr_off, vsc, vsc_size);
         g_cbr_vsc_off = g_cbr_off;
@@ -321,11 +369,11 @@ static int cbr_draw(ID3D11DeviceContext *ctx, const void *vsc, int vsc_changed, 
     }
     o_par = g_cbr_off; memcpy((uint8_t *)m.pData + o_par, par, par_size); g_cbr_off += a_par;
     o_psc = g_cbr_off; memcpy((uint8_t *)m.pData + o_psc, psc, psc_size); g_cbr_off += a_psc;
-    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_cbr, 0);
+    nv_unmap(ctx, (ID3D11Resource *)g_cbr);
     bufs[0] = bufs[1] = g_cbr;
     first[0] = g_cbr_vsc_off / 16u; num[0] = a_vsc / 16u;
     first[1] = o_par / 16u;         num[1] = a_par / 16u;
-    g_cbr_par_first = first[1]; g_cbr_par_num = num[1];   /* le GS des points le lit aussi */
+    g_cbr_par_first = first[1]; g_cbr_par_num = num[1];   /* the points' GS reads it too */
     ID3D11DeviceContext1_VSSetConstantBuffers1(g_ctx1, 0, 2, bufs, first, num);
     first[0] = o_psc / 16u; num[0] = a_psc / 16u;
     ID3D11DeviceContext1_PSSetConstantBuffers1(g_ctx1, 0, 1, bufs, first, num);
@@ -335,10 +383,9 @@ static int cbr_draw(ID3D11DeviceContext *ctx, const void *vsc, int vsc_changed, 
 static void cb_write(ID3D11DeviceContext *ctx, ID3D11Buffer *b, const void *data, UINT size)
 {
     D3D11_MAPPED_SUBRESOURCE m;
-    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)b, 0,
-                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+    if (SUCCEEDED(nv_map(ctx, (ID3D11Resource *)b, D3D11_MAP_WRITE_DISCARD, &m))) {
         memcpy(m.pData, data, size);
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)b, 0);
+        nv_unmap(ctx, (ID3D11Resource *)b);
     }
 }
 
@@ -450,18 +497,38 @@ static uint64_t fnv64(uint64_t h, const void *p, size_t n)
 
 /* The shader for this program and these input kinds, compiled on first use.
  * A program that fails to compile is remembered, so it is not retried. */
+static int vsh_lookup(const Nv2aVshDraw *d, const uint8_t kind[16]);
+static struct { uint64_t hash; uint8_t kind[16]; int pts, vi; } g_vsh_last = { 0, {0}, 0, -1 };
+
 static int vsh_get(const Nv2aVshDraw *d)
+{
+    uint8_t kind[16];
+    int a, i;
+
+    for (a = 0; a < 16; a++) kind[a] = (d->inputs & (1u << a)) ? d->attr[a].kind : 0xFF;
+    /* Same program and input kinds as the previous lookup: same entry (each
+     * draw asks twice, and consecutive draws often share the program). */
+    if (d3d8_pump_onemap_on() && g_vsh_last.vi >= 0 && g_vsh_last.hash == d->prog_hash &&
+        g_vsh_last.pts == (d->topology == D3DPT_POINTLIST) && !memcmp(g_vsh_last.kind, kind, sizeof kind))
+        return g_vsh_last.vi;
+    i = vsh_lookup(d, kind);
+    g_vsh_last.vi = i;
+    g_vsh_last.hash = d->prog_hash;
+    g_vsh_last.pts = d->topology == D3DPT_POINTLIST;
+    memcpy(g_vsh_last.kind, kind, sizeof kind);
+    return i;
+}
+
+static int vsh_lookup(const Nv2aVshDraw *d, const uint8_t kind[16])
 {
     static char src[262144];
     ID3D11Device *dev = d3d8_GetD3D11Device();
-    uint8_t kind[16];
     uint64_t key = d->prog_hash;
     ID3D10Blob *code = NULL, *err = NULL;
     HRESULT hr;
-    int a, i, len;
+    int i, len;
 
-    for (a = 0; a < 16; a++) kind[a] = (d->inputs & (1u << a)) ? d->attr[a].kind : 0xFF;
-    key = fnv64(key, kind, sizeof kind);
+    key = fnv64(key, kind, 16);
     if (d->topology == D3DPT_POINTLIST) key = fnv64(key, "pts", 3);
     if (d3d8_pump_cache_on()) {
         i = kidx_find(g_vsh_idx, VSH_CACHE * 2, key);
@@ -509,7 +576,26 @@ static int vsh_get(const Nv2aVshDraw *d)
     return i;
 }
 
+static ID3D11InputLayout *il_lookup(int vi, const D3D11_INPUT_ELEMENT_DESC *el, int n);
+static struct { int vi, n; D3D11_INPUT_ELEMENT_DESC el[16]; ID3D11InputLayout *il; } g_il_last;
+
+/* The input layout for this shader and these elements; the same elements
+ * as the previous draw give the same layout without hashing them again. */
 static ID3D11InputLayout *il_get(int vi, const D3D11_INPUT_ELEMENT_DESC *el, int n)
+{
+    ID3D11InputLayout *il;
+    if (d3d8_pump_onemap_on() && g_il_last.il && g_il_last.vi == vi && g_il_last.n == n &&
+        !memcmp(g_il_last.el, el, (size_t)n * sizeof *el))
+        return g_il_last.il;
+    il = il_lookup(vi, el, n);
+    g_il_last.il = il;
+    g_il_last.vi = vi;
+    g_il_last.n = n;
+    memcpy(g_il_last.el, el, (size_t)n * sizeof *el);
+    return il;
+}
+
+static ID3D11InputLayout *il_lookup(int vi, const D3D11_INPUT_ELEMENT_DESC *el, int n)
 {
     ID3D11Device *dev = d3d8_GetD3D11Device();
     uint64_t key = fnv64(14695981039346656037ull, &vi, sizeof vi);
@@ -555,13 +641,45 @@ static UINT ib_upload(ID3D11DeviceContext *ctx, const uint32_t *idx, UINT n)
     }
     if (size > IB_RING_SIZE) return (UINT)-1;
     if (g_ib_off + size > IB_RING_SIZE) { g_ib_off = 0; how = D3D11_MAP_WRITE_DISCARD; }
-    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_ib_ring, 0, how, 0, &m)))
+    if (FAILED(nv_map(ctx, (ID3D11Resource *)g_ib_ring, how, &m)))
         return (UINT)-1;
     off = g_ib_off;
     memcpy((uint8_t *)m.pData + off, idx, size);
-    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_ib_ring, 0);
+    nv_unmap(ctx, (ID3D11Resource *)g_ib_ring);
     g_ib_off = (off + size + 15u) & ~15u;
     return off;
+}
+
+/* XBOX_FIX_PUMP_ONEMAP: one ring for the vertex groups and the indices of a
+ * draw (bound as both vertex and index buffer), written by one Map once the
+ * whole size is known -- a wrap (DISCARD) can never fall between two uploads
+ * of one draw. NO_OVERWRITE otherwise, as the other rings. */
+#define VI_RING_SIZE (48u * 1024u * 1024u)
+static ID3D11Buffer *g_vi_ring;
+static UINT g_vi_off;
+
+static uint8_t *vi_ring_map(ID3D11DeviceContext *ctx, UINT size, UINT *off)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
+    if (!g_vi_ring) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = VI_RING_SIZE;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL, &g_vi_ring)))
+            return NULL;
+        g_vi_off = VI_RING_SIZE;        /* first Map = DISCARD */
+    }
+    if (size > VI_RING_SIZE) return NULL;
+    if (g_vi_off + size > VI_RING_SIZE) { g_vi_off = 0; how = D3D11_MAP_WRITE_DISCARD; }
+    if (FAILED(nv_map(ctx, (ID3D11Resource *)g_vi_ring, how, &m)))
+        return NULL;
+    *off = g_vi_off;
+    g_vi_off = (g_vi_off + size + 15u) & ~15u;
+    return (uint8_t *)m.pData + *off;
 }
 
 /* Point sprites on the GPU. The CPU path turned each point into
@@ -697,7 +815,7 @@ static int pc_init(void)
         if (FAILED(ID3D11Device_CreateQuery(dev, &qd, &g_so_q))) return 0;
     }
     failed = 0;
-    fprintf(stderr, "[PTSCHECK] comparaison CPU / GPU des points active\n");
+    fprintf(stderr, "[PTSCHECK] CPU / GPU point comparison active\n");
     return 1;
 }
 
@@ -761,9 +879,9 @@ static void pc_compare(ID3D11DeviceContext *ctx, float sw, float sh)
             if (dp > g_pcs.dpix) g_pcs.dpix = dp;
             if (da > g_pcs.dattr) g_pcs.dattr = da;
             if ((dp > 1.0 / 256.0 || da > 1.0 / 512.0) && g_pcs.pix_over++ < 4) {
-                fprintf(stderr, "[PTSCHECK] écart visible %.4g px, attributs %.4g : GPU", dp, da);
+                fprintf(stderr, "[PTSCHECK] visible gap %.4g px, attributes %.4g: GPU", dp, da);
                 for (k = 0; k < PC_FLOATS; k++) fprintf(stderr, " %.9g", g[k]);
-                fprintf(stderr, "\n[PTSCHECK]   CPU x %.9g y %.9g rhw %.9g, attributs", c[0], c[1], c[3]);
+                fprintf(stderr, "\n[PTSCHECK]   CPU x %.9g y %.9g rhw %.9g, attributes", c[0], c[1], c[3]);
                 for (k = 4; k < PC_FLOATS; k++) fprintf(stderr, " %.9g", ref[k]);
                 fprintf(stderr, "\n");
             } else if (dp > 1.0 / 256.0 || da > 1.0 / 512.0) {
@@ -772,9 +890,9 @@ static void pc_compare(ID3D11DeviceContext *ctx, float sw, float sh)
         }
         if (!memcmp(g, ref, sizeof ref)) g_pcs.exact++;
         else if (g_pcs.verts - g_pcs.exact < 3) {
-            fprintf(stderr, "[PTSCHECK] sommet différent : GPU");
+            fprintf(stderr, "[PTSCHECK] different vertex: GPU");
             for (k = 0; k < PC_FLOATS; k++) fprintf(stderr, " %.9g", g[k]);
-            fprintf(stderr, "\n[PTSCHECK]                    CPU");
+            fprintf(stderr, "\n[PTSCHECK]                   CPU");
             for (k = 0; k < PC_FLOATS; k++) fprintf(stderr, " %.9g", ref[k]);
             fprintf(stderr, "\n");
         }
@@ -782,8 +900,8 @@ static void pc_compare(ID3D11DeviceContext *ctx, float sw, float sh)
     }
     ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_so_stage, 0);
     if ((g_pcs.draws % 100) == 1)
-        fprintf(stderr, "[PTSCHECK] %llu draws, %llu sommets : %llu identiques au bit, écart max %.3g px "
-                "sur %llu visibles (%llu > 1/256 px ou attribut > 1/512), attributs %.3g ; ordre dans le triangle %llu ; nombre de sommets différent %llu, ignorés %llu\n",
+        fprintf(stderr, "[PTSCHECK] %llu draws, %llu vertices: %llu bit identical, max gap %.3g px "
+                "over %llu visible (%llu > 1/256 px or attribute > 1/512), attributes %.3g; order in the triangle %llu; different vertex count %llu, skipped %llu\n",
                 g_pcs.draws, g_pcs.verts, g_pcs.exact, g_pcs.dpix, g_pcs.visible, g_pcs.pix_over, g_pcs.dattr, g_pcs.rotated,
                 g_pcs.count_bad, g_pcs.skipped);
 }
@@ -800,6 +918,10 @@ int d3d8_nv2a_vsh_ready(const Nv2aVshDraw *d)
     return nv_init() && (d->topology != D3DPT_POINTLIST || gs_init()) && vsh_get(d) >= 0;
 }
 
+/* Largest block of constant attributes uploaded together (ONEMAP); far
+ * below the 2048-byte limit of AlignedByteOffset. */
+#define ZS_WINDOW 256u
+
 int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
@@ -807,17 +929,19 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     ID3D11PixelShader *ps = ps_find(d->ps_key);
     D3D11_INPUT_ELEMENT_DESC el[16];
     struct { const uint8_t *base; UINT stride, size; } grp[16];
-    ID3D11Buffer *vbs[16], *cbs[2];
+    ID3D11Buffer *vbs[16], *cbs[2], *ib_buf;
     UINT strides[16], offs[16], ib_off;
     ID3D11InputLayout *il;
     D3D11_PRIMITIVE_TOPOLOGY topo;
     int vi, a, g, ngrp = 0, nel = 0;
     uint16_t done = 0;
-    struct { float screen[4], fog[4], flags[4], vattr[16][4], point[4]; } params;
+    struct { float screen[4], fog[4], flags[4], vattr[16][4], point[4], hud[4]; } params;
     double pt = 0.0;                    /* sous-zones XBOX_PERF */
-    int use_cbr, vsc_changed = 0;       /* anneau de constantes */
+    int use_cbr, vsc_changed = 0;       /* constant ring */
     static int g_cbr_was;
     int points = d->topology == D3DPT_POINTLIST;
+    unsigned maps0 = g_nv_maps;         /* XBOX_PERF: Maps of this draw */
+    int onemap = d3d8_pump_onemap_on();
 
     if (!ctx || !dev || !ps || !d->nindices || !nv_init()) return 0;
     switch (d->topology) {
@@ -847,11 +971,22 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
         if (best < 0) break;
         done |= (uint16_t)(1u << best);
         a = best;
-        for (g = 0; g < ngrp; g++)
+        for (g = 0; g < ngrp; g++) {
             if (grp[g].stride == d->attr[a].stride && grp[g].stride &&
                 d->attr[a].base >= grp[g].base &&
                 (UINT)(d->attr[a].base - grp[g].base) < grp[g].stride)
                 break;
+            /* ONEMAP: a constant attribute (stride 0) joins a constant group
+             * that starts at most ZS_WINDOW bytes before its end, both read
+             * straight from guest memory (so the bytes between them are
+             * mapped too). Same element, same format, at its offset in the
+             * block: the shader reads the same bytes. */
+            if (onemap && !grp[g].stride && !d->attr[a].stride &&
+                d->attr[a].base >= grp[g].base && d->mem_lo &&
+                grp[g].base >= d->mem_lo && d->attr[a].base + d->attr[a].bytes <= d->mem_hi &&
+                (UINT)(d->attr[a].base - grp[g].base) + d->attr[a].bytes <= ZS_WINDOW)
+                break;
+        }
         if (g == ngrp) {
             grp[g].base = d->attr[a].base;
             grp[g].stride = d->attr[a].stride;
@@ -872,20 +1007,47 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
         }
     }
     if (g_perf_on) pt = perf_now();
-    {
-        UINT total = 0;
-        for (g = 0; g < ngrp; g++) total += grp[g].size;
-        d3d8_UpRingReserve(total, (UINT)ngrp);
+    if (onemap) {                       /* every group, then the indices, in one Map */
+        UINT rel[16], total = 0, ib_rel, base;
+        uint8_t *w;
+        for (g = 0; g < ngrp; g++) {
+            rel[g] = total;
+            total = (total + grp[g].size + 15u) & ~15u;
+        }
+        ib_rel = total;
+        total += d->nindices * 4u;
+        w = vi_ring_map(ctx, total, &base);
+        if (!w) return 0;
+        for (g = 0; g < ngrp; g++) {
+            memcpy(w + rel[g], grp[g].base, grp[g].size);
+            vbs[g] = g_vi_ring;
+            offs[g] = base + rel[g];
+            strides[g] = grp[g].stride;
+        }
+        memcpy(w + ib_rel, d->indices, d->nindices * 4u);
+        nv_unmap(ctx, (ID3D11Resource *)g_vi_ring);
+        ib_buf = g_vi_ring;
+        ib_off = base + ib_rel;
+        il = nel ? il_get(vi, el, nel) : NULL;
+        if (nel && !il) return 0;
+    } else {
+        {
+            UINT total = 0;
+            for (g = 0; g < ngrp; g++) total += grp[g].size;
+            d3d8_UpRingReserve(total, (UINT)ngrp);
+        }
+        for (g = 0; g < ngrp; g++) {
+            offs[g] = d3d8_UpRingUpload(grp[g].base, grp[g].size, &vbs[g]);
+            g_nv_maps++;
+            if (offs[g] == (UINT)-1 || !vbs[g]) return 0;
+            strides[g] = grp[g].stride;
+        }
+        il = nel ? il_get(vi, el, nel) : NULL;
+        if (nel && !il) return 0;
+        ib_off = ib_upload(ctx, d->indices, d->nindices);
+        if (ib_off == (UINT)-1) return 0;
+        ib_buf = g_ib_ring;
     }
-    for (g = 0; g < ngrp; g++) {
-        offs[g] = d3d8_UpRingUpload(grp[g].base, grp[g].size, &vbs[g]);
-        if (offs[g] == (UINT)-1 || !vbs[g]) return 0;
-        strides[g] = grp[g].stride;
-    }
-    il = nel ? il_get(vi, el, nel) : NULL;
-    if (nel && !il) return 0;
-    ib_off = ib_upload(ctx, d->indices, d->nindices);
-    if (ib_off == (UINT)-1) return 0;
     if (g_perf_on) { double t = perf_now(); perf_add(PZ_DUP, t - pt); pt = t; }
 
     use_cbr = d3d8_pump_cb_on() && cbr_ready(dev, ctx);
@@ -895,7 +1057,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
         vsc_changed = 1;
         g_vsc_valid = 1;
     }
-    if (use_cbr != g_cbr_was) {         /* changement de chemin : tout réécrire */
+    if (use_cbr != g_cbr_was) {         /* path change: rewrite everything */
         if (!use_cbr) cb_write(ctx, g_vsc_cb, g_vsc_last, sizeof g_vsc_last);
         vsc_changed = 1;
         g_cbr_was = use_cbr;
@@ -914,6 +1076,10 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     params.point[1] = d->point_size;
     params.point[2] = d->point_smooth ? 1.0f : 0.0f;
     params.point[3] = d->point_kx;
+    params.hud[0] = d->hud_kx;
+    params.hud[1] = d->hud_ax;
+    params.hud[2] = d->hud_ky;
+    params.hud[3] = d->hud_ay;
     if (d->attr_const) memcpy(params.vattr, d->attr_const, sizeof params.vattr);
     if (!use_cbr) cb_write(ctx, g_vsp_cb, &params, sizeof params);
 
@@ -935,7 +1101,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     nv_set_raster(ctx, dev, d->raster);
     if (ngrp) ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, (UINT)ngrp, vbs, strides, offs);
     ID3D11DeviceContext_IASetInputLayout(ctx, il);
-    ID3D11DeviceContext_IASetIndexBuffer(ctx, g_ib_ring, DXGI_FORMAT_R32_UINT, ib_off);
+    ID3D11DeviceContext_IASetIndexBuffer(ctx, ib_buf, DXGI_FORMAT_R32_UINT, ib_off);
     ID3D11DeviceContext_IASetPrimitiveTopology(ctx, topo);
     ID3D11DeviceContext_VSSetShader(ctx, g_vsh[vi].vs, NULL, 0);
     if (!use_cbr) {
@@ -945,10 +1111,10 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     }
     ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
     if (!use_cbr) ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_ps_cb);
-    if (points) {                       /* carrés des points */
+    if (points) {                       /* point squares */
         int chk = g_pc_ref && pc_init();
         ID3D11DeviceContext_GSSetShader(ctx, chk ? g_gs_so : g_gs, NULL, 0);
-        if (use_cbr)                    /* Params : le même bloc que le VS */
+        if (use_cbr)                    /* Params: the same block as the VS */
             ID3D11DeviceContext1_GSSetConstantBuffers1(g_ctx1, 1, 1, &g_cbr, &g_cbr_par_first, &g_cbr_par_num);
         else
             ID3D11DeviceContext_GSSetConstantBuffers(ctx, 1, 1, &g_vsp_cb);
@@ -969,13 +1135,13 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
         g_pc_ref = NULL;
         /* Every other draw of the device runs without a geometry shader. */
         ID3D11DeviceContext_GSSetShader(ctx, NULL, NULL, 0);
-        if (g_perf_on) perf_add(PZ_DDRAW, perf_now() - pt);
+        if (g_perf_on) { perf_add(PZ_DDRAW, perf_now() - pt); perf_gpu_draw(g_nv_maps - maps0, (unsigned)ngrp); }
         return 1;
     }
     if (g_perf_on) { double t = perf_now(); perf_add(PZ_DSTATE, t - pt); pt = t; }
     if (g_gpuprof_on) gpuprof_draw_begin();
     ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0);
     if (g_gpuprof_on) gpuprof_draw_end();
-    if (g_perf_on) perf_add(PZ_DDRAW, perf_now() - pt);
+    if (g_perf_on) { perf_add(PZ_DDRAW, perf_now() - pt); perf_gpu_draw(g_nv_maps - maps0, (unsigned)ngrp); }
     return 1;
 }

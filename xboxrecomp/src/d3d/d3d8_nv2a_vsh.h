@@ -39,6 +39,9 @@ typedef struct {
         const uint8_t  *base;           /* host address of vertex `lo`'s element */
         uint32_t        bytes;          /* readable bytes from base (whole range) */
     } attr[16];
+    /* Guest memory as one flat host range [mem_lo, mem_hi): attribute bases
+     * inside it point straight at guest memory (others at per-draw copies). */
+    const uint8_t     *mem_lo, *mem_hi;
     const float      (*attr_const)[4];  /* values of attributes with no array */
     const float      (*vconst)[4];      /* the 192 program constants */
     float              screen_w, screen_h, clip_max;
@@ -53,6 +56,9 @@ typedef struct {
     int                point_smooth;
     float              point_kx;        /* half-width factor (round sprites), 1 = square */
     float              point_zoom;      /* oPts scale (narrowed field of view), 1 = none */
+    /* Race HUD element: x' = ax + (x - ax) * kx, y' = ay + (y - ay) * ky,
+     * title pixels ; kx 0 = none. */
+    float              hud_kx, hud_ax, hud_ky, hud_ay;
     const uint32_t    *indices;         /* rebased: 0 = vertex `lo` */
     uint32_t           nindices;
     unsigned long long ps_key;

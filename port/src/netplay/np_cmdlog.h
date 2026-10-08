@@ -1,100 +1,98 @@
 /*
- * np_cmdlog -- journal des commandes et de l'état des riders (fork).
+ * np_cmdlog -- log of the riders' commands and state.
  *
- * Première brique du multijoueur, SANS réseau : à chaque tick de
- * course, le mot de commande 32 bits de chaque rider et son état clé sont
- * écrits dans un fichier binaire rejouable. Les hooks ne changent rien :
- * ils appellent toujours l'original et lisent après.
+ * First building block of multiplayer, WITHOUT network: on each race tick,
+ * the 32-bit command word of every rider and its key state are written to a
+ * replayable binary file. The hooks change nothing: they always call the
+ * original and read afterwards.
  *
- * ── Interrupteur (variable d'environnement, lue une fois au démarrage)
+ * ── Switch (environment variable, read once at start)
  *
- *   XBOX_NETLOG absent / "0"  OFF (défaut). recomp_lookup_manual() ne renvoie
- *                             aucun des hooks : chemin d'origine intact.
- *   XBOX_NETLOG=1             JOURNAL. Un fichier par course :
- *                             <_local>/netlog/cmdlog_<AAAAMMJJ_HHMMSS>_<n>.npcl
- *   XBOX_NETLOG_DIR           dossier de sortie (défaut : le « _local » le plus
- *                             haut en remontant depuis l'exe, + \netlog ; sinon
- *                             le dossier de l'exe).
+ *   XBOX_NETLOG unset / "0"   OFF (default). recomp_lookup_manual() returns
+ *                             none of the hooks: original path unchanged.
+ *   XBOX_NETLOG=1             LOG. One file per race:
+ *                             <_local>/netlog/cmdlog_<YYYYMMDD_HHMMSS>_<n>.npcl
+ *   XBOX_NETLOG_DIR           output folder (default: the highest "_local"
+ *                             found walking up from the exe, + \netlog; else
+ *                             the exe's folder).
  *
- * ── Les hooks (conventions vérifiées dans les octets)
+ * ── The hooks (conventions checked in the bytes)
  *
- *   La commande est demandée une fois par rider et par tick par
- *   Rider_UpdatePhysicsState (0x36990), site 0x36F7F :
+ *   The command is requested once per rider and per tick by
+ *   Rider_UpdatePhysicsState (0x36990), call site 0x36F7F:
  *       push &cmd ; ecx = rider ; call [ [rider] + 0x24 ]   (RECOMP_ICALL_SAFE)
- *   puis consommée par 0x31640 (dispatch sur rider+0x458, voir plus bas).
+ *   then consumed by 0x31640 (dispatch on rider+0x458, see below).
  *
- *   0x0005BEB0  commande du Player (manette)   slot +0x24 de la vtable 0x189ED0
- *   0x00048C40  commande des OtherRider (IA)   slot +0x24 de la vtable 0x188D50
+ *   0x0005BEB0  Player command (pad)          slot +0x24 of vtable 0x189ED0
+ *   0x00048C40  OtherRider command (AI)       slot +0x24 of vtable 0x188D50
  *
- *   Les deux : thiscall, 1 argument (pointeur vers le mot de commande, 4
- *   octets, mis à 0 puis rempli par l'original), ret 4. Ce sont des THUNKS
- *   d'ajustement (`sub ecx,[ecx-4]` puis jmp 0x5AA30 / 0x48AB0) : le ecx
- *   d'ENTRÉE (celui que lit le hook) est le pointeur du sous-objet Rider
- *   AVANT ajustement, c'est-à-dire exactement la valeur rangée dans
- *   race+0xC4[i] (vérifié au runtime : esi au site d'appel = ces
- *   entrées). Seules références : leurs vtables -> lookup_manual voit
- *   100 % des appels.
- *   Règles : lire ecx et l'argument AVANT l'original (il dépile 4 octets) ;
- *   après l'original, lire le mot ; g_eax/g_ecx/g_edx restaurés autour du
- *   journal ; pile contrôlée (entrée + 4 + 4, sinon compteur esp_bad).
+ *   Both: thiscall, 1 argument (pointer to the command word, 4 bytes, zeroed
+ *   then filled by the original), ret 4. They are adjustor THUNKS
+ *   (`sub ecx,[ecx-4]` then jmp 0x5AA30 / 0x48AB0): the ENTRY ecx (the one
+ *   the hook reads) is the Rider sub-object pointer BEFORE adjustment, i.e.
+ *   exactly the value stored in race+0xC4[i] (checked at runtime: esi at the
+ *   call site = these entries). Only references: their vtables ->
+ *   lookup_manual sees 100 % of the calls.
+ *   Rules: read ecx and the argument BEFORE the original (it pops 4 bytes);
+ *   after the original, read the word; g_eax/g_ecx/g_edx restored around the
+ *   log; stack checked (entry + 4 + 4, else counter esp_bad).
  *
- * ── Mesuré
- *   Thread : tous les appels arrivent sur UN thread, celui de RenderFrame
- *     pendant la course (vérifié avec XBOX_PASS_TAGS=log en parallèle) : l'update
- *     physique et le rendu sont séquentiels sur le thread du jeu.
- *   Tick : 1 appel par rider et par tick ; race+0x18 avance de 1 par tick (FAIT).
- *   U2 : le jeu RATTRAPE. La simulation tient 60 ticks/s de temps réel quand
- *     l'affichage ralentit (plusieurs ticks entre deux Present, jamais un
- *     Present sans tick) ; sous très forte charge (16 Present/s) elle tombe à
- *     ~52 ticks/s (jusqu'à 10 ticks par Present observés).
+ * ── Measured
+ *   Thread: every call comes on ONE thread, the RenderFrame one during the
+ *     race (checked with XBOX_PASS_TAGS=log alongside): the physics update
+ *     and the render are sequential on the game thread.
+ *   Tick: 1 call per rider and per tick; race+0x18 goes up by 1 per tick.
+ *   U2: the game CATCHES UP. The simulation holds 60 ticks/s of real time
+ *     when the display slows down (several ticks between two Presents, never
+ *     a Present without a tick); under very heavy load (16 Presents/s) it
+ *     drops to ~52 ticks/s (up to 10 ticks per Present observed).
 
- * ── Offsets utilisés (sous-objet Rider sauf mention)
+ * ── Offsets used (Rider sub-object unless stated; status)
  *
- *   objet course  race = [[0x1E3C7C]+0x72C]+0x1C                     FAIT
- *     race+0x88   nombre de riders                                   FAIT (runtime 6)
- *     race+0xC4[] pointeurs des sous-objets Rider                    FAIT
- *     race+0x7C / +0x80  nombre de Players / d'IA                    FAIT (runtime 1/5)
- *     race+0x18   compteur de frames de course                       DÉDUIT (vérifié par l'outil)
- *     race+0x1C   état de course (4 = Race)                          DÉDUIT
- *   roster 0x1DE900, pas 0x98, nombre [0x1DE8FC]                     FAIT
- *   graines RNG : [0x1DEC98] (par course), [0x1DEC9C] (chargement)   FAIT
- *   piste [0x1DEC90], mode de jeu [0x1DEC94]                         DÉDUIT (notes upstream)
- *   rider+0x170..+0x178  position                                    FAIT (notes + runtime)
- *   rider+0x180..+0x188  vitesse                                     FAIT (notes)
- *   rider+0x458  état / mode du rider : clé du switch des deux
- *                générateurs de commande ET de 0x31640              FAIT
- *   rider+0x15C  facteur de vitesse (écrit par l'IA)                 FAIT écriture / DÉDUIT rôle
- *   clé de 0x31640 : lue exactement comme 0x31640 la lit, m = [rider+0x58E0],
- *     key = [m + [[m+0x30]+4] + 0x488]. CORRECTION (une première lecture disait
- *     « mode physique rider+0x488 ») : l'offset 0x488 est relatif à
- *     l'objet complet (base virtuelle à +0x30), donc la clé est
- *     rider+0x458 ; le drapeau NPCL_F_MODE_IS_458 le vérifie à chaque
- *     enregistrement (100 % des 116 280 enregistrements d'une course mesurée).
+ *   race object   race = [[0x1E3C7C]+0x72C]+0x1C                     MEASURED
+ *     race+0x88   number of riders                                   MEASURED (runtime 6)
+ *     race+0xC4[] pointers to the Rider sub-objects                  MEASURED
+ *     race+0x7C / +0x80  number of Players / AIs                     MEASURED (runtime 1/5)
+ *     race+0x18   race frame counter                                 INFERRED (checked by the tool)
+ *     race+0x1C   race state (4 = Race)                              INFERRED
+ *   roster 0x1DE900, stride 0x98, count [0x1DE8FC]                   MEASURED
+ *   RNG seeds: [0x1DEC98] (per race), [0x1DEC9C] (load)              MEASURED
+ *   track [0x1DEC90], game mode [0x1DEC94]                           INFERRED (upstream notes)
+ *   rider+0x170..+0x178  position                                    MEASURED (notes + runtime)
+ *   rider+0x180..+0x188  velocity                                    MEASURED (notes)
+ *   rider+0x458  rider state / mode: switch key of both command
+ *                generators AND of 0x31640                          MEASURED
+ *   rider+0x15C  speed factor (written by the AI)                    write MEASURED / role INFERRED
+ *   key of 0x31640: read exactly as 0x31640 reads it, m = [rider+0x58E0],
+ *     key = [m + [[m+0x30]+4] + 0x488]. The 0x488 offset is relative to the
+ *     full object (virtual base at +0x30), so the key is rider+0x458 (not
+ *     a "physics mode at rider+0x488"); the NPCL_F_MODE_IS_458 flag checks
+ *     it on every record (100 % of 116,280 records in one run).
  *
- * ── Format du fichier .npcl (petit-boutiste, tout en uint32 sauf mention)
+ * ── .npcl file format (little endian, all uint32 unless stated)
  *
- *   En-tête :
- *     magic 'NPCL' (0x4C43504E), version (1), taille de l'en-tête en octets,
- *     taille d'un enregistrement (56), piste, mode de jeu, graine 0x1DEC98,
- *     graine 0x1DEC9C, adresse de l'objet course, nombre de riders n (<= 16),
- *     nombre de Players, nombre d'IA, n pointeurs de sous-objets Rider
- *     (race+0xC4[]), nombre d'entrées de roster r (<= 16), r x 0x98 octets
- *     bruts du roster, 2 dwords de réserve (0). Taille = 4 x (15 + n) + 0x98 x r.
- *   Puis des enregistrements de 56 octets (struct npcl_record ci-dessous),
- *   un par appel de commande, dans l'ordre des appels.
- *   v3 : à chaque changement de race+0x1C, au premier appel de commande du
- *   tick et AVANT l'original, deux enregistrements « RNG » : kind
- *   NPCL_KIND_RNG_A / NPCL_KIND_RNG_B, idx 0xFE, cmd = race_state, et les 6
- *   dwords de l'état RNG dans pos[0..2] puis vel[0..2] (bits bruts). Les
- *   outils doivent ignorer idx 0xFE dans les statistiques par rider.
+ *   Header:
+ *     magic 'NPCL' (0x4C43504E), version (1), header size in bytes, record
+ *     size (56), track, game mode, seed 0x1DEC98, seed 0x1DEC9C, address of
+ *     the race object, number of riders n (<= 16), number of Players, number
+ *     of AIs, n Rider sub-object pointers (race+0xC4[]), number of roster
+ *     entries r (<= 16), r x 0x98 raw roster bytes, 2 reserved dwords (0).
+ *     Size = 4 x (15 + n) + 0x98 x r.
+ *   Then 56-byte records (struct npcl_record below), one per command call,
+ *   in call order.
+ *   v3: on each change of race+0x1C, on the first command call of the tick
+ *   and BEFORE the original, two "RNG" records: kind NPCL_KIND_RNG_A /
+ *   NPCL_KIND_RNG_B, idx 0xFE, cmd = race_state, and the 6 dwords of the RNG
+ *   state in pos[0..2] then vel[0..2] (raw bits). Tools must skip idx 0xFE in
+ *   per-rider statistics.
  *
- *   tick : compteur propre au journal, +1 quand un rider déjà vu dans le tick
- *   courant redemande sa commande (donc un tick = un passage de
- *   Rider_UpdatePhysicsState sur les riders). present : d3d8_PresentSeq() au
- *   moment de l'appel (sert à la mesure U2). Nouveau fichier quand l'objet
- *   course change ou que race+0x18 recule.
+ *   tick: the log's own counter, +1 when a rider already seen in the current
+ *   tick asks for its command again (so one tick = one pass of
+ *   Rider_UpdatePhysicsState over the riders). present: d3d8_PresentSeq() at
+ *   the time of the call (used for the U2 measurement). New file when the
+ *   race object changes or race+0x18 goes back.
  *
- *   Outil : port/tools/np_cmdlog_dump.py (CSV + PNG des trajectoires + U2).
+ *   Tool: port/tools/np_cmdlog_dump.py (CSV + PNG of the paths + U2).
  */
 #ifndef NP_CMDLOG_H
 #define NP_CMDLOG_H
@@ -102,46 +100,46 @@
 #include <stdint.h>
 
 #define NPCL_MAGIC        0x4C43504Eu   /* "NPCL" */
-#define NPCL_VERSION      3u   /* 2 : phys_mode = clé exacte de 0x31640 ; 3 : événements RNG */
+#define NPCL_VERSION      3u   /* 2: phys_mode = exact key of 0x31640; 3: RNG events */
 #define NPCL_MAX_RIDERS   16u
 #define NPCL_ROSTER_STRIDE 0x98u
 
 /* kind */
 #define NPCL_KIND_PLAYER  0u
 #define NPCL_KIND_AI      1u
-#define NPCL_KIND_RNG_A   2u   /* v3 : état RNG global (0x1FAD70) */
-#define NPCL_KIND_RNG_B   3u   /* v3 : état RNG « course » (0x1FAD88) */
+#define NPCL_KIND_RNG_A   2u   /* v3: global RNG state (0x1FAD70) */
+#define NPCL_KIND_RNG_B   3u   /* v3: "race" RNG state (0x1FAD88) */
 
-#define NPCL_RNG_A_VA     0x001FAD70u   /* 6 dwords, semé à l'horloge au boot */
-#define NPCL_RNG_B_VA     0x001FAD88u   /* 6 dwords, re-semé par course depuis [0x1DEC98] */
+#define NPCL_RNG_A_VA     0x001FAD70u   /* 6 dwords, seeded from the clock at boot */
+#define NPCL_RNG_B_VA     0x001FAD88u   /* 6 dwords, reseeded per race from [0x1DEC98] */
 /* flags */
-#define NPCL_F_MODE_IS_458 0x01u        /* la clé de 0x31640 est bien rider+0x458 */
-#define NPCL_F_IDX_UNKNOWN 0x02u        /* rider absent de race+0xC4[] */
+#define NPCL_F_MODE_IS_458 0x01u        /* the key of 0x31640 is indeed rider+0x458 */
+#define NPCL_F_IDX_UNKNOWN 0x02u        /* rider missing from race+0xC4[] */
 
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t tick;          /* compteur du journal (voir en-tête) */
+    uint32_t tick;          /* log counter (see header) */
     uint32_t race_frame;    /* race+0x18 */
     uint32_t present;       /* d3d8_PresentSeq() */
-    uint8_t  idx;           /* index dans race+0xC4[], 0xFF si inconnu */
-    uint8_t  kind;          /* NPCL_KIND_* (selon le hook) */
+    uint8_t  idx;           /* index in race+0xC4[], 0xFF if unknown */
+    uint8_t  kind;          /* NPCL_KIND_* (by hook) */
     uint8_t  flags;         /* NPCL_F_* */
     uint8_t  race_state;    /* race+0x1C (octet bas) */
-    uint32_t cmd;           /* mot de commande après l'original */
+    uint32_t cmd;           /* command word after the original */
     float    pos[3];        /* rider+0x170 */
     float    vel[3];        /* rider+0x180 */
     uint32_t ev_state;      /* rider+0x458 */
     float    speed_factor;  /* rider+0x15C */
-    uint32_t phys_mode;     /* clé du switch de 0x31640 (= rider+0x458) */
+    uint32_t phys_mode;     /* switch key of 0x31640 (= rider+0x458) */
 } npcl_record;
 
-/* Instantanés d'état du Player, fichier .npst à côté du .npcl
- * (XBOX_NETLOG_STATE=1). En-tête : magic 'NPST', version 1, taille d'un
- * bloc (NPST_BLOCK), index du Player dans race+0xC4[]. Puis, à chaque tick
- * où le Player demande sa commande (même point que les enregistrements
- * .npcl, après l'original) : npst_record puis NPST_BLOCK octets bruts du
- * sous-objet Rider, à partir de son offset 0. Sert aux corrections d'état
- * du ghost (np_ghost.h, XBOX_GHOST_STATE) et à l'inventaire des champs. */
+/* Player state snapshots, .npst file next to the .npcl
+ * (XBOX_NETLOG_STATE=1). Header: magic 'NPST', version 1, block size
+ * (NPST_BLOCK), index of the Player in race+0xC4[]. Then, on each tick where
+ * the Player asks for its command (same point as the .npcl records, after
+ * the original): npst_record then NPST_BLOCK raw bytes of the Rider
+ * sub-object, from its offset 0. Used for the ghost's state corrections
+ * (np_ghost.h, XBOX_GHOST_STATE) and for the field inventory. */
 #define NPST_MAGIC   0x5453504Eu   /* "NPST" */
 #define NPST_VERSION 1u
 #define NPST_BLOCK   0x5A00u

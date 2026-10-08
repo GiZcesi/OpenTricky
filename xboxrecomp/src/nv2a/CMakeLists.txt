@@ -8,6 +8,8 @@
 add_library(xbox_nv2a STATIC
     nv2a_core.c
     nv2a_pgraph_d3d11.c
+    nv2a_hdtex.c
+    nv2a_btnicons.c
     nv2a_vsh_cpu.c
     nv2a_psh.c
     nv2a_pb_replay.c

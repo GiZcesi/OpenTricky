@@ -965,7 +965,7 @@ class Lifter:
         if m == "pop":
             return self._lift_pop(insn, ops)
         if m in ("pushal", "pushad"):
-            # Emitted as a TODO until part 183, so the popal that pairs with
+            # Once emitted as a TODO, so the popal that pairs with
             # it never restored anything: sub_001033D0 (board shadow
             # silhouettes) kept a clobbered ebp after its SSE loop, read its
             # object from the wrong frame and wrote a byte per triangle
@@ -1052,7 +1052,7 @@ class Lifter:
             # The direction flag, tracked statically within the function:
             # both std sites in SSX are straight-line std / string op / cld
             # (strrchr, memmove's backward copy), and emitting them as
-            # comments made both run forwards (part 183 -- every hard-disk
+            # comments made both run forwards (every hard-disk
             # save failed). Blocks are lifted in address order, so this is
             # exact for that idiom.
             self._df_state()
@@ -1667,8 +1667,8 @@ class Lifter:
         # XMM registers are recomp_xmm_t (recomp_types.h): .f low float lane,
         # .d low double, .l[4]/.u[4] packed lanes, .x all 16 bytes. They used
         # to be declared `float`, which moved 4 of 16 bytes on every movaps and
-        # had no packed arithmetic at all; part 47 fixed the generated tree by
-        # a one-off transform, but the lifter kept emitting the old model, so
+        # had no packed arithmetic at all; a one-off transform once fixed the
+        # generated tree, but the lifter kept emitting the old model, so
         # every function recovered afterwards was broken again.
         dbl = m.endswith("sd") or m.endswith("pd") or m in ("comisd", "ucomisd")
         lane = "d" if dbl else "f"
@@ -2008,7 +2008,7 @@ class Lifter:
         """x87 -> C over the simulated register file (fp_push/fp_pop/fp_top/
         fp_st1 and _fp_stack[(_fp_top + i) & 7] for st(i)).
 
-        Rewritten in part 179. The old version collapsed every fadd/fsub/fmul/
+        Rewritten. The old version collapsed every fadd/fsub/fmul/
         fdiv to the popping two-register form, popped on `fst`, did not pop on
         `fistp`/`fcomp`/`fcompp`, compared a memory `fcom` against st(1), and
         left fld/fstp st(i), fsubr/fdivr, the integer forms, fsin/fcos and

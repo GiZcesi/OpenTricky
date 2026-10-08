@@ -173,7 +173,7 @@ static int eval_cond(const char *c)
 /* XBOX_ESP_GUARD=1: at every label, check this thread's guest esp is inside
  * RAM, and report the first label where it is not together with the label
  * the same thread passed just before -- the stack pointer broke between
- * those two. Kernel calls are too far apart to catch it: in part 177 a
+ * those two. Kernel calls are too far apart to catch it: once a
  * thread's esp reached the top of the APU aperture (0xFE87FFFC) inside one
  * frame callback without making a single kernel call, so every push became
  * an APU register write. Costs a call per label while enabled. */
