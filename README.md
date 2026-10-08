@@ -1,6 +1,7 @@
-<img width="1280" height="320" alt="readme-header-1280x320" src="https://github.com/user-attachments/assets/6287a1e6-1da2-4ba0-99e7-6d373a20607f" />
+<img width="1280" height="320" alt="BANNIERE-FINALE-1280x320" src="https://github.com/user-attachments/assets/eb23ea38-f97d-43a1-b22c-e58a80f90aa7" />
 
 <h1 align="center">OpenTricky</h1>
+
 
 <p align="center">
   <b>SSX Tricky (Xbox, 2001), running natively on Windows</b><br>
