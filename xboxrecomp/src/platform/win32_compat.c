@@ -11,7 +11,9 @@
 #if !defined(_WIN32)
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
+#if defined(__linux__)
 #define _GNU_SOURCE
+#endif
 
 #include "win32_compat.h"
 
@@ -26,11 +28,22 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <execinfo.h>
+#if defined(__linux__)
 #include <sys/sysinfo.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <sys/sysctl.h>
+#endif
 
 /* ===================================================================== */
 /* Last-error (thread-local)                                             */
 /* ===================================================================== */
+
+#define OT_MIN_THREAD_STACK ((SIZE_T)8 * 1024 * 1024)
 
 static __thread DWORD t_last_error = 0;
 
@@ -170,7 +183,7 @@ VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv)
 /* ===================================================================== */
 
 typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
-               K_FILEMAP, K_FILE } w32_kind;
+               K_FILEMAP, K_FILE, K_WTIMER } w32_kind;
 
 #define W32_MAX_APC 16
 
@@ -213,6 +226,10 @@ typedef struct w32_object {
     DWORD           timer_period;
     WAITORTIMERCALLBACK timer_cb;
     PVOID           timer_param;
+
+    /* waitable timer (CreateWaitableTimerEx): signaled/manual_reset are shared
+     * with events; wt_gen invalidates an armed helper thread on re-arm/cancel */
+    unsigned        wt_gen;
 
     /* file mapping / fd-backed file handle */
     int             fd;
@@ -267,6 +284,17 @@ static void obj_release(w32_object *o)
     free(o);
 }
 
+/* Handles that are not pointers to our objects (the file layer's virtual ISO handles carry a tag in
+ * the bits above any user-space address): never dereferenced here. */
+static int foreign_handle(HANDLE h)
+{
+    /* The tag sits in the top byte (0x15 for the ISO handles); no user-space address, on 47- or
+     * 48-bit address spaces, has any of those bits set. */
+    return ((uintptr_t)h >> 56) != 0 && h != INVALID_HANDLE_VALUE;
+}
+/* A handle as one of our objects, or NULL when it is not one: pseudo handles, virtual handles. */
+#define AS_OBJ(h) (foreign_handle(h) ? (w32_object *)NULL : (w32_object *)(h))
+
 /* ---- fd-backed file handle (for the file-I/O HLE) -------------------- */
 HANDLE w32_open_handle(int fd, const char *host_path)
 {
@@ -278,22 +306,24 @@ HANDLE w32_open_handle(int fd, const char *host_path)
 
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
+    if (foreign_handle(h)) return -1;
     return (o && o->kind == K_FILE) ? o->fd : -1;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
+    if (foreign_handle(h)) return NULL;
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
 BOOL CloseHandle(HANDLE h)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
-        h == INVALID_HANDLE_VALUE)
+        h == INVALID_HANDLE_VALUE || foreign_handle(h))
         return TRUE;
-    obj_release((w32_object *)h);
+    obj_release(AS_OBJ(h));
     return TRUE;
 }
 
@@ -305,7 +335,8 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
     if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
-    w32_object *o = (w32_object *)src;
+    w32_object *o = AS_OBJ(src);
+    if (!o) { *dst = NULL; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }   /* not one of ours */
     InterlockedIncrement(&o->refcount);
     *dst = src;
     if (options & DUPLICATE_CLOSE_SOURCE)
@@ -360,7 +391,8 @@ static DWORD wait_single(w32_object *o, DWORD ms)
     for (;;) {
         int ready = 0;
         switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
+        case K_EVENT:
+        case K_WTIMER: ready = o->signaled; break;
         case K_THREAD: ready = o->exited;   break;
         case K_SEM:    ready = (o->sem_count > 0); break;
         case K_MUTEX:
@@ -377,7 +409,8 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     if (result == WAIT_OBJECT_0) {
         switch (o->kind) {
-        case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+        case K_EVENT:
+        case K_WTIMER: if (!o->manual_reset) o->signaled = 0; break;
         case K_SEM:   o->sem_count--; break;
         case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
         default: break;
@@ -391,7 +424,8 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
-    return wait_single((w32_object *)h, ms);
+    if (foreign_handle(h)) { SetLastError(ERROR_INVALID_HANDLE); return WAIT_FAILED; }   /* e.g. a virtual ISO handle */
+    return wait_single(AS_OBJ(h), ms);
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -463,7 +497,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 
 BOOL SetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -474,7 +508,7 @@ BOOL SetEvent(HANDLE h)
 
 BOOL ResetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 0;
@@ -484,7 +518,7 @@ BOOL ResetEvent(HANDLE h)
 
 BOOL PulseEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -514,7 +548,7 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
 
 BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
     if (!o || o->kind != K_SEM) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (previousCount) *previousCount = (LONG)o->sem_count;
@@ -544,7 +578,7 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 
 BOOL ReleaseMutex(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
     if (!o || o->kind != K_MUTEX) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (o->mtx_owner == GetCurrentThreadId() && --o->mtx_recursion <= 0) {
@@ -599,8 +633,11 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    if (stackSize)
-        pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
+    /* Lifted guest code keeps large frames on the native stack, so the 1 MB an
+     * Xbox thread asks for (or macOS's 512 KB default for secondary threads) is
+     * not enough: a native overflow shows up as a random fault. Floor at 8 MB. */
+    if (stackSize < OT_MIN_THREAD_STACK) stackSize = OT_MIN_THREAD_STACK;
+    pthread_attr_setstacksize(&attr, stackSize);
 
     if (pthread_create(&o->thread, &attr, thread_trampoline, o) != 0) {
         pthread_attr_destroy(&attr);
@@ -633,7 +670,7 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
@@ -643,7 +680,7 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -657,7 +694,7 @@ DWORD SuspendThread(HANDLE h)
 {
     /* True mid-run suspension is not supported on POSIX; only the
      * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -668,7 +705,7 @@ DWORD SuspendThread(HANDLE h)
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = AS_OBJ(h);
     if (!o || o->kind != K_THREAD) return FALSE;
     pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
@@ -682,14 +719,14 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : AS_OBJ(h);
     if (o && o->kind == K_THREAD) o->priority = priority;
     return TRUE;   /* real RT priorities need privileges; tracked only */
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : AS_OBJ(h);
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
@@ -697,7 +734,7 @@ VOID SwitchToThread(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : AS_OBJ(thread);
     if (!o || o->kind != K_THREAD) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
@@ -792,7 +829,7 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
 BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = AS_OBJ(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_due    = dueTime;
     o->timer_period = period;
@@ -802,7 +839,7 @@ BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG
 BOOL DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionEvent)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = AS_OBJ(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_cancel = 1;
     if (completionEvent) SetEvent(completionEvent);
@@ -883,6 +920,28 @@ static int prot_from_page(DWORD protect)
     }
 }
 
+/* An address range this process reserved for itself (the guest window). Inside
+ * it MAP_FIXED is safe -- it can only replace our own placeholder mapping --
+ * which is what VirtualAlloc/MapViewOfFileEx at a fixed address need on macOS,
+ * where there is no MAP_FIXED_NOREPLACE. */
+static uintptr_t s_win_lo, s_win_hi;
+
+static int in_owned_window(const void *p, size_t len)
+{
+    uintptr_t a = (uintptr_t)p;
+    return s_win_hi && a >= s_win_lo && a + len <= s_win_hi;
+}
+
+void *w32_reserve_window(SIZE_T size)
+{
+    /* PROT_NONE + NORESERVE: address space only, no memory is committed. */
+    void *p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    s_win_lo = (uintptr_t)p;
+    s_win_hi = (uintptr_t)p + size;
+    return p;
+}
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
@@ -896,10 +955,21 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         /* fall through to a fresh mapping */
     }
 
-    if (address) flags |= MAP_FIXED_NOREPLACE;
+    int owned = address && in_owned_window(address, size);
+    if (owned) flags |= MAP_FIXED;
+#if defined(MAP_FIXED_NOREPLACE)
+    else if (address) flags |= MAP_FIXED_NOREPLACE;
+#endif
     void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
                    flags, -1, 0);
     if (p == MAP_FAILED) { SetLastError(8); return NULL; }
+#if !defined(MAP_FIXED_NOREPLACE)
+    /* No NOREPLACE flag (macOS): the address is only a hint, and plain MAP_FIXED
+     * would silently unmap whatever is already there. Without MAP_FIXED the
+     * kernel places the mapping elsewhere when the range is taken, so a result
+     * that is not the requested address means "that range was not free". */
+    if (address && !owned && p != address) { munmap(p, size); SetLastError(8); return NULL; }
+#endif
     return p;
 }
 
@@ -1002,7 +1072,12 @@ VOID OutputDebugStringA(LPCSTR str)
 
 VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
 
+#if defined(__APPLE__)
+VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt) { memset_s(ptr, cnt, 0, cnt); }
+#else
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt) { explicit_bzero(ptr, cnt); }
+#endif
+BOOL HeapValidate(HANDLE heap, DWORD flags, LPCVOID mem) { (void)heap; (void)flags; (void)mem; return TRUE; }
 
 unsigned int _clearfp(void)
 {
@@ -1105,7 +1180,14 @@ BOOL FlushFileBuffers(HANDLE h)
 /* via SDL_GetKeyboardState when main.c gets its SDL2 port.              */
 /* ===================================================================== */
 
-SHORT GetAsyncKeyState(int vKey)          { (void)vKey; return 0; }
+/* Host input, supplied by the port's window (SDL3): a key (Win32 virtual-key code) is down, a pad's state, and
+ * whether the game window has the keyboard focus. NULL = no input (headless). */
+int (*w32_key_hook)(int vk);
+int (*w32_pad_hook)(unsigned port, XINPUT_STATE *st);
+int (*w32_focus_hook)(void);
+int w32_input_focused(void) { return w32_focus_hook ? w32_focus_hook() : 0; }
+
+SHORT GetAsyncKeyState(int vKey)          { return (w32_key_hook && w32_key_hook(vKey)) ? (SHORT)0x8000 : 0; }
 HWND  FindWindowA(LPCSTR c, LPCSTR w)     { (void)c; (void)w; return NULL; }
 HWND  GetActiveWindow(void)               { return NULL; }
 BOOL  SetWindowTextA(HWND h, LPCSTR t)    { (void)h; (void)t; return TRUE; }
@@ -1127,7 +1209,10 @@ LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
 
 /* XInput stub: real gamepad is wired through input_compat (SDL2). */
 DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
-{ (void)idx; if (state) memset(state, 0, sizeof(*state)); return ERROR_DEVICE_NOT_CONNECTED; }
+{
+    if (state) memset(state, 0, sizeof(*state));
+    return (w32_pad_hook && state && w32_pad_hook(idx, state)) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+}
 
 BOOL TerminateProcess(HANDLE process, UINT exitCode)
 {
@@ -1250,7 +1335,19 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
 
+#if defined(__linux__)
     int fd = memfd_create(name ? name : "xbox_map", 0);
+#else
+    /* No memfd on macOS: an anonymous POSIX shared-memory object. Unlinking it
+     * straight away leaves a nameless object that lives as long as the fd. The
+     * name must be unique and (on macOS) at most 31 characters. */
+    static volatile LONG s_shm_seq = 0;
+    char shm_name[32];
+    snprintf(shm_name, sizeof shm_name, "/ot%d_%d", (int)getpid(),
+             (int)InterlockedIncrement(&s_shm_seq));
+    int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) shm_unlink(shm_name);
+#endif
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (ftruncate(fd, (off_t)size) != 0) {
         close(fd);
@@ -1274,7 +1371,7 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
-    w32_object *o = (w32_object *)mapping;
+    w32_object *o = AS_OBJ(mapping);
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
     off_t  off = ((off_t)offHigh << 32) | offLow;
@@ -1319,8 +1416,9 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
 {
-    struct sysinfo si;
     if (!b) return FALSE;
+#if defined(__linux__)
+    struct sysinfo si;
     if (sysinfo(&si) != 0) return FALSE;
 
     ULONGLONG unit = si.mem_unit ? si.mem_unit : 1;
@@ -1328,6 +1426,18 @@ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
     b->ullAvailPhys     = (ULONGLONG)si.freeram   * unit;
     b->ullTotalPageFile = b->ullTotalPhys + (ULONGLONG)si.totalswap * unit;
     b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)si.freeswap  * unit;
+#elif defined(__APPLE__)
+    uint64_t total = 0; size_t len = sizeof total;
+    if (sysctlbyname("hw.memsize", &total, &len, NULL, 0) != 0) return FALSE;
+    vm_statistics64_data_t vs; mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &cnt) != KERN_SUCCESS)
+        return FALSE;
+    uint64_t avail = ((uint64_t)vs.free_count + vs.inactive_count) * (uint64_t)vm_page_size;
+    b->ullTotalPhys     = total;
+    b->ullAvailPhys     = avail;
+    b->ullTotalPageFile = total;
+    b->ullAvailPageFile = avail;
+#endif
     b->ullTotalVirtual  = b->ullTotalPhys;
     b->ullAvailVirtual  = b->ullAvailPhys;
     b->ullAvailExtendedVirtual = 0;
@@ -1453,4 +1563,315 @@ PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handl
 { (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
 ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
 
+
+/* ===================================================================== */
+/* Pointer interlocked, SRW locks, waitable timers, misc host queries    */
+/* ===================================================================== */
+
+PVOID InterlockedExchangePointer(PVOID volatile *p, PVOID v)
+{
+    return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST);
+}
+
+/* SRWLOCK: one lazily created pthread rwlock behind a pointer, so that the
+ * all-zero static initializer SRWLOCK_INIT works as on Windows. */
+static pthread_rwlock_t *srw_get(PSRWLOCK l)
+{
+    pthread_rwlock_t *rw = (pthread_rwlock_t *)__atomic_load_n(&l->Ptr, __ATOMIC_ACQUIRE);
+    if (rw) return rw;
+    pthread_rwlock_t *fresh = (pthread_rwlock_t *)malloc(sizeof *fresh);
+    pthread_rwlock_init(fresh, NULL);
+    PVOID expected = NULL;
+    if (__atomic_compare_exchange_n(&l->Ptr, &expected, (PVOID)fresh, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return fresh;
+    pthread_rwlock_destroy(fresh);
+    free(fresh);
+    return (pthread_rwlock_t *)expected;
+}
+VOID InitializeSRWLock(PSRWLOCK l)             { l->Ptr = NULL; }
+VOID AcquireSRWLockExclusive(PSRWLOCK l)       { pthread_rwlock_wrlock(srw_get(l)); }
+VOID AcquireSRWLockShared(PSRWLOCK l)          { pthread_rwlock_rdlock(srw_get(l)); }
+VOID ReleaseSRWLockExclusive(PSRWLOCK l)       { pthread_rwlock_unlock(srw_get(l)); }
+VOID ReleaseSRWLockShared(PSRWLOCK l)          { pthread_rwlock_unlock(srw_get(l)); }
+BOOLEAN TryAcquireSRWLockExclusive(PSRWLOCK l) { return pthread_rwlock_trywrlock(srw_get(l)) == 0; }
+BOOLEAN TryAcquireSRWLockShared(PSRWLOCK l)    { return pthread_rwlock_tryrdlock(srw_get(l)) == 0; }
+
+/* Waitable timers. Arming starts a helper thread that sleeps on the timer's
+ * own lock/condvar until the due time, signals the object, and repeats for a
+ * periodic timer. Re-arming or cancelling bumps wt_gen, which retires the
+ * helper. A non-NULL completion routine is called from that helper thread (a
+ * real one runs as an APC on the arming thread; nothing in the runtime uses it). */
+typedef struct { w32_object *o; unsigned gen; struct timespec due; LONG period_ms;
+                 PTIMERAPCROUTINE fn; LPVOID arg; } wt_arm;
+
+static void *wt_thread(void *p)
+{
+    wt_arm a = *(wt_arm *)p;
+    free(p);
+    w32_object *o = a.o;
+    pthread_mutex_lock(&o->lock);
+    for (;;) {
+        int rc = 0;
+        while (o->wt_gen == a.gen && rc != ETIMEDOUT)
+            rc = pthread_cond_timedwait(&o->gate, &o->lock, &a.due);
+        if (o->wt_gen != a.gen) break;
+        o->signaled = 1;
+        pthread_cond_broadcast(&o->cond);
+        if (a.fn) {
+            pthread_mutex_unlock(&o->lock);
+            a.fn(a.arg, 0, 0);
+            pthread_mutex_lock(&o->lock);
+            if (o->wt_gen != a.gen) break;
+        }
+        if (a.period_ms <= 0) break;
+        a.due.tv_sec  += a.period_ms / 1000;
+        a.due.tv_nsec += (long)(a.period_ms % 1000) * 1000000L;
+        if (a.due.tv_nsec >= 1000000000L) { a.due.tv_sec++; a.due.tv_nsec -= 1000000000L; }
+    }
+    pthread_mutex_unlock(&o->lock);
+    obj_release(o);
+    return NULL;
+}
+
+HANDLE CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access)
+{
+    (void)sa; (void)name; (void)access;
+    w32_object *o = obj_alloc(K_WTIMER);
+    o->manual_reset = (flags & CREATE_WAITABLE_TIMER_MANUAL_RESET) ? 1 : 0;
+    return (HANDLE)o;
+}
+
+BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *due, LONG period,
+                      PTIMERAPCROUTINE fn, LPVOID arg, BOOL resume)
+{
+    (void)resume;
+    w32_object *o = AS_OBJ(h);
+    if (!o || o->kind != K_WTIMER || !due) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    if (due->QuadPart < 0) {            /* relative, in 100 ns units */
+        ULONGLONG ns = (ULONGLONG)(-due->QuadPart) * 100ull;
+        t.tv_sec  += (time_t)(ns / 1000000000ull);
+        t.tv_nsec += (long)(ns % 1000000000ull);
+    } else if (due->QuadPart > 0) {     /* absolute FILETIME */
+        LONGLONG unix100 = due->QuadPart - (LONGLONG)FILETIME_EPOCH_DIFF;
+        t.tv_sec  = (time_t)(unix100 / 10000000);
+        t.tv_nsec = (long)(unix100 % 10000000) * 100L;
+    }
+    if (t.tv_nsec >= 1000000000L) { t.tv_sec++; t.tv_nsec -= 1000000000L; }
+
+    pthread_mutex_lock(&o->lock);
+    o->wt_gen++;
+    o->signaled = 0;
+    pthread_cond_broadcast(&o->gate);       /* retire a previous helper */
+    wt_arm *a = (wt_arm *)malloc(sizeof *a);
+    a->o = o; a->gen = o->wt_gen; a->due = t; a->period_ms = period; a->fn = fn; a->arg = arg;
+    InterlockedIncrement(&o->refcount);     /* the helper's reference */
+    pthread_mutex_unlock(&o->lock);
+
+    pthread_t th;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    int rc = pthread_create(&th, &attr, wt_thread, a);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) { free(a); obj_release(o); SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+    return TRUE;
+}
+
+BOOL CancelWaitableTimer(HANDLE h)
+{
+    w32_object *o = AS_OBJ(h);
+    if (!o || o->kind != K_WTIMER) return FALSE;
+    pthread_mutex_lock(&o->lock);
+    o->wt_gen++;
+    pthread_cond_broadcast(&o->gate);
+    pthread_mutex_unlock(&o->lock);
+    return TRUE;
+}
+
+/* The runtime asks for stack traces and module bases for diagnostics only. */
+USHORT CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash)
+{
+    void *buf[128];
+    if (count > 128 - skip - 1) count = 128 - skip - 1;
+    int n = backtrace(buf, (int)(count + skip + 1));
+    int out = 0;
+    for (int i = (int)skip + 1; i < n; i++) frames[out++] = buf[i];
+    if (hash) *hash = 0;
+    return (USHORT)out;
+}
+
+HMODULE GetModuleHandleA(LPCSTR name)
+{
+    /* NULL means "this executable" (its load address). Looking another module up
+     * by name -- ntdll, kernel32, ... -- has no meaning here and fails, which is
+     * what callers that probe optional exports expect. */
+    if (name) return NULL;
+#if defined(__APPLE__)
+    return (HMODULE)_dyld_get_image_header(0);
+#else
+    extern char __executable_start;
+    return (HMODULE)&__executable_start;
+#endif
+}
+HMODULE GetModuleHandleW(LPCWSTR name) { return name ? NULL : GetModuleHandleA(NULL); }
+
+DWORD GetModuleFileNameA(HMODULE mod, LPSTR buf, DWORD size)
+{
+    (void)mod;
+    if (!buf || !size) return 0;
+#if defined(__APPLE__)
+    uint32_t n = size;
+    const char *home = getenv("OT_HOME_DIR");      /* the app runs the real binary inside its bundle but keeps its files (settings, saves) here */
+    if (home && home[0]) { snprintf(buf, size, "%s/SSX Tricky", home); return (DWORD)strlen(buf); }
+    if (_NSGetExecutablePath(buf, &n) != 0) { buf[0] = 0; return 0; }
+#else
+    ssize_t n = readlink("/proc/self/exe", buf, size - 1);
+    if (n < 0) { buf[0] = 0; return 0; }
+    buf[n] = 0;
+#endif
+    return (DWORD)strlen(buf);
+}
+
+BOOL IsDebuggerPresent(void) { return FALSE; }
+VOID DebugBreak(void)        { __builtin_trap(); }
+
+DWORD GetTempPathA(DWORD size, LPSTR buf)
+{
+    const char *t = getenv("TMPDIR");
+    if (!t || !*t) t = "/tmp/";
+    size_t n = strlen(t);
+    int slash = t[n - 1] != '/';
+    if (n + slash + 1 > size) return (DWORD)(n + slash + 1);
+    memcpy(buf, t, n);
+    if (slash) buf[n++] = '/';
+    buf[n] = 0;
+    return (DWORD)n;
+}
+
+BOOL CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa)
+{
+    (void)sa;
+    if (mkdir(path, 0777) == 0) return TRUE;
+    SetLastError(errno == EEXIST ? ERROR_ALREADY_EXISTS : ERROR_PATH_NOT_FOUND);
+    return FALSE;
+}
+
+/* ---- port helpers (see win32_compat.h) ---------------------------------- */
+#include <sys/stat.h>
+
+DWORD GetFileAttributesA(LPCSTR path)
+{
+    struct stat st;
+    if (!path || stat(path, &st) != 0) { SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_FILE_ATTRIBUTES; }
+    return S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+}
+
+static void wide_to_utf8(LPCWSTR w, char *out, size_t n)
+{
+    size_t k = 0;
+    for (; w && *w && k + 4 < n; w++) {
+        uint32_t c = *w;
+        if (c >= 0xD800 && c < 0xDC00 && w[1] >= 0xDC00 && w[1] < 0xE000) { c = 0x10000 + ((c - 0xD800) << 10) + (w[1] - 0xDC00); w++; }
+        if (c < 0x80) out[k++] = (char)c;
+        else if (c < 0x800) { out[k++] = (char)(0xC0 | (c >> 6)); out[k++] = (char)(0x80 | (c & 63)); }
+        else if (c < 0x10000) { out[k++] = (char)(0xE0 | (c >> 12)); out[k++] = (char)(0x80 | ((c >> 6) & 63)); out[k++] = (char)(0x80 | (c & 63)); }
+        else { out[k++] = (char)(0xF0 | (c >> 18)); out[k++] = (char)(0x80 | ((c >> 12) & 63)); out[k++] = (char)(0x80 | ((c >> 6) & 63)); out[k++] = (char)(0x80 | (c & 63)); }
+    }
+    out[k] = 0;
+}
+
+BOOL CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa)
+{
+    char u8[1024];
+    wide_to_utf8(path, u8, sizeof u8);
+    return CreateDirectoryA(u8, sa);
+}
+
+const KNOWNFOLDERID FOLDERID_Documents = { 1 };
+
+HRESULT SHGetKnownFolderPath(const KNOWNFOLDERID *id, DWORD flags, HANDLE token, PWSTR *out)
+{
+    (void)id; (void)flags; (void)token;
+    const char *home = getenv("HOME");
+    if (!home || !*home || !out) return (HRESULT)0x80004005;
+    char p[1024];
+    snprintf(p, sizeof p, "%s/Documents", home);
+    size_t n = strlen(p);
+    WCHAR *w = (WCHAR *)malloc((n + 1) * sizeof(WCHAR));
+    if (!w) return (HRESULT)0x8007000E;
+    for (size_t i = 0; i <= n; i++) w[i] = (unsigned char)p[i];   /* paths here are ASCII in practice */
+    *out = w;
+    return 0;
+}
+VOID CoTaskMemFree(LPVOID p) { free(p); }
+
+HINSTANCE ShellExecuteW(HWND owner, LPCWSTR verb, LPCWSTR file, LPCWSTR params, LPCWSTR dir, int show)
+{ (void)owner; (void)verb; (void)file; (void)params; (void)dir; (void)show; return (HINSTANCE)(uintptr_t)2; }
+
+int MessageBoxW(HWND hwnd, LPCWSTR text, LPCWSTR caption, UINT type)
+{
+    char t[1024], c[256];
+    (void)hwnd; (void)type;
+    wide_to_utf8(text, t, sizeof t); wide_to_utf8(caption, c, sizeof c);
+    fprintf(stderr, "[MessageBox] %s: %s\n", c, t);
+    return 1;
+}
+
+/* Absolute, lexically normalised path ("." and ".." folded) without touching the disk. */
+DWORD GetFullPathNameA(LPCSTR path, DWORD size, LPSTR out, LPSTR *filePart)
+{
+    char tmp[2048], *seg[256], *p, *save = NULL;
+    int n = 0, i;
+    size_t len = 0;
+    if (!path || !*path) return 0;
+    if (path[0] == '/') snprintf(tmp, sizeof tmp, "%s", path);
+    else {
+        char cwd[1024];
+        if (!getcwd(cwd, sizeof cwd)) return 0;
+        snprintf(tmp, sizeof tmp, "%s/%s", cwd, path);
+    }
+    for (p = strtok_r(tmp, "/", &save); p && n < 256; p = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(p, ".")) continue;
+        if (!strcmp(p, "..")) { if (n) n--; continue; }
+        seg[n++] = p;
+    }
+    char res[2048];
+    res[0] = 0;
+    for (i = 0; i < n; i++) len += (size_t)snprintf(res + len, sizeof res - len, "/%s", seg[i]);
+    if (!len) { res[0] = '/'; res[1] = 0; len = 1; }
+    if (len + 1 > size) return (DWORD)(len + 1);
+    memcpy(out, res, len + 1);
+    if (filePart) { char *s = strrchr(out, '/'); *filePart = (s && s[1]) ? s + 1 : NULL; }
+    return (DWORD)len;
+}
+
 #endif /* !_WIN32 */
+
+
+/* ---- one-time initialisation, processor count -------------------------------------------------------------- */
+static pthread_mutex_t g_once_lock = PTHREAD_MUTEX_INITIALIZER;
+
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx)
+{
+    BOOL ok = TRUE;
+    pthread_mutex_lock(&g_once_lock);
+    if (once->state == 0) {
+        ok = fn ? fn(once, param, ctx) : TRUE;
+        once->state = ok ? 2 : 0;
+    }
+    pthread_mutex_unlock(&g_once_lock);
+    return ok;
+}
+
+VOID GetSystemInfo(LPSYSTEM_INFO si)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN), pg = sysconf(_SC_PAGESIZE);
+    if (!si) return;
+    si->dwNumberOfProcessors = n > 0 ? (DWORD)n : 1;
+    si->dwPageSize = pg > 0 ? (DWORD)pg : 4096;
+}

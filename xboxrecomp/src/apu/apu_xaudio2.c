@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "apu_xaudio2.h"
 
@@ -529,14 +530,196 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+#else /* !_WIN32 -- null sink: a sound device that plays nothing, on a real clock */
 
-int  xa2_init(void)                                   { return 0; }
-void xa2_shutdown(void)                               {}
-int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
-int  xa2_get_buffer_size(void)                        { return 0; }
-int  xa2_channels(void)                               { return 2; }
-int  xa2_target_queued(void)                          { return XA2_TARGET_QUEUED; }
+/* apu_core paces its mixer on xa2_queued() (throttle_realtime), so a sink that
+ * reports "nothing queued" makes the mixer run flat out instead of at the sample
+ * rate, and the title's audio clock -- which DSOUND polls -- runs fast. This sink
+ * models the device's clock instead: it "plays" 48000 sample frames per second of
+ * wall time, drains what has been submitted, and reports the buffers still waiting.
+ * When nothing is submitted it underruns, as a real device does; time still passes. */
+#include <time.h>
+#include <pthread.h>
+#include <stdio.h>
+
+#if defined(OT_SDL_AUDIO)
+#include <SDL3/SDL.h>
+/* macOS: the same clock model, but the samples go to the default output device through an SDL3 audio stream when one
+ * opens (OT_AUDIO=null keeps the silent sink; no device = the silent sink too). The queue the mixer paces on is then
+ * what the stream still holds. */
+static SDL_AudioStream *s_stream;
+#define SDL_BYTES_PER_BUF (256u * 2u * 2u)
+#endif
+
+#define NULL_SAMPLE_RATE 48000u
+#define NULL_BUF_FRAMES  256u        /* one submission = 256 sample frames */
+#define NULL_MAX_QUEUED  24u         /* the Windows sink's XA2_NUM_BUFS */
+
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+static int       s_active;
+static uint64_t  s_submitted;        /* sample frames handed over */
+static uint64_t  s_played;           /* sample frames the virtual device has consumed */
+static uint64_t  s_last_ns;
+static unsigned long s_underruns, s_drops;
+static int       s_frames_written;
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Advance the device clock; lock held. */
+static void advance(void)
+{
+    uint64_t now = mono_ns();
+    uint64_t can = (now - s_last_ns) * NULL_SAMPLE_RATE / 1000000000ull;
+    if (can) {
+        uint64_t have = s_submitted - s_played;
+        s_played += can < have ? can : have;
+        /* keep the sub-frame remainder of the clock */
+        s_last_ns += can * 1000000000ull / NULL_SAMPLE_RATE;
+    }
+}
+
+static unsigned queued_buffers(void)
+{
+    return (unsigned)((s_submitted - s_played + NULL_BUF_FRAMES - 1) / NULL_BUF_FRAMES);
+}
+
+int xa2_init(void)
+{
+    pthread_mutex_lock(&s_lock);
+    s_submitted = s_played = 0;
+    s_last_ns = mono_ns();
+    s_underruns = s_drops = 0;
+    s_frames_written = 0;
+    s_active = 1;
+    pthread_mutex_unlock(&s_lock);
+#if defined(OT_SDL_AUDIO)
+    {
+        const char *e = getenv("OT_AUDIO");
+        if (!(e && !strcmp(e, "null")) && SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            SDL_AudioSpec spec; SDL_zero(spec);
+            spec.format = SDL_AUDIO_S16; spec.channels = 2; spec.freq = (int)NULL_SAMPLE_RATE;
+            SDL_AudioDeviceID dev = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;     /* the system default: SDL moves the stream when the default output changes */
+            const char *want = getenv("OT_AUDIO_DEVICE");                  /* a name (or part of one) of an output device, e.g. "MacBook Pro Speakers" */
+            if (want && want[0]) {
+                int n = 0, i; SDL_AudioDeviceID *ids = SDL_GetAudioPlaybackDevices(&n);
+                for (i = 0; ids && i < n; i++) {
+                    const char *nm = SDL_GetAudioDeviceName(ids[i]);
+                    if (nm && strcasestr(nm, want)) { dev = ids[i]; fprintf(stderr, "[XA2] output device: %s\n", nm); break; }
+                }
+                if (dev == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) fprintf(stderr, "[XA2] no output device matches OT_AUDIO_DEVICE=%s: the default is used\n", want);
+                SDL_free(ids);
+            }
+            SDL_AudioStream *st = SDL_OpenAudioDeviceStream(dev, &spec, NULL, NULL);
+            if (st && SDL_ResumeAudioStreamDevice(st)) {
+                pthread_mutex_lock(&s_lock);       /* published under the lock the submit/queued/shutdown paths read it with */
+                s_stream = st;
+                pthread_mutex_unlock(&s_lock);
+                fprintf(stderr, "[XA2] SDL3 audio: 48000 Hz stereo, driver %s\n", SDL_GetCurrentAudioDriver());
+                return 1;
+            }
+            fprintf(stderr, "[XA2] no audio device (%s): silent sink\n", SDL_GetError());
+            if (st) SDL_DestroyAudioStream(st);
+            SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        }
+    }
+#endif
+    fprintf(stderr, "[XA2] null sink: 48000 Hz stereo, plays nothing, real-time clock\n");
+    return 1;
+}
+
+void xa2_shutdown(void)
+{
+    pthread_mutex_lock(&s_lock);
+    s_active = 0;
+#if defined(OT_SDL_AUDIO)
+    if (s_stream) { SDL_AudioStream *st = s_stream; s_stream = NULL; SDL_DestroyAudioStream(st); SDL_QuitSubSystem(SDL_INIT_AUDIO); }
+#endif
+    pthread_mutex_unlock(&s_lock);
+    fprintf(stderr, "[XA2] Shut down (%d buffers written, %lu underruns, %lu dropped)\n",
+            s_frames_written, s_underruns, s_drops);
+}
+
+/* test hook: sample frames handed to the sink so far */
+uint64_t xa2_null_frames_submitted(void) { return s_submitted; }
+
+int xa2_is_active(void)        { return s_active; }
+int xa2_channels(void)         { return 2; }
+int xa2_get_buffer_size(void)  { return NULL_BUF_FRAMES; }
+
+int xa2_target_queued(void)
+{
+    static int target;
+    if (!target) {
+        const char *e = getenv("XBOX_AUDIO_QUEUE");
+        int n = (e && *e) ? atoi(e) : XA2_TARGET_QUEUED;
+        if (n < XA2_QUEUE_MIN) n = XA2_QUEUE_MIN;
+        if (n > XA2_QUEUE_MAX) n = XA2_QUEUE_MAX;
+        target = n;
+    }
+    return target;
+}
+
+int xa2_queued(void)
+{
+    unsigned q;
+    pthread_mutex_lock(&s_lock);
+    if (!s_active) { pthread_mutex_unlock(&s_lock); return 0; }
+#if defined(OT_SDL_AUDIO)
+    if (s_stream) {
+        q = (unsigned)(((unsigned)SDL_GetAudioStreamQueued(s_stream) + SDL_BYTES_PER_BUF - 1) / SDL_BYTES_PER_BUF);
+        pthread_mutex_unlock(&s_lock);
+        return (int)q;
+    }
+#endif
+    advance();
+    q = queued_buffers();
+    pthread_mutex_unlock(&s_lock);
+    return (int)q;
+}
+
+int xa2_submit_samples(const int16_t *samples, int num_samples)
+{
+#if !defined(OT_SDL_AUDIO)
+    (void)samples;
+#endif
+    pthread_mutex_lock(&s_lock);
+    if (!s_active) { pthread_mutex_unlock(&s_lock); return 0; }
+#if defined(OT_SDL_AUDIO)
+    if (s_stream) {
+        int n = num_samples > (int)NULL_BUF_FRAMES ? (int)NULL_BUF_FRAMES : num_samples;
+        int queued = SDL_GetAudioStreamQueued(s_stream);
+        if ((unsigned)queued >= NULL_MAX_QUEUED * SDL_BYTES_PER_BUF) { s_drops++; pthread_mutex_unlock(&s_lock); return 0; }
+        if (queued == 0 && s_frames_written > (int)NULL_MAX_QUEUED) s_underruns++;
+        {   /* a periodic line (~21 s): is anything audible, and did the device run dry */
+            static int peak, cnt; int k;
+            for (k = 0; k < n * 2; k++) { int v = samples[k] < 0 ? -samples[k] : samples[k]; if (v > peak) peak = v; }
+            if (++cnt % 4000 == 0) {
+                fprintf(stderr, "[XA2] %d buffers, peak %d of 32767, %lu underruns, %lu dropped, %d queued\n",
+                        s_frames_written, peak, s_underruns, s_drops, queued / (int)SDL_BYTES_PER_BUF);
+                peak = 0;
+            }
+        }
+        SDL_PutAudioStreamData(s_stream, samples, n * 4);
+        s_submitted += (uint64_t)n;
+        s_frames_written++;
+        pthread_mutex_unlock(&s_lock);
+        return 1;
+    }
+#endif
+    advance();
+    if (queued_buffers() >= NULL_MAX_QUEUED) { s_drops++; pthread_mutex_unlock(&s_lock); return 0; }
+    if (s_submitted == s_played && s_frames_written > (int)NULL_MAX_QUEUED)
+        s_underruns++;                       /* the device ran dry before this arrived */
+    if (s_submitted == s_played) s_last_ns = mono_ns();   /* an idle device starts playing now */
+    s_submitted += (uint64_t)(num_samples > (int)NULL_BUF_FRAMES ? (int)NULL_BUF_FRAMES : num_samples);
+    s_frames_written++;
+    pthread_mutex_unlock(&s_lock);
+    return 1;
+}
 
 #endif /* _WIN32 */

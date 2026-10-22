@@ -15,6 +15,10 @@
  */
 
 #include "xbox_memory_layout.h"
+#if defined(__APPLE__)
+/* The Windows-only base search helpers are unused here. */
+#pragma clang diagnostic ignored "-Wunused-function"
+#endif
 #include "kernel.h"
 #include <stdio.h>
 #include <string.h>
@@ -1108,6 +1112,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Windows 11 where low addresses are often reserved), try page-aligned
      * addresses upward until we find a free region.
      */
+#if defined(__APPLE__)
+    /*
+     * macOS: no probing for a free base. The recompiled code reaches every guest
+     * address as base + va, so the process needs the whole 4 GB window
+     * [base, base + 4 GB) anyway -- reserve all of it once, wherever the kernel
+     * puts it, and place everything inside our own reservation. Nothing foreign
+     * can be in there, so the Windows machinery below (candidate bases, slot
+     * probes, partial mirror views, retries) has no work to do.
+     */
+    {
+        void *window = w32_reserve_window((size_t)0x100000000ull + 0x10000u);
+        if (window)
+            g_memory_base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,
+                                            0, 0, g_memory_size, window);
+        if (g_memory_base)
+            fprintf(stderr, "  Guest window: 4 GB reserved at %p\n", window);
+    }
+#else
     {
         static const uintptr_t try_bases[] = {
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
@@ -1258,6 +1280,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
         }
     }
+
+#endif /* __APPLE__ */
 
     if (!g_memory_base) {
         fprintf(stderr, "xbox_MemoryLayoutInit: failed to map base view (%zu KB) -- no base "
@@ -2370,6 +2394,12 @@ int xbox_VerifyViewIntegrity(const char *tag)
     int foreign = 0;
 
     if (!g_memory_base) return 0;
+#if defined(__APPLE__)
+    /* The Windows check looks for foreign allocations inside the guest view with VirtualQuery. Here the
+     * whole 4 GB window is our own reservation (w32_reserve_window), so nothing foreign can be in it. */
+    (void)tag; (void)p; (void)end; (void)mbi;
+    return 0;
+#endif
 
     p   = (unsigned char *)g_memory_base;
     end = p + g_memory_size;

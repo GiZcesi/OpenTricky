@@ -37,6 +37,11 @@ endif()
 
 if(WIN32)
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm)
+elseif(APPLE)
+    # macOS: SDL3 audio output (apu_xaudio2.c, OT_SDL_AUDIO), as the window and input use SDL3
+    find_package(SDL3 CONFIG REQUIRED)
+    target_compile_definitions(xbox_apu PRIVATE OT_SDL_AUDIO=1)
+    target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
 else()
     # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
     find_package(SDL2 REQUIRED)

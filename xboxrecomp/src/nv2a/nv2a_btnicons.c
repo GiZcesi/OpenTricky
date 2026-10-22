@@ -9,7 +9,12 @@
 #endif
 #define COBJMACROS
 #include <windows.h>
+#ifdef _WIN32
 #include <wincodec.h>
+#else
+#include <SDL3/SDL.h>
+#include "../platform/ot_assets.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -287,6 +292,7 @@ static uint64_t fnv64(const uint8_t *p, uint32_t n)
     return h;
 }
 
+#ifdef _WIN32
 /* ── Drawings: PNG resources decoded by WIC to straight RGBA ───────────── */
 static int decode_png(const void *data, DWORD size, Img *out)
 {
@@ -332,6 +338,27 @@ done:
     if (uninit) CoUninitialize();
     return ok;
 }
+#else   /* not Windows: the pictures are files (ot_assets.c), decoded by SDL's PNG loader */
+static int decode_png(const void *data, size_t size, Img *out)
+{
+    SDL_Surface *sf = SDL_LoadPNG_IO(SDL_IOFromConstMem(data, size), true), *cv;
+    int ok = 0;
+    if (!sf) return 0;
+    cv = SDL_ConvertSurface(sf, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(sf);
+    if (!cv) return 0;
+    if (cv->w > 0 && cv->h > 0 && cv->w <= 1024 && cv->h <= 1024) {
+        out->rgba = (uint8_t *)malloc((size_t)cv->w * cv->h * 4);
+        if (out->rgba) {
+            int y;
+            for (y = 0; y < cv->h; y++) memcpy(out->rgba + (size_t)y * cv->w * 4, (const uint8_t *)cv->pixels + (size_t)y * cv->pitch, (size_t)cv->w * 4);
+            out->w = cv->w; out->h = cv->h; ok = 1;
+        }
+    }
+    SDL_DestroySurface(cv);
+    return ok;
+}
+#endif
 
 /* The replay help draws the D-pad disc and the two sticks on a dark
  * background, where the pack's near-black bodies vanish: their dark texels
@@ -351,10 +378,16 @@ static void lighten_body(Img *im)
 
 static int load_res(const char *name, Img *out)
 {
+#ifdef _WIN32
     HRSRC r = FindResourceA(NULL, name, MAKEINTRESOURCEA(10) /* RT_RCDATA */);
     HGLOBAL g = r ? LoadResource(NULL, r) : NULL;
     const void *p = g ? LockResource(g) : NULL;
     return p && decode_png(p, SizeofResource(NULL, r), out);
+#else
+    size_t n = 0;
+    const void *p = ot_asset(name, &n);
+    return p && decode_png(p, n, out);
+#endif
 }
 
 /* LB / RB (L1 / R1) shown wide in the race / trick HUD: their letters are
@@ -1065,7 +1098,11 @@ int btnicons_cfg_style(void)
 {
     const char *r;
     if (!btnicons_on() || !(r = cfg_res())) return 0;
+#ifdef _WIN32
     if (!FindResourceA(NULL, r, MAKEINTRESOURCEA(10))) return 0;
+#else
+    if (!ot_asset(r, NULL)) return 0;
+#endif
     return g_mode == MODE_PS2 ? 1 : g_mode == MODE_PS ? 2 : 3;
 }
 

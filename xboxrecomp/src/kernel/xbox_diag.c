@@ -1190,6 +1190,96 @@ void xbox_diag_stop(void)
 }
 
 #else  /* !_WIN32 */
-void xbox_diag_start(void) {}
-void xbox_diag_stop(void) {}
+/* The diagnostics console is Windows-only; its hooks are plain pointers the host sets. */
+void (*g_diag_shot_hook)(const wchar_t *path) = NULL;
+int  (*g_diag_press_hook)(const char *name, int ms) = NULL;
+void (*g_diag_drawlog_hook)(int frames) = NULL;
+void (*g_diag_skipprog_hook)(uint32_t hash) = NULL;
+void (*g_diag_ignored_hook)(void) = NULL;
+
+/* A small POSIX console (macOS): XBOX_DIAG_PORT=<port> listens on 127.0.0.1; lines "press <button> [ms]", "shot <path.png>", "help", "quit";
+ * each is answered with "OK" or "ERR <reason>". It lets a script walk the menus (press, then shot to look) the way the Windows console does. */
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+static int s_diag_listen = -1;
+
+static void diag_reply(int fd, const char *msg) { (void)!write(fd, msg, strlen(msg)); }
+
+static void diag_line(int fd, char *line)
+{
+    char *cmd = strtok(line, " \t\r\n"), *a1 = strtok(NULL, " \t\r\n"), *a2 = strtok(NULL, " \t\r\n");
+    if (!cmd) { diag_reply(fd, "OK\n"); return; }
+    if (!strcmp(cmd, "help")) { diag_reply(fd, "press <button> [ms] | shot <path.png> | quit\nOK\n"); return; }
+    if (!strcmp(cmd, "press")) {
+        if (!a1) { diag_reply(fd, "ERR usage: press <button> [ms]\n"); return; }
+        if (!g_diag_press_hook) { diag_reply(fd, "ERR no input hook\n"); return; }
+        diag_reply(fd, g_diag_press_hook(a1, a2 ? atoi(a2) : 150) ? "OK\n" : "ERR unknown button\n");
+        return;
+    }
+    if (!strcmp(cmd, "shot")) {
+        wchar_t w[1024];
+        if (!a1) { diag_reply(fd, "ERR usage: shot <path.png>\n"); return; }
+        if (!g_diag_shot_hook) { diag_reply(fd, "ERR no screenshot hook\n"); return; }
+        if (mbstowcs(w, a1, 1023) == (size_t)-1) { diag_reply(fd, "ERR bad path\n"); return; }
+        w[1023] = 0;
+        g_diag_shot_hook(w);
+        diag_reply(fd, "OK\n");
+        return;
+    }
+    diag_reply(fd, "ERR unknown command (try help)\n");
+}
+
+static void *diag_client(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    char buf[1024]; size_t n = 0;
+    for (;;) {
+        char c;
+        ssize_t r = read(fd, &c, 1);
+        if (r <= 0) break;
+        if (c == '\n') { buf[n] = 0; if (!strncmp(buf, "quit", 4)) { diag_reply(fd, "OK\n"); break; } diag_line(fd, buf); n = 0; }
+        else if (n < sizeof buf - 1) buf[n++] = c;
+    }
+    close(fd);
+    return NULL;
+}
+
+static void *diag_accept(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        int fd = accept(s_diag_listen, NULL, NULL);
+        pthread_t t;
+        if (fd < 0) break;
+        if (pthread_create(&t, NULL, diag_client, (void *)(intptr_t)fd) == 0) pthread_detach(t); else close(fd);
+    }
+    return NULL;
+}
+
+void xbox_diag_start(void)
+{
+    const char *e = getenv("XBOX_DIAG_PORT");
+    struct sockaddr_in a; int one = 1, port; pthread_t t;
+    if (!e || !e[0] || s_diag_listen >= 0) return;
+    port = atoi(e);
+    if (port <= 0 || port > 65535) return;
+    s_diag_listen = socket(AF_INET, SOCK_STREAM, 0);
+    if (s_diag_listen < 0) return;
+    setsockopt(s_diag_listen, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);     /* this machine only */
+    if (bind(s_diag_listen, (struct sockaddr *)&a, sizeof a) != 0 || listen(s_diag_listen, 4) != 0) {
+        fprintf(stderr, "  [DIAG] cannot listen on 127.0.0.1:%d\n", port); close(s_diag_listen); s_diag_listen = -1; return;
+    }
+    if (pthread_create(&t, NULL, diag_accept, NULL) == 0) pthread_detach(t);
+    fprintf(stderr, "  [DIAG] console on 127.0.0.1:%d (press, shot, quit)\n", port);
+}
+void xbox_diag_stop(void) { if (s_diag_listen >= 0) { close(s_diag_listen); s_diag_listen = -1; } }
+int  xbox_diag_watch_host_write(uint32_t va, uint32_t len, int begin) { (void)va; (void)len; (void)begin; return 0; }
 #endif

@@ -398,3 +398,39 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 }
 
 #endif /* _WIN32 */
+
+#if !defined(_WIN32)
+#include "platform/xbox_winnt.h"
+/* No VEH here: the aperture is protected and the platform MMIO trap emulates the
+ * access (platform/mmio_trap.c). */
+#include "platform/mmio_trap.h"
+#define APU_MMIO_BASE  0xFE800000u
+#define APU_MMIO_SIZE  0x00080000u
+
+static uint64_t apu_trap_read(void *u, uint32_t off, unsigned size)
+{ (void)u; return mcpx_apu_mmio_read(g_apu_state, off, size); }
+static void apu_trap_write(void *u, uint32_t off, uint64_t v, unsigned size)
+{ (void)u; mcpx_apu_mmio_write(g_apu_state, off, v, size); }
+
+bool apu_mmio_install(uint8_t *mem_base)
+{
+    if (!g_apu_state) {
+        g_apu_state = mcpx_apu_init_standalone(mem_base);
+        if (!g_apu_state) {
+            fprintf(stderr, "  [APU] init failed -- aperture left as plain RAM\n");
+            return false;
+        }
+    }
+    if (!ot_mmio_trap(mem_base + APU_MMIO_BASE, APU_MMIO_SIZE, "APU",
+                      apu_trap_read, apu_trap_write, NULL)) {
+        fprintf(stderr, "  [APU] could not guard the aperture -- registers stay plain RAM\n");
+        return false;
+    }
+    fprintf(stderr, "  [APU] MCPX aperture trapped at Xbox VA 0x%08X (%u bytes)\n",
+            APU_MMIO_BASE, APU_MMIO_SIZE);
+    return true;
+}
+
+bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr, uint32_t fault_xbox_va, int is_write)
+{ (void)ctx; (void)fault_addr; (void)fault_xbox_va; (void)is_write; return false; }
+#endif /* !_WIN32 */

@@ -26,6 +26,7 @@ BOOL xbox_path_split_game_disc(const char* xbox_path, const char** remainder);
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -45,11 +46,6 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
         return NULL;
     return ObjectAttributes->ObjectName->Buffer;
 }
-
-/* ======================================================================== */
-#if defined(_WIN32)
-/* ====================  Win32 backend  =================================== */
-/* ======================================================================== */
 
 /* ---- Game disc served from an XDVDFS image ------------------------------
  *
@@ -173,6 +169,12 @@ static BOOL iso_try_open(PXBOX_OBJECT_ATTRIBUTES oa, PHANDLE out, NTSTATUS *stat
                                              : STATUS_SUCCESS;
     return TRUE;
 }
+
+/* ======================================================================== */
+#if defined(_WIN32)
+/* ====================  Win32 backend  =================================== */
+/* ======================================================================== */
+
 
 /* Convert Xbox create disposition to Win32 */
 static DWORD xbox_disposition_to_win32(ULONG Disposition)
@@ -1038,8 +1040,15 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
                 return STATUS_NO_MORE_FILES;
             }
             {
-                xdvdfs_entry *e = &ents[ih->enum_index++];
+                xdvdfs_entry *e = &ents[ih->enum_index];
                 size_t name_len = strlen(e->name);
+                /* never write past the caller's buffer (the entry is the fixed part plus the name) */
+                if ((size_t)Length < offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName) + name_len + 1) {
+                    IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
+                    IoStatusBlock->Information = 0;
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+                ih->enum_index++;
                 entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
                 memset(entry, 0, sizeof(*entry));
                 entry->FileNameLength = (ULONG)name_len;
@@ -1161,7 +1170,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->FileAttributes = ctx->find_data.dwFileAttributes;
     entry->FileNameLength = name_len;
     {
-        ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
+        ULONG header_size = (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
         if (name_len > 0 && (header_size + name_len) <= Length)
             memcpy(entry->FileName, filename_ansi, name_len);
         IoStatusBlock->Status = STATUS_SUCCESS;
@@ -1343,6 +1352,30 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
+    /* Game disc served from a mounted ISO? Answer from the image and skip the host
+     * filesystem entirely; writes to the disc are refused as on real hardware. */
+    {
+        NTSTATUS iso_status = STATUS_SUCCESS;
+        HANDLE   iso_h = INVALID_HANDLE_VALUE;
+        if (iso_try_open(ObjectAttributes, &iso_h, &iso_status)) {
+            if (NT_SUCCESS(iso_status) &&
+                (CreateDisposition == XBOX_FILE_CREATE ||
+                 CreateDisposition == XBOX_FILE_OVERWRITE ||
+                 CreateDisposition == XBOX_FILE_OVERWRITE_IF ||
+                 CreateDisposition == XBOX_FILE_SUPERSEDE)) {
+                iso_handle_free(iso_h);
+                iso_status = STATUS_MEDIA_WRITE_PROTECTED;
+                iso_h = INVALID_HANDLE_VALUE;
+            }
+            *FileHandle = iso_h;
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = iso_status;
+                IoStatusBlock->Information = NT_SUCCESS(iso_status) ? 1 : 0;
+            }
+            return iso_status;
+        }
+    }
+
     const char* xbox_path = get_xbox_path(ObjectAttributes);
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
@@ -1386,16 +1419,44 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    /* Read out of a mounted ISO. An explicit ByteOffset is a positioned read and does not
+     * disturb the handle's own position; otherwise read sequentially and advance it. */
+    {
+        iso_handle *ih = iso_handle_get(FileHandle);
+        if (ih) {
+            uint32_t off = (ByteOffset && ByteOffset->QuadPart >= 0)
+                         ? (uint32_t)ByteOffset->QuadPart : ih->pos;
+            uint32_t got;
+            if (ih->mem) {
+                got = off < ih->size ? ih->size - off : 0;
+                if (got > Length) got = Length;
+                if (got) memcpy(Buffer, ih->mem + off, got);
+            } else {
+                got = xdvdfs_read(ih->sector, ih->size, off, Buffer, Length);
+            }
+            if (!(ByteOffset && ByteOffset->QuadPart >= 0))
+                ih->pos = off + got;
+            IoStatusBlock->Information = got;
+            if (got == 0 && Length > 0) {
+                IoStatusBlock->Status = STATUS_END_OF_FILE;
+                return STATUS_END_OF_FILE;
+            }
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            if (Event) SetEvent(Event);
+            return STATUS_SUCCESS;
+        }
+    }
+
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0) {
         IoStatusBlock->Status = STATUS_INVALID_HANDLE;
         return STATUS_INVALID_HANDLE;
     }
 
-    if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
-
-    ssize_t n = read(fd, Buffer, Length);
+    /* positioned read: pread leaves the shared fd offset alone, so two threads reading one handle cannot interleave */
+    ssize_t n = (ByteOffset && ByteOffset->QuadPart >= 0)
+              ? pread(fd, Buffer, Length, (off_t)ByteOffset->QuadPart)
+              : read(fd, Buffer, Length);
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1422,16 +1483,22 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    /* The disc is read-only, on real hardware and here. */
+    if (is_iso_handle(FileHandle)) {
+        IoStatusBlock->Status = STATUS_MEDIA_WRITE_PROTECTED;
+        IoStatusBlock->Information = 0;
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    }
+
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0) {
         IoStatusBlock->Status = STATUS_INVALID_HANDLE;
         return STATUS_INVALID_HANDLE;
     }
 
-    if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
-
-    ssize_t n = write(fd, Buffer, Length);
+    ssize_t n = (ByteOffset && ByteOffset->QuadPart >= 0)
+              ? pwrite(fd, Buffer, Length, (off_t)ByteOffset->QuadPart)
+              : write(fd, Buffer, Length);
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1448,6 +1515,11 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
+    /* Virtual ISO handles are not host handles: never pass one to CloseHandle. */
+    if (is_iso_handle(Handle)) {
+        iso_handle_free(Handle);
+        return STATUS_SUCCESS;
+    }
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         CloseHandle(Handle);
         return STATUS_SUCCESS;
@@ -1474,6 +1546,60 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+
+    /* Files on a mounted ISO: size, position and attributes come from the virtual handle. */
+    {
+        iso_handle *ih = iso_handle_get(FileHandle);
+        if (ih) {
+            const ULONG attrs = FILE_ATTRIBUTE_READONLY |
+                                (ih->is_dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL);
+            switch (FileInformationClass) {
+                case XboxFileStandardInformation: {
+                    PXBOX_FILE_STANDARD_INFORMATION info = (PXBOX_FILE_STANDARD_INFORMATION)FileInformation;
+                    memset(info, 0, sizeof(*info));
+                    info->EndOfFile.QuadPart = ih->size;
+                    info->AllocationSize.QuadPart = (ih->size + 2047) & ~2047LL;   /* 2048-byte sectors */
+                    info->NumberOfLinks = 1;
+                    info->Directory = ih->is_dir ? TRUE : FALSE;
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    IoStatusBlock->Information = sizeof(*info);
+                    return STATUS_SUCCESS;
+                }
+                case XboxFilePositionInformation: {
+                    PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
+                    info->CurrentByteOffset.QuadPart = ih->pos;
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    IoStatusBlock->Information = sizeof(*info);
+                    return STATUS_SUCCESS;
+                }
+                case XboxFileBasicInformation: {
+                    PXBOX_FILE_BASIC_INFORMATION info = (PXBOX_FILE_BASIC_INFORMATION)FileInformation;
+                    memset(info, 0, sizeof(*info));
+                    info->FileAttributes = attrs;
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    IoStatusBlock->Information = sizeof(*info);
+                    return STATUS_SUCCESS;
+                }
+                case XboxFileNetworkOpenInformation: {
+                    /* The size-and-attributes-in-one-call class SSX Tricky's FILE_size uses; left
+                     * unanswered it reads the file with Length = 0xFFFFFFFF (see the Windows branch). */
+                    PXBOX_FILE_NETWORK_OPEN_INFORMATION info = (PXBOX_FILE_NETWORK_OPEN_INFORMATION)FileInformation;
+                    memset(info, 0, sizeof(*info));
+                    info->EndOfFile.QuadPart = ih->size;
+                    info->AllocationSize.QuadPart = (ih->size + 2047) & ~2047LL;
+                    info->FileAttributes = attrs;
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    IoStatusBlock->Information = sizeof(*info);
+                    return STATUS_SUCCESS;
+                }
+                default:
+                    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                        "NtQueryInformationFile: unhandled class %d on an ISO handle", FileInformationClass);
+                    IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
+                    return STATUS_NOT_IMPLEMENTED;
+            }
+        }
+    }
 
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0)
@@ -1545,6 +1671,25 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
+    /* Mounted ISO: seeking moves the virtual position; anything that would modify the disc is
+     * refused as write-protected, which is what real hardware reports. */
+    {
+        iso_handle *ih = iso_handle_get(FileHandle);
+        if (ih) {
+            if (FileInformationClass == XboxFilePositionInformation) {
+                PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
+                LONGLONG off = info->CurrentByteOffset.QuadPart;
+                if (off < 0) off = 0;
+                if (off > (LONGLONG)ih->size) off = (LONGLONG)ih->size;
+                ih->pos = (uint32_t)off;
+                IoStatusBlock->Status = STATUS_SUCCESS;
+                return STATUS_SUCCESS;
+            }
+            IoStatusBlock->Status = STATUS_MEDIA_WRITE_PROTECTED;
+            return STATUS_MEDIA_WRITE_PROTECTED;
+        }
+    }
+
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0)
         return STATUS_INVALID_HANDLE;
@@ -1598,7 +1743,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
-            int fd = w32_handle_fd(FileHandle);
+            int fd = is_iso_handle(FileHandle) ? -1 : w32_handle_fd(FileHandle);
             info->BytesPerSector = 512;
             info->SectorsPerAllocationUnit = 8;
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
@@ -1624,7 +1769,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
 
 NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
 {
-    int fd = w32_handle_fd(FileHandle);
+    int fd = is_iso_handle(FileHandle) ? -1 : w32_handle_fd(FileHandle);
     if (fd >= 0) fsync(fd);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
@@ -1643,6 +1788,21 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     if (!FileInformation)
         return STATUS_INVALID_PARAMETER;
     const char* xbox_path = get_xbox_path(ObjectAttributes);
+    {
+        const char *rel = NULL;
+        uint32_t sector = 0, size = 0;
+        uint8_t attrs = 0;
+        if (xdvdfs_is_mounted() && xbox_path && xbox_path_split_game_disc(xbox_path, &rel)) {
+            if (!xdvdfs_find(rel, &sector, &size, &attrs))
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            memset(FileInformation, 0, sizeof(*FileInformation));
+            FileInformation->EndOfFile.QuadPart = size;
+            FileInformation->AllocationSize.QuadPart = (size + 2047) & ~2047LL;
+            FileInformation->FileAttributes = FILE_ATTRIBUTE_READONLY |
+                ((attrs & XDVDFS_ATTR_DIRECTORY) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL);
+            return STATUS_SUCCESS;
+        }
+    }
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     if (stat(host_path, &st) != 0)
@@ -1679,6 +1839,56 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
+    /* Enumerate a directory inside a mounted ISO: one entry per call, the cursor kept on the
+     * virtual handle (RestartScan rewinds it), as the Windows branch does. */
+    {
+        iso_handle *ih = iso_handle_get(FileHandle);
+        if (ih) {
+            static xdvdfs_entry ents[512];            /* one scan at a time: guarded below */
+            static CRITICAL_SECTION cs; static BOOL cs_init;
+            uint32_t n;
+            PXBOX_FILE_DIRECTORY_INFORMATION entry;
+            if (!ih->is_dir) {
+                IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+                return STATUS_INVALID_PARAMETER;
+            }
+            if (!cs_init) { InitializeCriticalSection(&cs); cs_init = TRUE; }
+            EnterCriticalSection(&cs);
+            if (RestartScan) ih->enum_index = 0;
+            n = xdvdfs_list(ih->sector, ih->size, ents, (uint32_t)(sizeof(ents) / sizeof(ents[0])));
+            if (ih->enum_index >= n) {
+                LeaveCriticalSection(&cs);
+                IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+                return STATUS_NO_MORE_FILES;
+            }
+            {
+                xdvdfs_entry *e = &ents[ih->enum_index];
+                size_t name_len = strlen(e->name);
+                /* never write past the caller's buffer (the entry is the fixed part plus the name) */
+                if ((size_t)Length < offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName) + name_len + 1) {
+                    LeaveCriticalSection(&cs);          /* was returning with the section held: every later query deadlocked */
+                    IoStatusBlock->Status = STATUS_BUFFER_OVERFLOW;
+                    IoStatusBlock->Information = 0;
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+                ih->enum_index++;
+                entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
+                memset(entry, 0, sizeof(*entry));
+                entry->FileNameLength = (ULONG)name_len;
+                memcpy(entry->FileName, e->name, name_len);
+                entry->FileName[name_len] = '\0';
+                entry->EndOfFile.QuadPart = e->size;
+                entry->AllocationSize.QuadPart = (e->size + 2047) & ~2047LL;
+                entry->FileAttributes = FILE_ATTRIBUTE_READONLY |
+                    ((e->attrs & XDVDFS_ATTR_DIRECTORY) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL);
+            }
+            LeaveCriticalSection(&cs);
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = sizeof(*entry);
+            return STATUS_SUCCESS;
+        }
+    }
+
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
     EnterCriticalSection(&s_dir_cs);
 
@@ -1694,6 +1904,12 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         ctx->dir = NULL;
     }
 
+    {   extern volatile int s_save_trace;
+        if (s_save_trace > 0)
+            fprintf(stderr, "  [KTRACE] dir listing: handle %p restart %d pattern \"%.*s\" context %s\n", FileHandle, (int)RestartScan,
+                    (FileName && FileName->Buffer) ? (int)FileName->Length : 0, (FileName && FileName->Buffer) ? FileName->Buffer : "",
+                    ctx->dir ? "left over (open)" : "new");
+    }
     if (RestartScan || ctx->dir == NULL) {
         if (ctx->dir) { closedir(ctx->dir); ctx->dir = NULL; }
         const char* dpath = w32_handle_path(FileHandle);
@@ -1759,12 +1975,65 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->FileAttributes = mode_to_xbox_attrs(st.st_mode);
     entry->FileNameLength = name_len;
 
-    ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
+    ULONG header_size = (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
     if (name_len > 0 && (header_size + (ULONG)name_len) <= Length)
         memcpy(entry->FileName, de->d_name, name_len);
     IoStatusBlock->Status = STATUS_SUCCESS;
     IoStatusBlock->Information = header_size + name_len;
     return STATUS_SUCCESS;
+}
+
+
+/* Bookkeeping the Windows backend keeps for ISO-backed handles and directory
+ * enumeration contexts (see the _WIN32 branch). Handles here are pointers to
+ * heap objects rather than recycled small integers, so there is nothing to
+ * release; callers see "not an ISO handle" and "no directory context". */
+/* Host-rewritten files (xbox_file_hook.h): the POSIX backend accepts the hooks and
+ * never applies them, so OpenTricky's rewritten data files (button legends, ...)
+ * are served as the disc has them. Headless bring-up does not need them. */
+void xbox_file_add_hook(xbox_file_hook_match_fn match, xbox_file_hook_rewrite_fn rewrite)
+{ (void)match; (void)rewrite; }
+void xbox_file_set_hook(xbox_file_hook_match_fn match, xbox_file_hook_rewrite_fn rewrite)
+{ (void)match; (void)rewrite; }
+
+/* A virtual ISO handle gets its slot back when the title closes it (same switch as the Windows
+ * branch, XBOX_FIX_ISOCLOSE=0 keeps the old leak); 0 for any other handle. */
+int xbox_iso_handle_release(HANDLE Handle)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_FIX_ISOCLOSE"); on = !(e && e[0] == '0'); }
+    if (!on || !is_iso_handle(Handle)) return 0;
+    iso_handle_free(Handle);
+    return 1;
+}
+int xbox_iso_handles_in_use(void) { return s_iso_in_use; }
+/* The per-handle enumeration context (NtQueryDirectoryFile) must not outlive the handle: handles here are heap pointers that get reused, and a
+ * stale context left at the end of an earlier listing made the next directory opened on the same pointer look empty (the save's XCreateSaveGame
+ * enumerates "U:\\" twice, the second time found no files, and the game wrote its save to an unset path). Called when the handle is closed. */
+BOOL xbox_dir_context_bound(HANDLE FileHandle)
+{
+    BOOL bound = FALSE;
+    int i;
+    if (!s_dir_cs_init) return FALSE;
+    EnterCriticalSection(&s_dir_cs);
+    for (i = 0; i < MAX_DIR_CONTEXTS; i++)
+        if (s_dir_contexts[i].handle == FileHandle && s_dir_contexts[i].dir) { bound = TRUE; break; }
+    LeaveCriticalSection(&s_dir_cs);
+    return bound;
+}
+void xbox_dir_context_release(HANDLE FileHandle)
+{
+    int i;
+    if (!s_dir_cs_init || !FileHandle) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (i = 0; i < MAX_DIR_CONTEXTS; i++)
+        if (s_dir_contexts[i].handle == FileHandle) {
+            if (s_dir_contexts[i].dir) closedir(s_dir_contexts[i].dir);
+            s_dir_contexts[i].dir = NULL;
+            s_dir_contexts[i].handle = NULL;
+            s_dir_contexts[i].pattern[0] = 0;
+        }
+    LeaveCriticalSection(&s_dir_cs);
 }
 
 #endif /* _WIN32 */

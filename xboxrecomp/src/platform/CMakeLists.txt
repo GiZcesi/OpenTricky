@@ -24,7 +24,9 @@ if(WIN32)
     add_library(platform INTERFACE)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
 else()
-    add_library(platform STATIC win32_compat.c)
+    add_library(platform STATIC win32_compat.c mmio_trap.c ot_assets.c)
+    # the folder the build was made from: where assets/resources.txt is found when the program runs from the build tree
+    target_compile_definitions(platform PRIVATE OT_DEFAULT_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../port/assets")
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}

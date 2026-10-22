@@ -15,6 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Set by the macOS GPU backend: emit Metal Shading Language (a `fragment` function over the backend's VSOut, texture(i) /
+ * sampler(i) per sampled stage, constants at buffer(0)) instead of HLSL. */
+int nv2a_psh_msl;
+
 typedef struct { char *buf; int size, len, overflow; } SB;
 
 static void sbf(SB *s, const char *fmt, ...)
@@ -48,7 +52,7 @@ typedef struct {
     In rgb_in[8][4], alpha_in[8][4];
     Out rgb_out[8], alpha_out[8];
     In fin[7];
-    int final_enabled, clamp_sum, inv_v1, inv_r0;
+    int final_enabled, clamp_sum, inv_v1, inv_r0, samp_mask;
     char varE[2304], varF[2304];
 } Ps;
 
@@ -153,8 +157,8 @@ static void stage_code(Ps *ps, const In *in, const Out *o, int is_alpha, SB *cod
     get_input_var(ps, in[1], is_alpha, b, sizeof b);
     get_input_var(ps, in[2], is_alpha, c, sizeof c);
     get_input_var(ps, in[3], is_alpha, d, sizeof d);
-    snprintf(ab, sizeof ab, o->ab_op ? "dot(%s, %s)" : "(%s * %s)", a, b);
-    snprintf(cd, sizeof cd, o->cd_op ? "dot(%s, %s)" : "(%s * %s)", c, d);
+    snprintf(ab, sizeof ab, o->ab_op && !is_alpha ? "dot(%s, %s)" : "(%s * %s)", a, b);
+    snprintf(cd, sizeof cd, o->cd_op && !is_alpha ? "dot(%s, %s)" : "(%s * %s)", c, d);
     get_output(ab, o->mapping, abm, sizeof abm);
     get_output(cd, o->mapping, cdm, sizeof cdm);
     get_var(ps, o->ab, 1, abd, sizeof abd);
@@ -233,6 +237,59 @@ static const char preamble[] =
     "    return uv;\n"
     "}\n";
 
+/* MSL: everything up to the function header. VSOut matches the vertex shader in d3d8_gpu.c. */
+static const char msl_preamble[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VSOut { float4 pos [[position]]; float4 d0; float4 d1; float fog; float4 t0; float4 t1; float4 t2; float4 t3; };\n"
+    "struct PshConsts { float4 c0[9]; float4 c1[9]; float4 fog_color; float4 tex_size[4]; float4 alpha_ref; float4 clip_region[8]; };\n"
+    /* HLSL lets a scalar meet a vector in max/min/clamp; Metal wants matching types */
+    "static float3 max(float3 a, float b) { return max(a, float3(b)); }\n"
+    "static float4 max(float4 a, float b) { return max(a, float4(b)); }\n"
+    "static float3 clamp(float3 a, float lo, float hi) { return clamp(a, float3(lo), float3(hi)); }\n"
+    "static float4 clamp(float4 a, float lo, float hi) { return clamp(a, float4(lo), float4(hi)); }\n"
+    "static float sign1(float x) { x *= 255.0; return (x - 128.0) / 127.0; }\n"
+    "static float sign2(float x) { x *= 255.0; return x >= 128.0 ? (x - 255.5) / 127.5 : (x + 0.5) / 127.5; }\n"
+    "static float sign3(float x) { x *= 255.0; return x >= 128.0 ? (x - 256.0) / 127.0 : x / 127.0; }\n"
+    "static float3 dotmap_zero_to_one(float4 c) { return c.rgb; }\n"
+    "static float3 dotmap_minus1_to_1_d3d(float4 c) { return float3(sign1(c.r), sign1(c.g), sign1(c.b)); }\n"
+    "static float3 dotmap_minus1_to_1_gl(float4 c) { return float3(sign2(c.r), sign2(c.g), sign2(c.b)); }\n"
+    "static float3 dotmap_minus1_to_1(float4 c) { return float3(sign3(c.r), sign3(c.g), sign3(c.b)); }\n"
+    "static float3 dotmap_hilo_1(float4 c) {\n"
+    "    uint hi = ((uint)(c.a * 255.0) << 8) | (uint)(c.r * 255.0);\n"
+    "    uint lo = ((uint)(c.g * 255.0) << 8) | (uint)(c.b * 255.0);\n"
+    "    return float3(hi / 65535.0, lo / 65535.0, 1.0);\n"
+    "}\n"
+    "static float3 dotmap_hilo_hemisphere_d3d(float4 c) { return c.rgb; }\n"
+    "static float3 dotmap_hilo_hemisphere_gl(float4 c) { return c.rgb; }\n"
+    "static float3 dotmap_hilo_hemisphere(float4 c) { return c.rgb; }\n"
+    "static float2 remapCubeTo2D(float3 t) {\n"
+    "    float3 a = abs(t);\n"
+    "    float2 uv;\n"
+    "    if (a.x > a.y && a.x > a.z) uv = (t.x > 0.0 ? float2(-t.z, t.y) : float2(t.z, t.y)) / a.x;\n"
+    "    else if (a.y > a.x && a.y > a.z) uv = (t.y > 0.0 ? float2(t.x, -t.z) : float2(t.x, t.z)) / a.y;\n"
+    "    else uv = (t.z > 0.0 ? float2(t.x, t.y) : float2(-t.x, t.y)) / a.z;\n"
+    "    return uv;\n"
+    "}\n";
+
+/* In-place text substitution (the generated code is ours: a handful of HLSL spellings become their MSL ones). */
+static void subst(char *buf, int cap, const char *from, const char *to)
+{
+    int fl = (int)strlen(from), tl = (int)strlen(to);
+    char *p = buf;
+    while ((p = strstr(p, from)) != NULL) {
+        int len = (int)strlen(p);
+        if ((int)(p - buf) + len - fl + tl >= cap) {
+            static int told;      /* the rest keeps its HLSL spelling: the shader will not compile, which is then reported */
+            if (!told) { told = 1; fprintf(stderr, "[PSH] subst: '%s' does not fit the shader buffer\n", from); }
+            return;
+        }
+        memmove(p + tl, p + fl, (size_t)(len - fl + 1));
+        memcpy(p, to, (size_t)tl);
+        p += tl;
+    }
+}
+
 /* Normalised 2D coordinate expression for stage i from `coord` (a float2
  * expression): rect (linear) textures are addressed in texels. */
 static void norm2(const Ps *ps, int i, const char *coord, char *out, size_t n)
@@ -261,7 +318,8 @@ static void tex_code(Ps *ps, int i, SB *decl, SB *v)
     const char *dm = dotmap_funcs[ps->dot_map[i] & 7];
     char co[256], nrm[320];
 
-    if (stage_samples(mode))
+    if (stage_samples(mode)) ps->samp_mask |= 1 << i;
+    if (stage_samples(mode) && !nv2a_psh_msl)
         sbf(decl, "Texture2D tex%d : register(t%d);\nSamplerState smp%d : register(s%d);\n",
             i, i, i, i);
     switch (mode) {
@@ -477,6 +535,29 @@ int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
                 ops[st->alpha_func & 7]);
     }
 
+    if (nv2a_psh_msl) {
+        char sig[512] = ""; int n = 0;
+        subst(varsbuf, sizeof varsbuf, ".Sample(", ".sample(");
+        subst(codebuf, sizeof codebuf, ".Sample(", ".sample(");
+        subst(varsbuf, sizeof varsbuf, "lerp(", "mix(");
+        subst(codebuf, sizeof codebuf, "lerp(", "mix(");
+        subst(varsbuf, sizeof varsbuf, "discard;", "discard_fragment();");
+        subst(codebuf, sizeof codebuf, "discard;", "discard_fragment();");
+        for (i = 0; i < 4; i++)
+            if (ps.samp_mask & (1 << i))
+                n += snprintf(sig + n, sizeof sig - (size_t)n, ",\n    texture2d<float> tex%d [[texture(%d)]], sampler smp%d [[sampler(%d)]]", i, i, i, i);
+        sbf(&out, "%sfragment float4 fs_psh(VSOut i [[stage_in]], constant PshConsts &pcb [[buffer(0)]]%s) {\n", msl_preamble, sig);
+        sbf(&out, "constant float4 *c0 = pcb.c0; constant float4 *c1 = pcb.c1; float4 fog_color = pcb.fog_color;\n"
+                  "constant float4 *tex_size = pcb.tex_size; float4 alpha_ref = pcb.alpha_ref; constant float4 *clip_region = pcb.clip_region;\n");
+        if (st->window_clip)
+            sbf(&out, "{ float2 wc = i.pos.xy - 0.5; bool hit = false;\n"
+                      "  for (int k = 0; k < 8; k++)\n"
+                      "    if (all(wc >= clip_region[k].xy) && all(wc < clip_region[k].zw)) hit = true;\n"
+                      "  if (%shit) discard_fragment(); }\n", st->window_clip == 2 ? "" : "!");
+        sbf(&out, "%s%sreturn fragColor;\n}\n", varsbuf, codebuf);
+        if (out.overflow || decl.overflow || vars.overflow || code.overflow) return -1;
+        return out.len;
+    }
     sbf(&out, "%s%s", preamble, declbuf);
     sbf(&out, "float4 main(PSIn i) : SV_TARGET {\n");
     if (st->window_clip) {

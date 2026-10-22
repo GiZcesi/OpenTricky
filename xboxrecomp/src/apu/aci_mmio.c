@@ -35,6 +35,7 @@
 
 #include "aci_mmio.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Register file. Reads and writes land here; the side effects below are what
@@ -239,6 +240,21 @@ void aci_mmio_report(void)
     fflush(stderr);
 }
 
+/* Power-on register state, shared by both install paths. */
+static void aci_reset_regs(void)
+{
+    int ch;
+    memset(g_aci_regs, 0, sizeof(g_aci_regs));
+    /* PCR is deliberately NOT set here. On real hardware the codec is not
+     * ready at power-on -- it becomes ready a moment after the driver releases
+     * the AC-link cold reset, and aci_write() raises it there. Forcing it
+     * ready before the link is up let code that samples GLOB_STA early take a
+     * path the hardware would never give it. */
+    /* Park every bus-master channel halted, which is the post-reset state. */
+    for (ch = 0; ch < ACI_NABM_CHANNELS; ch++)
+        g_aci_regs[ACI_NABM_OFF + ch * ACI_CHANNEL_STRIDE + 0x06] = ACI_SR_DCH;
+}
+
 /* ---- instruction decode (same shape as apu_mmio_hook.c) - */
 
 #ifdef _WIN32
@@ -362,18 +378,8 @@ bool aci_mmio_install(void *mem_base)
 {
     DWORD old = 0;
     void *page = (uint8_t *)mem_base + XBOX_ACI_MMIO_BASE;
-    int ch;
 
-    memset(g_aci_regs, 0, sizeof(g_aci_regs));
-    /* PCR is deliberately NOT set here. On real hardware the codec is not
-     * ready at power-on -- it becomes ready a moment after the driver releases
-     * the AC-link cold reset, and aci_write() raises it there. Forcing it
-     * ready before the link is up let code that samples GLOB_STA early take a
-     * path the hardware would never give it. */
-    /* Park every bus-master channel halted, which is the post-reset state. */
-    for (ch = 0; ch < ACI_NABM_CHANNELS; ch++)
-        g_aci_regs[ACI_NABM_OFF + ch * ACI_CHANNEL_STRIDE + 0x06] = ACI_SR_DCH;
-
+    aci_reset_regs();
     if (!VirtualProtect(page, XBOX_ACI_MMIO_SIZE, PAGE_NOACCESS, &old)) {
         fprintf(stderr, "  [ACI] could not guard the aperture (error %lu) -- "
                         "audio registers stay plain RAM\n", GetLastError());
@@ -387,5 +393,22 @@ bool aci_mmio_install(void *mem_base)
 }
 
 #else
-bool aci_mmio_install(void *mem_base) { (void)mem_base; return false; }
+/* No exception handler to decode instructions in: the page is protected and the
+ * access is emulated by the platform MMIO trap (platform/mmio_trap.c). */
+#include "platform/mmio_trap.h"
+static uint64_t aci_trap_read(void *u, uint32_t off, unsigned size) { (void)u; return aci_read(off, size); }
+static void aci_trap_write(void *u, uint32_t off, uint64_t v, unsigned size) { (void)u; aci_write(off, v, size); }
+
+bool aci_mmio_install(void *mem_base)
+{
+    aci_reset_regs();
+    if (!ot_mmio_trap((uint8_t *)mem_base + XBOX_ACI_MMIO_BASE, XBOX_ACI_MMIO_SIZE, "ACI",
+                      aci_trap_read, aci_trap_write, NULL)) {
+        fprintf(stderr, "  [ACI] could not guard the aperture -- audio registers stay plain RAM\n");
+        return false;
+    }
+    fprintf(stderr, "  [ACI] AC'97 aperture trapped at Xbox VA 0x%08X (%u bytes)\n",
+            XBOX_ACI_MMIO_BASE, XBOX_ACI_MMIO_SIZE);
+    return true;
+}
 #endif /* _WIN32 */

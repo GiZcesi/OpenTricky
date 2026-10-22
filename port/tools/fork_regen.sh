@@ -30,6 +30,8 @@ FRESH="$ROOT/build/gen_fresh"
 AUDIT="$ROOT/xboxrecomp/tools/audit"
 FORK="$ROOT/port/tools/fork"
 PY="${PYTHON:-python}"
+# In-place extended-regex sed: GNU sed takes -i and -E; BSD sed (macOS) needs -i '' as two words.
+if sed --version >/dev/null 2>&1; then sedi() { sed -i -E "$@"; }; else sedi() { sed -i '' -E "$@"; }; fi
 UPTO=999; ONLY=0; SKIP=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -92,7 +94,7 @@ cp "$FORK/recomp_fork_shim.c" "$GEN/"
 # translated ones <name>_lifted (xapi_input_hle.c:11-13). The file number varies.
 for n in sub_0017FF2C sub_00180916 sub_0018098B sub_00180997 sub_00180B89 sub_00180BFA sub_00180C59 sub_00180C7B; do
     f=$(grep -l -E "^void ${n}\(void\)"$'\r'"?\$" "$GEN"/recomp_*.c)
-    sed -i -E "s/^void ${n}\(void\)(\r?)\$/void ${n}_lifted(void)\1/" "$f"
+    sedi "s/^void ${n}\(void\)(\r?)\$/void ${n}_lifted(void)\1/" "$f"
     grep -q -E "^void ${n}_lifted\(void\)" "$f" || { echo "rename $n failed"; exit 1; }
 done
 
@@ -104,7 +106,7 @@ echo "== [3b] hand-written bodies (checked against the XBE bytes)"
 # without popping its 8 arguments (esp 0x24 off at every caller).
 # Lifter convention for `ret N`: esp += 4 + N.
 STUBS="$GEN/recomp_stubs_unresolved.c"
-sed -i -E 's|^void sub_001788B2\(void\) \{ /\* 0x001788B2: not detected \*/ \}|void sub_001788B2(void) { esp += 0x24; return; /* ret 0x20 -- hand-written, fork_regen.sh [3b] */ }|' "$STUBS"
+sedi 's|^void sub_001788B2\(void\) \{ /\* 0x001788B2: not detected \*/ \}|void sub_001788B2(void) { esp += 0x24; return; /* ret 0x20 -- hand-written, fork_regen.sh [3b] */ }|' "$STUBS"
 grep -q 'sub_001788B2(void) { esp += 0x24' "$STUBS" || { echo "hand body 0x001788B2 not applied"; exit 1; }
 
 {

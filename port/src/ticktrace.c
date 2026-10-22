@@ -238,6 +238,7 @@ static void rd_note_fn(RdFn *t, uint32_t va, uint32_t off)
         }
 }
 
+#if defined(_WIN32)
 static LONG CALLBACK rd_veh(EXCEPTION_POINTERS *x)
 {
     DWORD code = x->ExceptionRecord->ExceptionCode;
@@ -292,6 +293,14 @@ static void rd_disarm(void)
     VirtualProtect((void *)s_rd_lo, s_rd_hi - s_rd_lo, s_rd_prot, &old);
     s_rd_renders++;
 }
+
+#else
+/* XBOX_TICKTRACE_READS watches guest memory for reads by write-protecting its pages and
+ * single-stepping each faulting instruction (a vectored exception handler plus the x86 trap
+ * flag). There is no equivalent wired for other hosts: arming reports failure. */
+static int  rd_arm(void)    { return 0; }
+static void rd_disarm(void) {}
+#endif /* _WIN32 */
 
 static void rd_report(void)
 {
@@ -478,7 +487,9 @@ void ticktrace_init(void)
             e = getenv("XBOX_TICKTRACE_READS_PHASE");
             s_rd_tick = e && !strcmp(e, "tick");
             s_rd_on = s_rd_nr && s_rd_nw && s_rd_seen;
+#if defined(_WIN32)
             if (s_rd_on) AddVectoredExceptionHandler(1, rd_veh);
+#endif
             if (!s_rev) rev_build();
         }
     }

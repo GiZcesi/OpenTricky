@@ -452,7 +452,26 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
 
 #else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
 
-bool nv2a_dac_trap_install(uint8_t *mem_base) { (void)mem_base; return false; }
+/* The DAC palette page (see the _WIN32 branch): protected, and its accesses
+ * emulated by the platform MMIO trap. Only the 4 KB page is a device; the rest of
+ * its 16 KB host page keeps behaving like RAM. */
+#include "platform/mmio_trap.h"
+static uint64_t dac_trap_read(void *u, uint32_t off, unsigned size)
+{ (void)u; return nv2a_mmio_read(nv2a_get_state(), NV2A_PRMDIO_OFFSET + off, size); }
+static void dac_trap_write(void *u, uint32_t off, uint64_t v, unsigned size)
+{ (void)u; nv2a_mmio_write(nv2a_get_state(), NV2A_PRMDIO_OFFSET + off, v, size); }
+
+bool nv2a_dac_trap_install(uint8_t *mem_base)
+{
+    if (!ot_mmio_trap(mem_base + NV2A_MMIO_BASE + NV2A_PRMDIO_OFFSET, 0x1000, "DAC",
+                      dac_trap_read, dac_trap_write, NULL)) {
+        fprintf(stderr, "  [DAC] could not trap the palette page -- gamma ramp ignored\n");
+        return false;
+    }
+    fprintf(stderr, "  [DAC] palette registers trapped at Xbox VA 0x%08X (4 KB)\n",
+            NV2A_MMIO_BASE + NV2A_PRMDIO_OFFSET);
+    return true;
+}
 bool nv2a_dac_handle_mmio(PCONTEXT ctx, uint32_t fault_xbox_va, int is_write)
 { (void)ctx; (void)fault_xbox_va; (void)is_write; return false; }
 

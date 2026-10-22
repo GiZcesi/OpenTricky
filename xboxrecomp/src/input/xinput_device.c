@@ -210,6 +210,10 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
 
+    {   /* macOS: the window owns the pads (SDL3); it rumbles them */
+        extern int ot_window_rumble(int port, unsigned short low, unsigned short high) __attribute__((weak));
+        if (ot_window_rumble && ot_window_rumble((int)dwPort, pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed)) return ERROR_SUCCESS;
+    }
     SDL_GameController *c = g_pads[dwPort];
     if (!c) return ERROR_DEVICE_NOT_CONNECTED;
 

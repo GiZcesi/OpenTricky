@@ -45,6 +45,7 @@
 #include "pumplag.h"
 #include "strmwalk.h"
 #include "chantfix.h"
+#include "pacing.h"
 #include "ticktrace.h"
 #include "../../xboxrecomp/src/kernel/xbox_perf.h"
 extern void (*perf_lookup(unsigned int xbox_va))(void);
@@ -171,13 +172,13 @@ void hook_lockrect_0016B1C0(void)
         d3d8_NoteGuestFramebufferLock();
         if (!seen_a) {
             seen_a = pbits;
-            d3d8_SetGuestFramebuffer(XBOX_PTR(pbits), pitch, w, h);
+            d3d8_SetGuestFramebuffer((const void *)XBOX_PTR(pbits), pitch, w, h);
             fprintf(stderr, "  [FB] guest framebuffer discovered: 0x%08X "
                     "pitch %u (%ux%u)\n", pbits, pitch, w, h);
             fflush(stderr);
         } else if (!seen_b) {
             seen_b = pbits;
-            d3d8_SetGuestFramebufferAlt(XBOX_PTR(pbits));
+            d3d8_SetGuestFramebufferAlt((const void *)XBOX_PTR(pbits));
             fprintf(stderr, "  [FB] second framebuffer discovered: 0x%08X "
                     "(double buffered)\n", pbits);
             fflush(stderr);
@@ -250,6 +251,12 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
      * default 2; 0 = the original walk, see strmwalk.h). */
     {
         recomp_func_t fn = strmwalk_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
+    /* Loading screens held long enough to be seen, the start countdown slowed (OT_MIN_LOAD_MS, OT_COUNTDOWN_SLOW; see pacing.h). */
+    {
+        recomp_func_t fn = pacing_lookup(xbox_va);
         if (fn) return fn;
     }
 

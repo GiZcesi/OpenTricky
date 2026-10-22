@@ -24,6 +24,20 @@
 #include "version.h"
 #include "kernel/xbox_xdvdfs.h"
 
+/* Path separators: Windows paths use '\', others '/'. The last separator of either
+ * kind, so a path written on one host still splits on the other. */
+#if defined(_WIN32)
+#define PATH_SEP "\\"
+#else
+#define PATH_SEP "/"
+#include <sys/stat.h>
+#endif
+static char *last_sep(char *s)
+{
+    char *a = strrchr(s, '\\'), *b = strrchr(s, '/');
+    return a > b ? a : b;
+}
+
 static BOOL to_path(const WCHAR *w, char *out, size_t n);   /* below */
 
 /* ── Settings file ─────────────────────────────────────────────────── */
@@ -66,14 +80,16 @@ static int res_list(int aspect, const Res **list)
     case LAUNCHER_ASPECT_329: *list = k_res329; return (int)(sizeof k_res329 / sizeof k_res329[0]);
     case LAUNCHER_ASPECT_AUTO: {
         static const int heights[] = { 2160, 1440, 1200, 1080, 720 };
-        DEVMODEW dm;
         int i, n = 0, mw = 1920, mh = 1080;
+#if defined(_WIN32)
+        DEVMODEW dm;
         memset(&dm, 0, sizeof dm);
         dm.dmSize = sizeof dm;
         if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth >= 640 && dm.dmPelsHeight >= 480) {
             mw = (int)dm.dmPelsWidth;
             mh = (int)dm.dmPelsHeight;
         }
+#endif
         {
             /* Test only: XBOX_MONITOR_SIZE=3440x1440 stands in for the monitor. */
             const char *e = getenv("XBOX_MONITOR_SIZE");
@@ -113,6 +129,10 @@ void launcher_init(uint32_t expected_entry_point)
 
 /* UTF-8 (settings.ini) <-> the ANSI paths the runtime opens. A path outside
  * the code page becomes its short 8.3 form, or empty if it has none. */
+#if !defined(_WIN32)
+#include "launcher_posix.inc"
+#endif
+#if defined(_WIN32)
 static BOOL u8_to_path(const char *u8, char *out, size_t n)
 {
     WCHAR w[MAX_PATH];
@@ -122,7 +142,9 @@ static BOOL u8_to_path(const char *u8, char *out, size_t n)
     if (!to_path(w, out, n)) { out[0] = '\0'; return FALSE; }
     return TRUE;
 }
+#endif /* _WIN32: u8_to_path */
 
+#if defined(_WIN32)
 static void path_to_u8(const char *ansi, char *out, size_t n)
 {
     WCHAR w[MAX_PATH];
@@ -130,17 +152,21 @@ static void path_to_u8(const char *ansi, char *out, size_t n)
     if (ansi[0] && MultiByteToWideChar(CP_ACP, 0, ansi, -1, w, MAX_PATH))
         WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL);
 }
+#endif /* _WIN32: path_to_u8 */
 
 /* The install root (settings_install_root): the folder of OpenTricky.exe and
  * settings.ini, where the saves (hdd\, portable.txt, Saves\) and a relative
  * HD pack or disc image are -- the parent of bin\ when the game is there. */
+#if defined(_WIN32)
 static void install_dir(char *out, size_t n)
 {
     char u8[SETTINGS_VALUE_MAX];
     out[0] = '\0';
     if (settings_install_root(u8, sizeof u8)) u8_to_path(u8, out, n);
 }
+#endif /* _WIN32: install_dir */
 
+#if defined(_WIN32)
 BOOL launcher_install_root_w(WCHAR *out, size_t n)
 {
     char u8[SETTINGS_VALUE_MAX];
@@ -153,12 +179,16 @@ BOOL launcher_install_root_w(WCHAR *out, size_t n)
     if (k && out[k - 1] == L'\\') out[k - 1] = 0;      /* "D:\" -> "D:": callers add "\<name>" */
     return TRUE;
 }
+#endif /* _WIN32: launcher_install_root_w */
 
+#if defined(_WIN32)
 static BOOL is_absolute(const char *p)
 {
     return (p[0] && p[1] == ':') || (p[0] == '\\' && p[1] == '\\');
 }
+#endif /* _WIN32: is_absolute */
 
+#if defined(_WIN32)
 void launcher_resolve_path(const char *path, char *out, size_t out_sz)
 {
     char base[MAX_PATH], joined[2 * MAX_PATH];
@@ -167,6 +197,7 @@ void launcher_resolve_path(const char *path, char *out, size_t out_sz)
     snprintf(joined, sizeof joined, "%s\\%s", base, path);
     if (!base[0] || !GetFullPathNameA(joined, (DWORD)out_sz, out, NULL)) snprintf(out, out_sz, "%s", path);
 }
+#endif /* _WIN32: launcher_resolve_path */
 
 /* settings.ini (settings.h, settings_locate): in the install root, beside
  * OpenTricky.exe, or in Documents\My Games\SSX Tricky when only that one exists. */
@@ -185,6 +216,7 @@ void launcher_config_path(char *out, size_t out_sz)
 
 /* The largest preset of the given shape whose window fits the primary
  * monitor's work area: a sensible first-run default. */
+#if defined(_WIN32)
 static void default_resolution(int aspect, int *w, int *h)
 {
     const Res *list;
@@ -202,6 +234,18 @@ static void default_resolution(int aspect, int *w, int *h)
     *w = list[best].w;
     *h = list[best].h;
 }
+#else
+/* No window frame to allow for: the largest preset that fits 1920x1080. */
+static void default_resolution(int aspect, int *w, int *h)
+{
+    const Res *list;
+    int n = res_list(aspect, &list), i, best = 0;
+    for (i = 0; i < n; i++)
+        if (list[i].w <= 1920 && list[i].h <= 1080) best = i;
+    *w = list[best].w;
+    *h = list[best].h;
+}
+#endif /* _WIN32: default_resolution */
 
 /* Resolution=auto (settings.ini): in fullscreen the monitor's own size (the
  * largest preset of the shape that fits it, for a fixed shape); in a window
@@ -442,11 +486,11 @@ void launcher_fork_apply(const LauncherConfig *cfg, const char *source)
     {   /* the shader disk cache, beside settings.ini (the path is not reported) */
         char dir[MAX_PATH], *slash;
         launcher_config_path(dir, sizeof dir);
-        slash = strrchr(dir, '\\');
+        slash = last_sep(dir);
         if (slash) slash[1] = '\0';
         else dir[0] = '\0';
         if (!getenv("XBOX_SHADER_CACHE_DIR") && strlen(dir) + 14 < sizeof dir) {
-            strcat(dir, "cache\\shaders");
+            strcat(dir, "cache" PATH_SEP "shaders");
             _putenv_s("XBOX_SHADER_CACHE_DIR", dir);
         }
     }
@@ -531,12 +575,12 @@ void launcher_log_path(char *out, size_t out_sz)
     char ini[MAX_PATH], exe[MAX_PATH], *slash, *name, *dot;
     DWORD k;
     launcher_config_path(ini, sizeof ini);
-    slash = strrchr(ini, '\\');
+    slash = last_sep(ini);
     if (slash) slash[1] = '\0';
     else ini[0] = '\0';
     k = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
     if (k == 0 || k >= sizeof exe) snprintf(exe, sizeof exe, "SSX Tricky.exe");
-    name = strrchr(exe, '\\');
+    name = last_sep(exe);
     name = name ? name + 1 : exe;
     dot = strrchr(name, '.');
     if (dot) *dot = '\0';
@@ -544,6 +588,7 @@ void launcher_log_path(char *out, size_t out_sz)
 }
 
 /* A folder with something in it (the saves of an earlier version). */
+#if defined(_WIN32)
 static BOOL folder_has_files(const WCHAR *dir)
 {
     WCHAR pat[MAX_PATH + 4];
@@ -560,6 +605,7 @@ static BOOL folder_has_files(const WCHAR *dir)
     FindClose(h);
     return any;
 }
+#endif /* _WIN32: folder_has_files */
 
 /* Documents\My Games\SSX Tricky\Saves, created if missing. The
  * real Documents folder (moved, or synced by OneDrive, it still works).
@@ -567,6 +613,7 @@ static BOOL folder_has_files(const WCHAR *dir)
  * one earlier versions gave -- TRUE only when the path also has an ANSI or
  * short 8.3 form -- so the folder chosen for a player never moves (saves
  * already beside the game stay found); the game itself opens it wide. */
+#if defined(_WIN32)
 static BOOL documents_saves(WCHAR *out, size_t n)
 {
     PWSTR docs = NULL;
@@ -585,6 +632,7 @@ static BOOL documents_saves(WCHAR *out, size_t n)
     return GetShortPathNameW(out, sh, MAX_PATH) &&      /* a user name outside the code page */
            WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, sh, -1, a, (int)sizeof a, NULL, &lossy) && !lossy;
 }
+#endif /* _WIN32: documents_saves */
 
 int launcher_unlock_all(void)
 {
@@ -598,11 +646,21 @@ int launcher_unlock_all_folder(char *save_u8, size_t sz)
     size_t n = strlen(save_u8);
     while (n && (save_u8[n - 1] == '\\' || save_u8[n - 1] == '/')) save_u8[--n] = '\0';
     if (!n || n + 1 + strlen(LAUNCHER_UNLOCK_ALL_DIR) >= sz) return 0;
-    strcat(save_u8, "\\" LAUNCHER_UNLOCK_ALL_DIR);
+    strcat(save_u8, PATH_SEP LAUNCHER_UNLOCK_ALL_DIR);
     /* with its parents: the save folder itself may not exist yet, and the
      * runtime creates only the last level (xbox_path_init) */
+#if defined(_WIN32)
     if (MultiByteToWideChar(CP_UTF8, 0, save_u8, -1, w, MAX_PATH))
         SHCreateDirectoryExW(NULL, w, NULL);
+#else
+    (void)w;
+    {
+        char *c;
+        for (c = save_u8 + 1; *c; c++)          /* mkdir -p */
+            if (*c == '/') { *c = '\0'; mkdir(save_u8, 0777); *c = '/'; }
+        mkdir(save_u8, 0777);
+    }
+#endif
     return 1;
 }
 
@@ -616,6 +674,7 @@ int launcher_unlock_all_folder(char *save_u8, size_t sz)
  *   3. Documents\My Games\SSX Tricky\Saves, as PC games do (works when the
  *      game is installed where it cannot write, such as Program Files);
  *      Saves\ in the install root if Documents cannot be used. */
+#if defined(_WIN32)
 int launcher_save_kind(const LauncherConfig *cfg)
 {
     WCHAR base[MAX_PATH], p[MAX_PATH + 16], d[MAX_PATH];
@@ -630,7 +689,9 @@ int launcher_save_kind(const LauncherConfig *cfg)
     if (documents_saves(d, MAX_PATH)) return LAUNCHER_SAVES_DOCUMENTS;
     return LAUNCHER_SAVES_PORTABLE;
 }
+#endif /* _WIN32: launcher_save_kind */
 
+#if defined(_WIN32)
 void launcher_hdd_path(const LauncherConfig *cfg, char *out, size_t out_sz)
 {
     int kind = launcher_save_kind(cfg);
@@ -659,10 +720,12 @@ void launcher_hdd_path(const LauncherConfig *cfg, char *out, size_t out_sz)
     }
     WideCharToMultiByte(CP_UTF8, 0, full, -1, out, (int)out_sz, NULL, NULL);
 }
+#endif /* _WIN32: launcher_hdd_path */
 
 /* ── Saves left by 0.1.1 and earlier in a misnamed folder ─────────── */
 
 /* Files in `dir` and below (stops counting at `limit`). */
+#if defined(_WIN32)
 static int count_files(const WCHAR *dir, int limit)
 {
     WCHAR pat[MAX_PATH + 4], sub[MAX_PATH];
@@ -687,8 +750,10 @@ static int count_files(const WCHAR *dir, int limit)
     FindClose(h);
     return n;
 }
+#endif /* _WIN32: count_files */
 
 /* A save folder with saves in it: UDATA holding at least one file. */
+#if defined(_WIN32)
 static BOOL has_saves(const WCHAR *dir)
 {
     WCHAR u[MAX_PATH];
@@ -696,9 +761,11 @@ static BOOL has_saves(const WCHAR *dir)
     u[MAX_PATH - 1] = 0;
     return count_files(u, 1) > 0;
 }
+#endif /* _WIN32: has_saves */
 
 /* Copies `src` into `dst`, folders included; an existing file is never
  * replaced, nothing is moved or deleted. Returns the files copied. */
+#if defined(_WIN32)
 static int copy_tree(const WCHAR *src, const WCHAR *dst)
 {
     WCHAR pat[MAX_PATH + 4], s[MAX_PATH], d[MAX_PATH];
@@ -722,6 +789,7 @@ static int copy_tree(const WCHAR *src, const WCHAR *dst)
     FindClose(h);
     return n;
 }
+#endif /* _WIN32: copy_tree */
 
 /* Up to 0.1.1 the save folder reached the runtime as an ANSI path read as
  * UTF-8: with an accent (a chosen folder, or the Documents folder of an
@@ -730,6 +798,7 @@ static int copy_tree(const WCHAR *src, const WCHAR *dst)
  * existed. That folder is worked out the same way here; if it holds saves
  * and the real one has none, they are copied over. The old folder is left
  * as it is, and nothing is done in any other case. */
+#if defined(_WIN32)
 void launcher_migrate_saves(const char *save_u8)
 {
     WCHAR real[MAX_PATH], ghost[MAX_PATH];
@@ -756,7 +825,9 @@ void launcher_migrate_saves(const char *save_u8)
     printf("Saves:      %d file(s) copied from %s (an earlier version's folder, left as it is) to %s\n",
            n, g8, save_u8);
 }
+#endif /* _WIN32: launcher_migrate_saves */
 
+#if defined(_WIN32)
 void launcher_open_path(HWND owner, const char *path, BOOL folder)
 {
     WCHAR w[MAX_PATH];
@@ -768,6 +839,7 @@ void launcher_open_path(HWND owner, const char *path, BOOL folder)
         MessageBoxW(owner, msg, L"SSX Tricky", MB_ICONWARNING);
     }
 }
+#endif /* _WIN32: launcher_open_path */
 
 /* settings.ini as read at start (settings_load), for launcher_config_save:
  * what this window does not change is written back as it was. */
@@ -913,6 +985,7 @@ BOOL launcher_check_iso(const char *path, char *why, size_t why_sz)
 typedef BOOL (WINAPI *SetDpiCtxFn)(HANDLE);
 typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
 
+#if defined(_WIN32)
 void launcher_enable_dpi_awareness(void)
 {
     HMODULE u = GetModuleHandleW(L"user32.dll");
@@ -921,12 +994,14 @@ void launcher_enable_dpi_awareness(void)
     if (!set || !set((HANDLE)(INT_PTR)-4))
         SetProcessDPIAware();
 }
+#endif /* _WIN32: launcher_enable_dpi_awareness */
 
 /* ── Path helpers ──────────────────────────────────────────────────── */
 
 /* The runtime opens files through the ANSI API, so a path must survive the
  * conversion. If it does not (characters outside the code page), the short
  * 8.3 form usually does; failing that the path is refused. */
+#if defined(_WIN32)
 static BOOL to_path(const WCHAR *w, char *out, size_t n)
 {
     BOOL lossy = FALSE;
@@ -942,3 +1017,4 @@ static BOOL to_path(const WCHAR *w, char *out, size_t n)
     }
     return TRUE;
 }
+#endif /* _WIN32: to_path */

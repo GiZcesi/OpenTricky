@@ -42,11 +42,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#include <strings.h>
+#endif
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 #include "kernel/xbox_xdvdfs.h"
 #include "launcher.h"
+#include "ot_window.h"
 #include "version.h"
 #include "hostui.h"
 #include "controls.h"
@@ -56,6 +61,15 @@
 bool nv2a_dac_trap_install(unsigned char *mem_base);
 bool nv2a_dac_handle_mmio(PCONTEXT ctx, unsigned int fault_xbox_va, int is_write);
 #include "pass_tags.h"
+/* The load address of the executable, for turning a return address into an offset addr2line
+ * can resolve: the linker-provided __ImageBase on Windows, the Mach-O header elsewhere. */
+#if defined(_WIN32)
+#define IMAGE_BASE_DECL extern void *__ImageBase;
+#define IMAGE_BASE_PTR ((char *)&__ImageBase)
+#else
+#define IMAGE_BASE_DECL
+#define IMAGE_BASE_PTR ((char *)GetModuleHandleA(NULL))
+#endif
 #include "netplay/np_cmdlog.h"
 #include "netplay/np_ghost.h"
 #include "netplay/np_net.h"
@@ -197,6 +211,37 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
  * NULL. Lets a different game/image be pointed at without a rebuild --
  * useful now that the disc is read straight out of an ISO.
  */
+#if !defined(_WIN32)
+/* Command line as the C runtime gives it (set by main below). */
+static int    g_argc;
+static char **g_argv;
+
+static const char *find_iso_argument(void)
+{
+    int i;
+    /* the path right after --direct is the disc image whatever it is called (.iso, .xiso, .img ...) */
+    for (i = 1; i + 1 < g_argc; i++)
+        if (!strcmp(g_argv[i], "--direct") && g_argv[i + 1][0] && g_argv[i + 1][0] != '-') return g_argv[i + 1];
+    for (i = 1; i < g_argc; i++) {
+        size_t len = strlen(g_argv[i]);
+        if (len > 4 && strcasecmp(g_argv[i] + len - 4, ".iso") == 0) return g_argv[i];
+    }
+    return NULL;
+}
+
+/* TRUE if `flag` (e.g. L"--direct", ASCII) is on the command line. */
+static BOOL has_flag(const wchar_t *flag)
+{
+    int i;
+    for (i = 1; i < g_argc; i++) {
+        const char *a = g_argv[i];
+        const wchar_t *f = flag;
+        while (*a && *f && (wchar_t)(unsigned char)*a == *f) { a++; f++; }
+        if (!*a && !*f) return TRUE;
+    }
+    return FALSE;
+}
+#else
 static const char *find_iso_argument(void)
 {
     static char arg[MAX_PATH];
@@ -217,7 +262,7 @@ static const char *find_iso_argument(void)
 }
 
 /* TRUE if `flag` (e.g. L"--direct") is on the command line. */
-static BOOL has_flag(const WCHAR *flag)
+static BOOL has_flag(const wchar_t *flag)
 {
     int i, n = 0;
     BOOL found = FALSE;
@@ -228,6 +273,7 @@ static BOOL has_flag(const WCHAR *flag)
     LocalFree(wargv);
     return found;
 }
+#endif /* _WIN32 */
 
 /*
  * No good disc image in settings.ini (a first start by double-click, a disc
@@ -240,6 +286,7 @@ static BOOL has_flag(const WCHAR *flag)
  * started. The one started here gets --no-skip, so "Skip launcher" cannot
  * send it straight back to a game that refuses the disc image.
  */
+#if defined(_WIN32)
 static int open_launcher_instead(const char *why)
 {
     WCHAR exe[MAX_PATH], cmd[MAX_PATH + 16];
@@ -271,6 +318,14 @@ static int open_launcher_instead(const char *why)
     }
     return 0;
 }
+#else
+static int open_launcher_instead(const char *why)
+{
+    fprintf(stderr, "No good disc image (%s).\nChoose your SSX Tricky (USA) Xbox disc image in settings.ini "
+                    "(DiscImage=), or run with --direct <image.iso>.\n", why);
+    return 0;
+}
+#endif /* _WIN32 */
 
 /*
  * TRUE when standard output goes somewhere other than a person: a pipe, a
@@ -279,6 +334,7 @@ static int open_launcher_instead(const char *why)
  * standard output at all, and a real console answers GetConsoleMode, so both
  * of those still use settings.ini.
  */
+#if defined(_WIN32)
 static BOOL output_is_redirected(void)
 {
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -287,6 +343,9 @@ static BOOL output_is_redirected(void)
     if (GetConsoleMode(h, &mode)) return FALSE;
     return GetFileType(h) != FILE_TYPE_UNKNOWN;
 }
+#else
+static BOOL output_is_redirected(void) { return !isatty(1); }
+#endif /* _WIN32 */
 
 /*
  * Read a whole file out of the mounted disc image into a freshly allocated
@@ -325,7 +384,11 @@ static void resolve_from_exe(const char *rel, char *out, size_t out_sz);
 
 static void resolve_from_exe_or_absolute(const char *p, char *out, size_t out_sz)
 {
+#if defined(_WIN32)
     BOOL absolute = (p[0] && p[1] == ':') || (p[0] == '\\' && p[1] == '\\');
+#else
+    BOOL absolute = p[0] == '/';
+#endif
     if (absolute) {
         strncpy(out, p, out_sz - 1);
         out[out_sz - 1] = '\0';
@@ -347,10 +410,18 @@ static void resolve_from_exe(const char *rel, char *out, size_t out_sz)
         return;
     }
 
+#if defined(_WIN32)
     slash = strrchr(exe, '\\');
+#else
+    slash = strrchr(exe, '/');
+#endif
     if (slash) *slash = '\0'; else exe[0] = '\0';
 
+#if defined(_WIN32)
     snprintf(joined, sizeof(joined), "%s\\%s", exe, rel);
+#else
+    snprintf(joined, sizeof(joined), "%s/%s", exe, rel);
+#endif
 
     if (GetFullPathNameA(joined, (DWORD)out_sz, out, NULL) == 0) {
         strncpy(out, joined, out_sz - 1);
@@ -361,6 +432,7 @@ static void resolve_from_exe(const char *rel, char *out, size_t out_sz)
 /* resolve_from_exe for xbox_path_init, which takes UTF-8 and opens files
  * through the wide calls: built wide, so a game folder with accents (or any
  * name outside the code page) reaches the runtime intact. */
+#if defined(_WIN32)
 static void resolve_from_exe_u8(const char *rel, char *out, size_t out_sz)
 {
     WCHAR exe[MAX_PATH], wrel[MAX_PATH], joined[MAX_PATH * 2], full[MAX_PATH];
@@ -383,6 +455,12 @@ static void resolve_from_exe_u8(const char *rel, char *out, size_t out_sz)
     if (!WideCharToMultiByte(CP_UTF8, 0, full, -1, out, (int)out_sz, NULL, NULL))
         snprintf(out, out_sz, "%s", rel);
 }
+#else
+static void resolve_from_exe_u8(const char *rel, char *out, size_t out_sz)
+{   /* paths are UTF-8 throughout */
+    resolve_from_exe(rel, out, out_sz);
+}
+#endif /* _WIN32 */
 
 /* Recompiled entry point (generated by recomp pipeline) */
 extern void xbe_entry_point(void);
@@ -404,6 +482,7 @@ extern size_t recomp_dispatch_init(void);
  *   - Add dumps of game-specific globals (heap handles, state flags)
  *   - Add SEH simulation if your game uses __try/__except
  */
+#if defined(_WIN32)
 /* End of the stack scan below: 8 KB above the faulting rsp, but never past
  * the top of the thread's stack. A fault near the top of a shallow stack (a
  * thread that just started) otherwise faulted again inside this handler,
@@ -638,6 +717,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
     return EXCEPTION_CONTINUE_SEARCH;
 }
+#endif /* _WIN32: the vectored exception handler; macOS traps device pages in platform/mmio_trap.c */
 
 /*
  * Who reads guest VA 8 / 0xC?
@@ -662,7 +742,7 @@ void xbox_lowaccess_log(unsigned va, void *ra)
     for (i = 0; i < g_lowacc_n; i++)
         if (g_lowacc[i] == ra && g_lowacc_va[i] == va) { g_lowacc_hits[i]++; return; }
     if (g_lowacc_n < LOWACC_MAX) {
-        extern void *__ImageBase;
+        IMAGE_BASE_DECL
         g_lowacc[g_lowacc_n] = ra;
         g_lowacc_va[g_lowacc_n] = va;
         g_lowacc_hits[g_lowacc_n] = 1;
@@ -671,7 +751,7 @@ void xbox_lowaccess_log(unsigned va, void *ra)
          * so an atexit report never runs. */
         fprintf(stderr, "[LOWACC] new reader #%d va=0x%02X rva=0x%08llX\n",
                 g_lowacc_n, va,
-                (unsigned long long)((char *)ra - (char *)&__ImageBase));
+                (unsigned long long)((char *)ra - IMAGE_BASE_PTR));
         fflush(stderr);
     }
 }
@@ -679,12 +759,12 @@ void xbox_lowaccess_log(unsigned va, void *ra)
 static void xbox_lowaccess_report(void)
 {
     int i;
-    extern void *__ImageBase;
+    IMAGE_BASE_DECL
     if (!g_lowacc_n) { fprintf(stderr, "[LOWACC] no reads of VA 8/0xC\n"); return; }
     fprintf(stderr, "[LOWACC] %d distinct reader(s) of VA 8/0xC:\n", g_lowacc_n);
     for (i = 0; i < g_lowacc_n; i++)
         fprintf(stderr, "[LOWACC]   va=0x%02X rva=0x%08llX  x%u\n", g_lowacc_va[i],
-                (unsigned long long)((char *)g_lowacc[i] - (char *)&__ImageBase),
+                (unsigned long long)((char *)g_lowacc[i] - IMAGE_BASE_PTR),
                 g_lowacc_hits[i]);
     fflush(stderr);
 }
@@ -732,8 +812,13 @@ static void boothang_hook(void)
 
 /* ── WinMain ───────────────────────────────────────────────── */
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
-                   LPSTR lpCmdLine, int nCmdShow)
+#if defined(_WIN32)
+#define OT_WINMAIN WinMain
+#else
+#define OT_WINMAIN ot_winmain
+#endif
+int WINAPI OT_WINMAIN(HINSTANCE hInstance, HINSTANCE hPrevInstance,
+                      LPSTR lpCmdLine, int nCmdShow)
 {
     void *xbe_data = NULL;
     size_t xbe_size = 0;
@@ -756,7 +841,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     launcher_enable_dpi_awareness();
 
     /* Install VEH handler (first handler in chain) */
+#if defined(_WIN32)
     AddVectoredExceptionHandler(1, veh_handler);
+#endif
 
     /* Rider command log (XBOX_NETLOG=1). Off by default, and then
      * recomp_lookup_manual() hands out none of its hooks. */
@@ -968,6 +1055,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             xbox_SetVideoFlags(0x00010000u);
         if (aa) d3d8_SetMsaa(atoi(aa));
         if (an) d3d8_SetAnisotropy(atoi(an));
+        if (getenv("OT_HOME_DIR")) {   /* the macOS app starts the game with --direct but keeps the player's key and button bindings (settings.ini) */
+            controls_keep_essential(&launch_cfg.controls);
+            controls_set_current(&launch_cfg.controls);
+        }
         /* The menu is there in every mode; only launcher starts save to the
          * .ini, so a test run never rewrites the player's settings. */
         hostui_install(NULL, FALSE);
@@ -1033,10 +1124,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * in the .ini through the launcher above). Off by default: the translator
      * never looks at the index. The index the game carries is a resource. */
     {
+#if defined(_WIN32)
         HRSRC r = FindResourceA(NULL, "HDTEX_INDEX", MAKEINTRESOURCEA(10) /* RT_RCDATA */);
         HGLOBAL g = r ? LoadResource(NULL, r) : NULL;
         const char *text = g ? (const char *)LockResource(g) : NULL;
         if (text) hdtex_set_builtin_index(text, SizeofResource(NULL, r));
+#else
+        {   /* not Windows: the index is a file of the assets folder (platform/ot_assets.c) */
+            extern const void *ot_asset(const char *name, size_t *size);
+            size_t n = 0; const char *text = (const char *)ot_asset("HDTEX_INDEX", &n);
+            if (text) hdtex_set_builtin_index(text, n);
+        }
+#endif
     }
     /* Fork: three branches the lifter cut from their flags, never taken until the
      * generated code got the condition back (fork pass fix_deadflags.py).
@@ -1186,7 +1285,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             name[i < 40 ? i : 40] = '\0';
             printf("Title:      %s (ID %08X)\n", name, title_id);
             xbox_path_set_title_id(title_id);
+#if defined(_WIN32)
             SetConsoleTitleA(name[0] ? name : "Xbox recompilation");
+#endif
         }
     }
 
@@ -1525,6 +1626,7 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
  * ------------------------------------------------------------------ */
 extern volatile unsigned g_last_loc;
 
+#if defined(_WIN32)
 static LONG WINAPI recomp_crash_filter(EXCEPTION_POINTERS *ep)
 {
     const EXCEPTION_RECORD *r = ep->ExceptionRecord;
@@ -1590,13 +1692,34 @@ static LONG WINAPI recomp_crash_filter(EXCEPTION_POINTERS *ep)
     }
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#endif /* _WIN32 */
+
+#if !defined(_WIN32)
+static int ot_guest_main(void *unused)
+{
+    (void)unused;
+    return ot_winmain(NULL, NULL, NULL, 1);
+}
+#endif
 
 int main(int argc, char **argv)
 {
     crashreport_install();      /* XBOX_CRASH_REPORT=0: nothing */
+#if defined(_WIN32)
     SetUnhandledExceptionFilter(recomp_crash_filter);
 
     (void)argc;
     (void)argv;
     return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
+#else
+    g_argc = argc;
+    g_argv = argv;
+    if (ot_window_wanted()) {
+        /* The window and its event loop own the main thread; the game runs on a second one. */
+        extern void d3d8_SetFrameSink(void (*fn)(const uint8_t *rgba, unsigned w, unsigned h));
+        d3d8_SetFrameSink(ot_window_post_frame);
+        return ot_window_run(ot_guest_main, NULL);
+    }
+    return ot_winmain(NULL, NULL, NULL, 1);
+#endif
 }

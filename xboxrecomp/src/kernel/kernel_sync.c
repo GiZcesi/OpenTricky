@@ -14,6 +14,7 @@
  * Time values use NT 100-nanosecond units (negative = relative).
  */
 
+#include <limits.h>
 #include "kernel.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +38,8 @@ static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
 
     if (Timeout->QuadPart < 0) {
         /* Relative: negative 100ns units */
-        LONGLONG relative_100ns = -Timeout->QuadPart;
+        LONGLONG relative_100ns = Timeout->QuadPart == LLONG_MIN ? LLONG_MAX : -Timeout->QuadPart;
+        if (relative_100ns / 10000 >= (LONGLONG)INFINITE) return INFINITE;     /* beyond 49 days: not a wrapped-around short wait */
         DWORD ms = (DWORD)(relative_100ns / 10000);
         if (ms == 0 && relative_100ns > 0)
             ms = 1;
@@ -50,6 +52,7 @@ static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
     LONGLONG diff = Timeout->QuadPart - now.QuadPart;
     if (diff <= 0)
         return 0;
+    if (diff / 10000 >= (LONGLONG)INFINITE) return INFINITE;
     return (DWORD)(diff / 10000);
 }
 

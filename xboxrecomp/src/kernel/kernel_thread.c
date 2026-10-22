@@ -11,6 +11,7 @@
  *   - Thread priorities use NT KPRIORITY increments
  */
 
+#include <limits.h>
 #include "kernel.h"
 
 /* ============================================================================
@@ -174,8 +175,8 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
 
     if (Interval->QuadPart < 0) {
         /* Negative = relative time in 100ns units. Convert to milliseconds. */
-        LONGLONG relative_100ns = -Interval->QuadPart;
-        ms = (DWORD)(relative_100ns / 10000);
+        LONGLONG relative_100ns = Interval->QuadPart == LLONG_MIN ? LLONG_MAX : -Interval->QuadPart;
+        ms = relative_100ns / 10000 >= (LONGLONG)INFINITE ? INFINITE - 1 : (DWORD)(relative_100ns / 10000);   /* no wrap to a short sleep */
         /* A sub-millisecond wait yields rather than sleeping a whole
          * millisecond. Rounding up overshoots by up to 10x, and the title uses
          * these as short spin-waits: the intro video's playback loop issues
@@ -193,7 +194,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         LONGLONG diff = Interval->QuadPart - now.QuadPart;
         if (diff <= 0)
             return STATUS_SUCCESS; /* Already past */
-        ms = (DWORD)(diff / 10000);
+        ms = diff / 10000 >= (LONGLONG)INFINITE ? INFINITE - 1 : (DWORD)(diff / 10000);
     }
 
     if (Alertable) {

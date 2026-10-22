@@ -314,14 +314,23 @@ void controls_read_keyboard(ControlsPad *io)
 {
     ControlMap m;
     int i;
+#if defined(__APPLE__)
+    extern int w32_input_focused(void);
+    HWND game = (HWND)1;            /* the SDL window (ot_window.c) reports its own focus */
+#else
     HWND game = d3d8_GetHostWindow();
+#endif
     BOOL front;
     if (s_suspended || !game) return;
     /* Real keys only while the game window itself is in front: not in one
      * of our windows, not in another program. Nor while Alt is held: Alt is
      * never a binding, and Alt+Enter (full screen) or Alt+Tab must not also
      * press what Enter or Tab is bound to (Start, Select). */
+#if defined(__APPLE__)
+    front = w32_input_focused() && !(GetAsyncKeyState(VK_MENU) & 0x8000);
+#else
     front = GetForegroundWindow() == game && !(GetAsyncKeyState(VK_MENU) & 0x8000);
+#endif
     controls_get_current(&m);
     for (i = 0; i < CTL_COUNT; i++)
         if (m.key[i] && ((front && (GetAsyncKeyState(m.key[i]) & 0x8000)) || autokey_held(m.key[i])))

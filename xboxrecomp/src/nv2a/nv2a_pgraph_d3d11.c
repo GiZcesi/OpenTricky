@@ -14,6 +14,7 @@
 #include "../kernel/xbox_perf.h"
 extern int d3d8_pump_cache_on(void);
 #include <time.h>
+#include "nv2a_par.h"
 #include "nv2a_pgraph_d3d11.h"
 #include "nv2a_regs.h"
 #include <stdio.h>
@@ -432,6 +433,7 @@ void nv2a_drawlog_arm(int frames)
 #define PG_SUBST_TAG 0x0FF00000u
 static const uint8_t *g_subst_host;
 static uint32_t g_subst_size;
+static int g_subst_on;      /* set only while subst_draw's draws run: the two above are not trusted outside it */
 static pgraph_draw_subst_fn g_subst_fn;
 /* Flat-colour pass of a substituted draw's overlay: the pixel shader returns
  * g_flat_rgba (debug views only). */
@@ -455,15 +457,52 @@ void pgraph_d3d11_tex_binding(int stage, uint32_t *offset, uint32_t *format)
     *format = stage >= 0 && stage < 4 ? g_pg.tex[stage].format : 0;
 }
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+/* Is [p, p + n) readable host memory? A vertex array the title points at can lie in a part of the guest window that has no memory behind it (the
+ * hole between the RAM mirror and the GPU aperture): reading it is a SIGSEGV in this thread. Pages found readable are remembered (a direct-mapped
+ * table of 16 KB pages), so the check costs a system call only the first time a page is used. */
+static int pg_readable(const uint8_t *p, uint32_t n)
+{
+    static uintptr_t ok[4096];
+    uintptr_t a = (uintptr_t)p & ~(uintptr_t)0x3FFF, e = ((uintptr_t)p + n + 0x3FFF) & ~(uintptr_t)0x3FFF;
+    for (; a < e; a += 0x4000) {
+        uintptr_t slot = (a >> 14) & 4095u;
+        uint8_t b; mach_vm_size_t got = 0;
+        if (ok[slot] == a) continue;
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)a, 1, (mach_vm_address_t)(uintptr_t)&b, &got) != KERN_SUCCESS) return 0;
+        ok[slot] = a;
+    }
+    return 1;
+}
+#else
+static int pg_readable(const uint8_t *p, uint32_t n) { (void)p; (void)n; return 1; }
+#endif
+
 static const uint8_t *va_ptr(uint32_t offset, uint32_t need)
 {
     uint32_t off = offset & 0x0FFFFFFFu;
-    if (g_subst_host && off - PG_SUBST_TAG < g_subst_size)
+    if (g_subst_on && g_subst_host && off - PG_SUBST_TAG < g_subst_size)
         return need <= g_subst_size - (off - PG_SUBST_TAG) ? g_subst_host + (off - PG_SUBST_TAG) : NULL;
     if (!g_pg_mem_base || !g_pg_mem_size || need == 0)
         return NULL;
     if (off >= g_pg_mem_size || need > g_pg_mem_size - off)
         return NULL;
+    if ((uintptr_t)(g_pg_mem_base + off) < 0x100000000ull) {      /* below 4 GB: not the guest window (which sits at g_xbox_mem_offset) */
+        static int told;
+        if (told++ < 6)
+            fprintf(stderr, "[PGRAPH] vertex data pointer %p from memory base %p + 0x%08X is not in the guest window: not drawn\n",
+                    (const void *)(g_pg_mem_base + off), (const void *)g_pg_mem_base, off);
+        return NULL;
+    }
+    if (!pg_readable(g_pg_mem_base + off, need)) {
+        static int told;
+        if (told++ < 6)
+            fprintf(stderr, "[PGRAPH] vertex data at offset 0x%08X (+%u bytes) is not readable (memory base %p, window %u bytes): not drawn\n",
+                    offset, need, (const void *)g_pg_mem_base, g_pg_mem_size);
+        return NULL;
+    }
     return g_pg_mem_base + off;
 }
 
@@ -1916,9 +1955,23 @@ static void va_fetch4(int attr, uint32_t idx, float o[4])
     p = va_ptr(g_pg.vattr[attr].offset + idx * stride, 16);
     if (!p)
         return;
+    if ((uintptr_t)p < 0x100000000ull) {       /* not guest memory: see va_ptr (never seen to happen; reported if it does) */
+        static int told;
+        if (told++ < 6)
+            fprintf(stderr, "[PGRAPH] va_fetch4: attribute %d pointer %p (offset 0x%08X idx %u stride %u, memory base %p, subst %d host %p size %u)\n", attr, (const void *)p,
+                    g_pg.vattr[attr].offset, idx, stride, (const void *)g_pg_mem_base, g_subst_on, (const void *)g_subst_host, g_subst_size);
+        return;
+    }
     if (g_plag.patch && stride == 0) {  /* XBOX_PUMPLAG: the block as the title drew the part */
         uint32_t off = (g_pg.vattr[attr].offset & 0x0FFFFFFFu) - (g_plag.cb & 0x0FFFFFFFu);
-        if (off + 16u <= 0xE0u) p = g_plag.patch + off;
+        if (off + 16u <= 0xE0u) {
+            p = g_plag.patch + off;
+            if ((uintptr_t)p < 0x100000000ull) {
+                static int told2;
+                if (told2++ < 6) fprintf(stderr, "[PGRAPH] va_fetch4: pump-lag patch pointer %p (snap %p, off %u): not used\n", (const void *)p, (const void *)g_plag.patch, off);
+                return;
+            }
+        }
     }
     switch (type) {
     case NV2A_VA_TYPE_F:
@@ -2094,10 +2147,10 @@ static int vsh_vertex(uint32_t idx, ProgVertex *ov, float *psize)
     ov->y = truncf(out[VSHCPU_OUT_POS][1] * 16.0f) / 16.0f;
     ov->z = (g_pg.clip_max > 0.0f) ? out[VSHCPU_OUT_POS][2] / g_pg.clip_max
                                    : out[VSHCPU_OUT_POS][2];
-    if (ov->z < 0.0f) g_vs.z_neg++;
-    else if (ov->z > 1.0f) g_vs.z_over++;
-    if (ov->x < -64.0f || ov->x > 704.0f || ov->y < -64.0f || ov->y > 544.0f) g_vs.xy_off++;
-    if (w <= 0.0f) g_vs.w_neg++;
+    if (ov->z < 0.0f) __atomic_fetch_add(&g_vs.z_neg, 1, __ATOMIC_RELAXED);      /* vertices run on several threads */
+    else if (ov->z > 1.0f) __atomic_fetch_add(&g_vs.z_over, 1, __ATOMIC_RELAXED);
+    if (ov->x < -64.0f || ov->x > 704.0f || ov->y < -64.0f || ov->y > 544.0f) __atomic_fetch_add(&g_vs.xy_off, 1, __ATOMIC_RELAXED);
+    if (w <= 0.0f) __atomic_fetch_add(&g_vs.w_neg, 1, __ATOMIC_RELAXED);
     /* Near-plane clipping, as xemu's vsh-prog.c: keep w's sign,
      * clamp it away from zero and infinity, and let the rasteriser clip in
      * homogeneous space -- d3d8_nv2a.c's VS multiplies x, y, z back by w.
@@ -2235,9 +2288,16 @@ static void occ_clear(void)
 static void occ_enable(int on)
 {
     if (on && g_occ_open < 0) {
-        int h = d3d8_OcclusionBegin(), s;
+        int h = d3d8_OcclusionBegin(), s, k;
         if (h < 0) { g_occ_dropped++; return; }
-        s = h;                                    /* one span slot per query handle */
+        /* A span slot is a free entry of the table, not the query handle itself: the handle is whatever the backend numbers its queries with (the
+         * Metal backend counts up to 32767), and indexing the 256-entry table with it overran it and corrupted the memory behind it. */
+        s = -1;
+        for (k = 0; k < 256; k++) {
+            int c = (h + k) & 255;
+            if (g_occ_span[c].refs <= 0) { s = c; break; }
+        }
+        if (s < 0) { d3d8_OcclusionRelease(h); g_occ_dropped++; return; }
         g_occ_span[s].h = h; g_occ_span[s].refs = 1; g_occ_span[s].ready = 0; g_occ_span[s].n = 0;
         g_occ_open = s;
     } else if (!on && g_occ_open >= 0) {
@@ -3038,9 +3098,109 @@ static int draw_is_perspective(const uint32_t *indices, uint32_t start, uint32_t
     return fabsf(1.0f / v.rhw - 1.0f) > 1e-3f;
 }
 
+/* The CPU-transformed vertex buffer pointer of draw_program lives alone on a page that is read-only except while the
+ * pointer is being replaced (POSIX hosts). A rare crash was traced to this pointer holding 0x100000106: with the page
+ * protected, whatever writes it stray faults at once, and the crash report names the writer. */
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <errno.h>
+#include <string.h>
+static ProgVertex **g_vb_slot;
+static int g_vb_protected;       /* 1 only if the page really is read-only; otherwise this is a plain static and says so */
+static void vb_slot_report(const char *what)
+{
+    static int told;
+    if (!told) { told = 1; fprintf(stderr, "[NV2A] vb guard page: %s failed: %s; the guard is off\n", what, strerror(errno)); }
+    g_vb_protected = 0;
+}
+static ProgVertex *vb_slot_get(void)
+{
+    if (!g_vb_slot) {
+        /* a private anonymous mapping of its own: page-aligned, nothing else lives on it, so protecting it affects only
+         * this pointer */
+        void *pg = mmap(NULL, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        static ProgVertex *fallback;
+        if (pg == MAP_FAILED) { vb_slot_report("mmap"); g_vb_slot = &fallback; return NULL; }
+        *(ProgVertex **)pg = NULL;
+        g_vb_slot = (ProgVertex **)pg;
+        if (mprotect(pg, 16384, PROT_READ) != 0) vb_slot_report("mprotect(read-only)"); else { g_vb_protected = 1; fprintf(stderr, "[NV2A] vb guard page active (read-only, %p)\n", pg); }
+    }
+    return *g_vb_slot;
+}
+static void vb_slot_set(ProgVertex *v)
+{
+    if (g_vb_protected) {
+        void *pg = (void *)g_vb_slot;
+        if (mprotect(pg, 16384, PROT_READ | PROT_WRITE) != 0) {
+            /* the page is still read-only, so the store below could not succeed: say so and stop rather than fault obscurely */
+            fprintf(stderr, "[NV2A] vb guard page: mprotect(read-write) failed: %s; cannot update the vertex buffer pointer\n", strerror(errno));
+            abort();
+        }
+        *g_vb_slot = v;
+        if (mprotect(pg, 16384, PROT_READ) != 0) vb_slot_report("mprotect(read-only, again)");
+    } else {
+        *g_vb_slot = v;
+    }
+}
+#else
+static ProgVertex *g_vb_plain;
+static ProgVertex *vb_slot_get(void) { return g_vb_plain; }
+static void vb_slot_set(ProgVertex *v) { g_vb_plain = v; }
+#endif
+
+/* The vertex-program loops of draw_program run through nv2a_par_for (macOS: on several cores; elsewhere unchanged). */
+typedef struct {
+    const uint32_t *indices; uint32_t start; int points;
+    ProgVertex *vb; uint8_t *okb; float *psb;
+    ProgVertex *cv; uint8_t *cok; const uint32_t *need; uint32_t lo;
+} VshJob;
+#define VSH_PAR_MIN 128u
+static void vsh_job_seq(void *c, uint32_t a, uint32_t b)       /* start + i */
+{
+    VshJob *j = (VshJob *)c; uint32_t i;
+    for (i = a; i < b; i++) j->okb[i] = (uint8_t)vsh_vertex(j->start + i, &j->vb[i], j->points ? &j->psb[i] : NULL);
+}
+static void vsh_job_idx_points(void *c, uint32_t a, uint32_t b)  /* indices[i], with point sizes */
+{
+    VshJob *j = (VshJob *)c; uint32_t i;
+    for (i = a; i < b; i++) j->okb[i] = (uint8_t)vsh_vertex(j->indices[i], &j->vb[i], &j->psb[i]);
+}
+static void vsh_job_need(void *c, uint32_t a, uint32_t b)        /* the distinct indices of an indexed draw */
+{
+    VshJob *j = (VshJob *)c; uint32_t n;
+    for (n = a; n < b; n++) {
+        uint32_t idx = j->need[n], k = idx - j->lo;
+        j->cok[k] = (uint8_t)vsh_vertex(idx, &j->cv[k], NULL);
+    }
+}
+
+/* Monotonic nanoseconds for the draw_program timing lines (QueryPerformanceCounter on Windows: no clock_gettime there). */
+static uint64_t dp_now_ns(void)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    return (uint64_t)((double)t.QuadPart * 1e9 / (double)f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+static uint64_t g_dp_ns, g_dp_calls, g_dp_verts, g_dp_vs_ns;   /* g_dp_vs_ns: the vertex-program loops alone */     /* time in draw_program (CPU vertex programs + submit), for the backend's log line */
+uint64_t pgraph_d3d11_draw_program_ns(uint64_t *calls, uint64_t *verts, uint64_t *vs_ns) { *calls = g_dp_calls; *verts = g_dp_verts; *vs_ns = g_dp_vs_ns; return g_dp_ns; }
+static void draw_program_inner(const uint32_t *indices, uint32_t start, uint32_t count);
 static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count)
 {
-    static ProgVertex *vb = NULL, *tb = NULL;
+    uint64_t t0 = dp_now_ns();
+    draw_program_inner(indices, start, count);
+    g_dp_ns += dp_now_ns() - t0;
+    g_dp_calls++; g_dp_verts += count;
+}
+static void draw_program_inner(const uint32_t *indices, uint32_t start, uint32_t count)
+{
+    static ProgVertex *tb = NULL;
+    ProgVertex *vb;
     static uint8_t *okb = NULL;
     static float *psb = NULL;               /* point sizes, for mode 1 */
     static uint32_t cap = 0;
@@ -3050,17 +3210,19 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
     int points = g_pg.draw_mode == 1;
     Nv2aVshDraw gd;
     int gpu = 0;
+    memset(&gd, 0, sizeof gd);          /* no stale array pointers from an earlier stack use (a crash read one) */
     double pt0 = g_perf_on ? perf_now() : 0.0;
 
     if (count == 0)
         return;
+    vb = vb_slot_get();
     if (count > cap) {
         uint32_t c = count < 4096 ? 4096 : count;
         ProgVertex *a = (ProgVertex *)realloc(vb, c * sizeof *a);
         ProgVertex *b;
         uint8_t *k;
         if (!a) return;
-        vb = a;
+        vb = a; vb_slot_set(a);
         b = (ProgVertex *)realloc(tb, 6u * c * sizeof *b);
         if (!b) return;
         tb = b;
@@ -3087,13 +3249,16 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
               && !(g_panel.on && !g_panel.scale_only && g_ph.phase == PGRAPH_PHASE_HUD)  /* panel ends: CPU */
               && gpu_prepare(&gd, indices, start, count);
     }
+    uint64_t vt0 = dp_now_ns();
     if (gpu) {
         n = gd.nindices;
         prim = gd.topology;
     } else if (indices && points) {
         /* Indexed points: no reuse to exploit, and each needs its size. */
-        for (i = 0; i < count; i++)
-            okb[i] = (uint8_t)vsh_vertex(indices[i], &vb[i], &psb[i]);
+        VshJob j; memset(&j, 0, sizeof j);
+        j.indices = indices; j.vb = vb; j.okb = okb; j.psb = psb;
+        va_const_init();
+        nv2a_par_for(count, g_pg.prog_writes_c ? 0x7fffffffu : VSH_PAR_MIN, vsh_job_idx_points, &j);
     } else if (indices) {
         /* An indexed list references each vertex several times; run the
          * program once per distinct index. Stamped slots avoid clearing the
@@ -3113,14 +3278,21 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             cv = (ProgVertex *)malloc(VCACHE * sizeof *cv);
             cok = (uint8_t *)malloc(VCACHE);
         }
-        if (stamp && cv && cok && hi - lo < VCACHE) {
+        static uint32_t *need = NULL, need_cap = 0;
+        if (stamp && cv && cok && hi - lo < VCACHE && (count <= need_cap || ({ uint32_t *nn = (uint32_t *)realloc(need, (size_t)count * sizeof *need); if (nn) { need = nn; need_cap = count; } nn != NULL; }))) {
+            /* one program run per distinct index: mark them, run them (on several cores), then gather */
+            VshJob j; uint32_t nneed = 0;
             if (++now == 0) { memset(stamp, 0, VCACHE * sizeof *stamp); now = 1; }
             for (i = 0; i < count; i++) {
                 uint32_t k = indices[i] - lo;
-                if (stamp[k] != now) {
-                    cok[k] = (uint8_t)vsh_vertex(indices[i], &cv[k], NULL);
-                    stamp[k] = now;
-                }
+                if (stamp[k] != now) { stamp[k] = now; need[nneed++] = indices[i]; }
+            }
+            memset(&j, 0, sizeof j);
+            j.cv = cv; j.cok = cok; j.need = need; j.lo = lo;
+            va_const_init();
+            nv2a_par_for(nneed, g_pg.prog_writes_c ? 0x7fffffffu : VSH_PAR_MIN, vsh_job_need, &j);
+            for (i = 0; i < count; i++) {
+                uint32_t k = indices[i] - lo;
                 vb[i] = cv[k];
                 okb[i] = cok[k];
             }
@@ -3130,9 +3302,12 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         }
         #undef VCACHE
     } else {
-        for (i = 0; i < count; i++)
-            okb[i] = (uint8_t)vsh_vertex(start + i, &vb[i], points ? &psb[i] : NULL);
+        VshJob j; memset(&j, 0, sizeof j);
+        j.start = start; j.points = points; j.vb = vb; j.okb = okb; j.psb = psb;
+        va_const_init();
+        nv2a_par_for(count, g_pg.prog_writes_c ? 0x7fffffffu : VSH_PAR_MIN, vsh_job_seq, &j);
     }
+    g_dp_vs_ns += dp_now_ns() - vt0;
     /* XBOX_VSH_DUMPDRAW=N (diagnostic): for up to N large draws (>= 64
      * vertices, sampled every 2000th program draw), print the attribute
      * formats, the first vertex's inputs and the program's outputs. */
@@ -3492,6 +3667,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             ps.alphakill[st] = (uint8_t)((g_pg.tex[st].control0 >> 2) & 1);
             pc.tex_size[st][0] = (float)(1u << TEXFMT_SIZE_U(f));
             pc.tex_size[st][1] = (float)(1u << TEXFMT_SIZE_V(f));
+            pc.tex_size[st][2] = ps.tex_rect[st] ? 1.0f : 0.0f;   /* .z: texel-unit coordinates (read by the macOS GPU backend; the HLSL uses .xy only) */
             if (ps.tex_rect[st] && g_pg.tex[st].image_rect) {
                 /* Linear images: IMAGE_RECT width 31:16, height 15:0. */
                 pc.tex_size[st][0] = (float)(g_pg.tex[st].image_rect >> 16);
@@ -4064,6 +4240,7 @@ static int subst_draw(void)
     }
     g_subst_host = sub.host;
     g_subst_size = sub.size;
+    g_subst_on = 1;
     {
         uint32_t st;
         for (st = 0; st < 4; st++) {
@@ -4136,6 +4313,7 @@ static int subst_draw(void)
         g_pg.blend_enable = be; g_pg.blend_sfactor = sf; g_pg.blend_dfactor = df;
         g_pg.depth_mask = dm; g_pg.cull_enable = cu;
     }
+    g_subst_on = 0;
     g_subst_host = NULL;
     g_subst_size = 0;
     for (a = 0; a < 16; a++) g_pg.vattr[a].offset = saved[a];

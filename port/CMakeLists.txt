@@ -15,7 +15,9 @@ project(ssx_tricky C)
 
 # The game's icon and manifest (src/ssx_recomp.rc.in) need the resource
 # compiler (windres with MinGW, rc.exe with MSVC).
-enable_language(RC)
+if(WIN32)
+    enable_language(RC)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -49,6 +51,7 @@ if(NOT RECOMP_GEN_SOURCES)
         "stored in this repository -- see docs/building.md.")
 endif()
 
+if(WIN32)
 # ── Icon ───────────────────────────────────────────────────────
 # Made at build time from the player's own game files, in the build directory
 # only (tools/make_icon.py: the Garibaldi track badge by default);
@@ -101,6 +104,7 @@ set(SSX_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 configure_file(src/ssx_recomp.rc.in "${CMAKE_CURRENT_BINARY_DIR}/ssx_recomp.rc" @ONLY)
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/ssx_recomp.rc" PROPERTIES
     OBJECT_DEPENDS "${SSX_APP_ICON};${SSX_HDTEX_INDEX};${SSX_BTNICON_FILES};${SSX_SRC_DIR}/version.h;${SSX_SRC_DIR}/version_info.rc")
+endif()
 
 set(GAME_SOURCES
     src/main.c
@@ -108,8 +112,6 @@ set(GAME_SOURCES
     src/settings.c
     src/controls.c
     src/hostui.c
-    src/crashreport.c
-    "${CMAKE_CURRENT_BINARY_DIR}/ssx_recomp.rc"
     src/recomp_manual.c
     src/pass_tags.c
     src/fps_cap.c
@@ -119,6 +121,7 @@ set(GAME_SOURCES
     src/pumplag.c
     src/strmwalk.c
     src/chantfix.c
+    src/pacing.c
     src/ctlscheme.c
     src/ps2legend.c
     src/fullfade.c
@@ -132,6 +135,14 @@ set(GAME_SOURCES
     src/xapi_input_hle.c
     src/recomp/recomp_probe.c
 )
+
+# The Windows crash reporter (dbghelp minidumps, report folder, dialog) has no equivalent
+# elsewhere; crashreport_posix.c satisfies the same header.
+if(WIN32)
+    list(APPEND GAME_SOURCES src/crashreport.c)
+else()
+    list(APPEND GAME_SOURCES src/crashreport_posix.c)
+endif()
 
 # Build identity written into crash reports (crashreport.c): -DSSX_BUILD_ID=...
 # (a release name) wins; otherwise the commit at configure time, "+" when the
@@ -159,10 +170,17 @@ message(STATUS "Build identity for crash reports: ${SSX_BUILD_ID}")
 set_source_files_properties(src/crashreport.c PROPERTIES
     COMPILE_DEFINITIONS "SSX_BUILD_ID=\"${SSX_BUILD_ID}\"")
 
-add_executable(${PROJECT_NAME} WIN32
-    ${GAME_SOURCES}
-    ${RECOMP_GEN_SOURCES}
-)
+if(NOT WIN32)
+    # The port's sources include <windows.h> expecting the NT types and Win32 primitives;
+    # a few (aspect.c, drawdist.c) rely on it for string.h-level helpers. Force the shim in.
+    add_compile_options(-include ${XBOXRECOMP_DIR}/src/platform/windows.h -Wno-error=int-conversion)
+endif()
+if(WIN32)
+    list(APPEND GAME_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/ssx_recomp.rc")
+    add_executable(${PROJECT_NAME} WIN32 ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
+else()
+    add_executable(${PROJECT_NAME} ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
+endif()
 
 # Name the executable after the title in the XBE certificate ("SSX Tricky"),
 # falling back to that name when no XBE is present.
@@ -187,20 +205,46 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${XBOXRECOMP_DIR}/include
 )
 
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    d3d11
-    dxgi
-    dxguid
-    $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # XInput 1.4 ships with Windows
-    winmm
-    ws2_32      # netplay over UDP (XBOX_NET)
-    # Launcher: controls dialog, file/folder pickers, shell
-    comctl32
-    ole32
-    shell32
-    uuid
-    d3dcompiler
-)
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        d3d11
+        dxgi
+        dxguid
+        $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # XInput 1.4 ships with Windows
+        winmm
+        ws2_32      # netplay over UDP (XBOX_NET)
+        # Launcher: controls dialog, file/folder pickers, shell
+        comctl32
+        ole32
+        shell32
+        uuid
+        d3dcompiler
+    )
+elseif(APPLE)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads m)
+
+    # The game window (src/ot_window.c): SDL3, from Homebrew (brew install sdl3). OT_WINDOW=OFF builds
+    # without it; at run time OT_WINDOW=0 or XBOX_HEADLESS=1 runs the game on the main thread with no window.
+    option(OT_WINDOW "Open an SDL3 window (macOS)" ON)
+    target_sources(${PROJECT_NAME} PRIVATE src/ot_window.c)
+    if(OT_WINDOW)
+        # src/ot_menu_macos.m: the menu bar entries. Its own library: the game target force-includes the Windows compatibility header,
+        # which clashes with Cocoa's types.
+        enable_language(OBJC)
+        find_package(SDL3 CONFIG REQUIRED)
+        add_library(ot_menu STATIC src/ot_menu_macos.m)
+        set_target_properties(ot_menu PROPERTIES COMPILE_OPTIONS "")      # drop the directory-wide force-include
+        target_link_libraries(ot_menu PRIVATE SDL3::SDL3 "-framework Cocoa")
+        target_link_libraries(${PROJECT_NAME} PRIVATE ot_menu)
+        find_package(SDL3 CONFIG REQUIRED)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE OT_HAVE_WINDOW=1)
+        target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3)
+        if(OT_GPU)
+            target_compile_definitions(${PROJECT_NAME} PRIVATE OT_GPU_RENDERER=1)
+        endif()
+    endif()
+endif()
 
 # Host tests of the settings registry and settings.ini (no game):
 #   cmake -DSSX_BUILD_TESTS=ON ... ; cmake --build ... --target settings_test

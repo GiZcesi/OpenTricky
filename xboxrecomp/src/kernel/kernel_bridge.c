@@ -26,7 +26,9 @@
  */
 
 #include "xbox_perf.h"
+#if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
+#endif
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include <stdio.h>
@@ -60,6 +62,14 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
 /* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
 #define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)xbox_fold_ram_alias((uint32_t)(va)) + g_xbox_mem_offset) : NULL)
+
+/* Handle-table tagging (the table is further down). Host HANDLEs are 64-bit pointers here, so a handle
+ * can only live in a 32-bit Xbox slot as a token: tag in the high byte, table index below. */
+#define BRIDGE_HANDLE_TAG  0x48000000u
+#define BRIDGE_HANDLE_MASK 0x00FFFFFFu
+#define BRIDGE_HANDLE_MAX  16384
+static HANDLE bridge_read_handle(uint32_t va);   /* defined below */
+static void bridge_write_handle(uint32_t handle_va, HANDLE h);   /* defined below */
 
 /* ── Dispatcher-object VA -> native HANDLE resolution ──────
  * Real Xbox kernel dispatcher objects (KEVENT, KSEMAPHORE, ...) are structs
@@ -139,6 +149,9 @@ static HANDLE xbox_resolve_dispatcher_handle(uint32_t obj_va)
      * values that actually look like Xbox memory addresses go through the
      * lazy-synthesis path below. */
     if (obj_va < XBOX_BASE_ADDRESS) return (HANDLE)(uintptr_t)obj_va;
+    /* A bridge token (a thread handle the title stored, say): resolve it through the handle table
+     * instead of treating it as the address of a dispatcher object. */
+    if ((obj_va & 0xFF000000u) == BRIDGE_HANDLE_TAG) return bridge_read_handle(obj_va);
     /* One object, one key: an object in contiguous memory can be named by
      * its 0x80000000 alias or its plain address. */
     obj_va = xbox_fold_ram_alias(obj_va);
@@ -280,6 +293,7 @@ static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
 static volatile LONG g_tick_thread_running = 0;
 static HANDLE g_tick_thread = NULL;
 
+extern uint64_t xbox_guest_clock_lost(void);
 static DWORD WINAPI xbox_tick_count_thread(LPVOID param)
 {
     /* From the performance counter, not GetTickCount: GetTickCount
@@ -292,8 +306,10 @@ static DWORD WINAPI xbox_tick_count_thread(LPVOID param)
     QueryPerformanceCounter(&q0);
     while (g_tick_thread_running) {
         QueryPerformanceCounter(&q);
-        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) =
-            base + (DWORD)((q.QuadPart - q0.QuadPart) * 1000 / f.QuadPart);
+        {   /* the guest's KeTickCount follows the guest clock (see xbox_guest_clock_lost) */
+            uint64_t real = (uint64_t)((double)(q.QuadPart - q0.QuadPart) * 1e7 / (double)f.QuadPart), lost = xbox_guest_clock_lost();
+            BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = base + (DWORD)((real > lost ? real - lost : 0) / 10000ULL);
+        }
         Sleep(1);
     }
     return 0;
@@ -595,7 +611,11 @@ static void bridge_PsCreateSystemThreadEx(void)
                 /* Main game thread: run directly, inheriting register state */
                 int terminated;
                 if (xbox_handle_ptr) {
+#if defined(_WIN32)      /* the Windows build keeps writing the raw handle value, as before the macOS port */
                     BRIDGE_MEM32(xbox_handle_ptr) = (uint32_t)(uintptr_t)GetCurrentThread();
+#else
+                    bridge_write_handle(xbox_handle_ptr, GetCurrentThread());
+#endif
                 }
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
@@ -635,9 +655,13 @@ static void bridge_PsCreateSystemThreadEx(void)
 
                 hThread = CreateThread(NULL, 0, xbox_worker_thread_trampoline, params, 0, NULL);
                 if (hThread) {
+#if defined(_WIN32)
                     if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr) = (uint32_t)(uintptr_t)hThread;
-                    fprintf(stderr, "  [KERNEL]   worker thread handle = 0x%08X written to 0x%08X\n",
-                            (uint32_t)(uintptr_t)hThread, xbox_handle_ptr);
+#else
+                    bridge_write_handle(xbox_handle_ptr, hThread);     /* host handles are 64-bit: a token in the 32-bit guest slot */
+#endif
+                    fprintf(stderr, "  [KERNEL]   worker thread handle %p -> 0x%08X written to 0x%08X\n",
+                            hThread, xbox_handle_ptr ? BRIDGE_MEM32(xbox_handle_ptr) : 0u, xbox_handle_ptr);
                     fflush(stderr);
                     /* Intentionally not closed here -- the game may later wait on
                      * this handle (KeWaitForSingleObject/KeWaitForMultipleObjects,
@@ -1095,9 +1119,6 @@ static void bridge_NtCreateEvent(void)
 /* Handle-table tagging. Defined here rather than beside the table itself
  * further down because callers above need the tag to tell a bridge token
  * from a raw Xbox VA. */
-#define BRIDGE_HANDLE_TAG  0x48000000u
-#define BRIDGE_HANDLE_MASK 0x00FFFFFFu
-#define BRIDGE_HANDLE_MAX  16384
 
 static HANDLE bridge_read_handle(uint32_t va); /* defined below */
 
@@ -2244,6 +2265,10 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
 static void file_ledger_open(HANDLE h, const char *path);
 static void file_ledger_read(HANDLE h, uint32_t n);
 
+/* After a save folder is created on the save drive (a create with disposition 2 under "U:\"), the next kernel calls are traced in full
+ * (minus the busiest, uninteresting ones): the save's own steps, to find the one that goes wrong. */
+volatile int s_save_trace = 0;       /* also read by kernel_file.c's directory listing trace */
+
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
@@ -2265,6 +2290,26 @@ static NTSTATUS bridge_create_file_impl(
     }
     fprintf(stderr, "  [FILE] create/open: path=\"%s\" disposition=0x%X share=0x%X\n",
             name.Buffer, disposition, share);
+    {   /* A path made of the game's 0xDEADC0DE "never written" fill: a buffer used before it was filled (the save's Data.ssx open).
+         * Report where it lives and who called, once per open, so the code that should have written it can be found. */
+        static int told;
+        if (told < 6 && memmem(name.Buffer, strlen(name.Buffer), "\xDE\xC0\xAD\xDE", 4)) {
+            uint32_t as = BRIDGE_MEM32(obj_attrs_va + 4), bv = as ? BRIDGE_MEM32(as + 4) : 0, k;
+            void *fr[16];
+            unsigned short c = (unsigned short)CaptureStackBackTrace(0, 16, fr, NULL), i;
+            uintptr_t mb = (uintptr_t)GetModuleHandleW(NULL);
+            told++;
+            fprintf(stderr, "  [FILE] UNINITIALISED PATH: ObjectName at 0x%08X, Length %u, Buffer 0x%08X, root 0x%08X; host frames:",
+                    as, as ? BRIDGE_MEM16(as) : 0, bv, BRIDGE_MEM32(obj_attrs_va));
+            for (i = 0; i < c; i++)
+                fprintf(stderr, " 0x%llX", (unsigned long long)(0x140000000ULL + ((uintptr_t)fr[i] - mb)));
+            fprintf(stderr, "\n  [FILE]   the 64 bytes before the buffer:");
+            for (k = 0; bv >= 64 && k < 64; k++) fprintf(stderr, " %02X", BRIDGE_MEM8(bv - 64 + k));
+            fprintf(stderr, "\n  [FILE]   the last 32 bytes of the string:");
+            for (k = 0; as && k < 32 && BRIDGE_MEM16(as) >= 32; k++) fprintf(stderr, " %02X", BRIDGE_MEM8(bv + BRIDGE_MEM16(as) - 32 + k));
+            fprintf(stderr, "\n");
+        }
+    }
     {   /* A create (not an open) of a name ending in '\' is a file name that
          * came out empty (the save image copy). Report who built
          * it -- host frames resolve with addr2line, image base 0x140000000. */
@@ -2285,6 +2330,7 @@ static NTSTATUS bridge_create_file_impl(
 
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
                            file_attrs, share, disposition, options);
+    if (disposition == 2 && !strncmp(name.Buffer, "U:\\", 3) && name.Buffer[3]) { s_save_trace = 2500; fprintf(stderr, "  [KTRACE] save folder created: tracing the next kernel calls\n"); }
 
     fprintf(stderr, "  [FILE] create/open: path=\"%s\" -> status=0x%08X iso=%d\n", name.Buffer, (uint32_t)st,
             xbox_iso_handles_in_use());
@@ -4330,6 +4376,7 @@ static __thread int  t_trap_nan_on = 0;
 /* Report an invalid-operation trap with a native backtrace, then mask the
  * exception again in the faulting context and retry: the operation produces
  * its NaN as it would have, and the run continues to the next report. */
+#if defined(_WIN32)
 static LONG CALLBACK trap_nan_veh(EXCEPTION_POINTERS *ep)
 {
     static volatile LONG reports = 0;
@@ -4353,13 +4400,16 @@ static LONG CALLBACK trap_nan_veh(EXCEPTION_POINTERS *ep)
     ep->ContextRecord->MxCsr |= 0x0080u;          /* mask IM, retry */
     return EXCEPTION_CONTINUE_EXECUTION;
 }
+#endif /* _WIN32: x86 MXCSR trap; no arm64 equivalent */
 
 static void trap_nan_check_path(const char *path)
 {
     static const char *want = (const char *)-1;
     if (want == (const char *)-1) want = getenv("XBOX_TRAP_NAN_FILE");
     if (want && *want && path && strstr(path, want) && !g_trap_nan_armed) {
+#if defined(_WIN32)
         AddVectoredExceptionHandler(1, trap_nan_veh);
+#endif
         InterlockedExchange(&g_trap_nan_armed, 1);
         fprintf(stderr, "  [TRAPNAN] armed on %s\n", path);
         fflush(stderr);
@@ -4370,7 +4420,12 @@ static void kernel_thunk_dispatch(void)
 {
     if (g_trap_nan_armed && !t_trap_nan_on) {
         t_trap_nan_on = 1;
+#if defined(__x86_64__) || defined(__i386__)
         _mm_setcsr(_mm_getcsr() & ~0x0080u);   /* unmask invalid (IM) */
+#endif
+        /* (XBOX_TRAP_NAN is a debugging aid. Apple Silicon cannot trap on a
+         * floating-point exception -- the FPCR trap-enable bits are not
+         * implemented -- so on arm64 this is a no-op.) */
     }
     xbox_apply_tls_index_once();
     /* Sample the push buffer on the guest's own thread while the translator is
@@ -4529,6 +4584,24 @@ static void kernel_thunk_dispatch(void)
     if ((long)g_kernel_call_count <= kernel_call_log_limit()) {
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
         fflush(stderr);
+    }
+
+    if (s_save_trace > 0 && ordinal != 277 && ordinal != 294 && ordinal != 125 && ordinal != 150 && ordinal != 158 && ordinal != 99 &&
+        ordinal != 160 && ordinal != 161 && ordinal != 225 && ordinal != 145) {
+        s_save_trace--;
+        fprintf(stderr, "  [KTRACE] %u %s -> 0x%08X\n", ordinal, bridge_ordinal_name(ordinal), g_eax);
+        fflush(stderr);
+    }
+    {   /* A kernel call that failed (an NTSTATUS error, severity bits 11) is reported even when the general call trace is throttled:
+         * a few lines per call, so a title that checks a result we get wrong shows up (the save's XCreateSaveGame was found this way). */
+        static struct { uint32_t key; uint8_t n; } seen[512];       /* per (call, status) */
+        uint32_t key = (uint32_t)slot * 0x9E3779B1u ^ g_eax, h = key % 512u;
+        if ((g_eax & 0xC0000000u) == 0xC0000000u && (long)g_kernel_call_count > kernel_call_log_limit() &&
+            (seen[h].key == key || !seen[h].n) && seen[h].n < 4) {
+            seen[h].key = key; seen[h].n++;
+            fprintf(stderr, "  [KERNEL] failed call: ordinal %u %s -> 0x%08X\n", ordinal, bridge_ordinal_name(ordinal), g_eax);
+            fflush(stderr);
+        }
     }
 
     /* A point between two kernel calls of this guest thread, where an

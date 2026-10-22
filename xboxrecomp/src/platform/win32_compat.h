@@ -97,6 +97,13 @@ BOOL TryEnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID DeleteCriticalSection(LPCRITICAL_SECTION cs);
 
 /* ---- Condition variables (paired with a CRITICAL_SECTION) ----------- */
+/* One-time initialisation (InitOnceExecuteOnce) and the processor count (GetSystemInfo), as far as the port needs them. */
+typedef struct _INIT_ONCE { volatile LONG state; } INIT_ONCE, *PINIT_ONCE;
+#define INIT_ONCE_STATIC_INIT { 0 }
+typedef BOOL (*PINIT_ONCE_FN)(PINIT_ONCE once, PVOID param, PVOID *ctx);
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx);
+typedef struct _SYSTEM_INFO { DWORD dwPageSize; DWORD dwNumberOfProcessors; } SYSTEM_INFO, *LPSYSTEM_INFO;
+VOID GetSystemInfo(LPSYSTEM_INFO si);
 VOID InitializeConditionVariable(PCONDITION_VARIABLE cv);
 BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWORD ms);
 VOID WakeConditionVariable(PCONDITION_VARIABLE cv);
@@ -406,6 +413,9 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
  * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
  * ucontext_t; for now we accept the registration and never fire. */
 typedef void *PEXCEPTION_POINTERS;
+/* Incomplete on purpose: code that takes an EXCEPTION_POINTERS* compiles, code that
+ * reads x86 context out of one does not (it is Windows-only). */
+typedef struct _EXCEPTION_POINTERS EXCEPTION_POINTERS;
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
 PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
 ULONG RemoveVectoredExceptionHandler(PVOID Handle);
@@ -465,6 +475,11 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access,
                        DWORD offHigh, DWORD offLow, SIZE_T count, LPVOID baseAddr);
 BOOL   UnmapViewOfFile(LPCVOID baseAddr);
 #define CreateFileMapping CreateFileMappingA
+
+/* Reserve an address range for the process's own use (PROT_NONE, nothing
+ * committed). Fixed-address VirtualAlloc/MapViewOfFileEx inside it replace the
+ * placeholder instead of probing for a free spot. */
+void *w32_reserve_window(SIZE_T size);
 
 /* ---- Aligned allocation ---------------------------------------------- */
 void *_aligned_malloc(SIZE_T size, SIZE_T alignment);
@@ -528,6 +543,108 @@ static inline MMRESULT waveOutWrite(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
 { (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+
+
+/* ---- Interlocked (pointer), SRW locks, waitable timers ---------------- */
+PVOID InterlockedExchangePointer(PVOID volatile *p, PVOID v);
+
+typedef struct { PVOID Ptr; } SRWLOCK, *PSRWLOCK;
+#define SRWLOCK_INIT { NULL }
+VOID    InitializeSRWLock(PSRWLOCK l);
+VOID    AcquireSRWLockExclusive(PSRWLOCK l);
+VOID    AcquireSRWLockShared(PSRWLOCK l);
+VOID    ReleaseSRWLockExclusive(PSRWLOCK l);
+VOID    ReleaseSRWLockShared(PSRWLOCK l);
+BOOLEAN TryAcquireSRWLockExclusive(PSRWLOCK l);
+BOOLEAN TryAcquireSRWLockShared(PSRWLOCK l);
+
+#define TIMER_ALL_ACCESS                    0x001F0003u
+#define CREATE_WAITABLE_TIMER_MANUAL_RESET  0x00000001u
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002u
+typedef VOID (*PTIMERAPCROUTINE)(LPVOID arg, DWORD lo, DWORD hi);
+HANDLE CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access);
+BOOL   SetWaitableTimer(HANDLE h, const LARGE_INTEGER *due, LONG period,
+                        PTIMERAPCROUTINE fn, LPVOID arg, BOOL resume);
+BOOL   CancelWaitableTimer(HANDLE h);
+
+/* ---- Diagnostics / module / path queries ------------------------------ */
+USHORT  CaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash);
+HMODULE GetModuleHandleA(LPCSTR name);
+HMODULE GetModuleHandleW(LPCWSTR name);
+#define GetModuleHandle GetModuleHandleA
+DWORD   GetModuleFileNameA(HMODULE mod, LPSTR buf, DWORD size);
+BOOL    IsDebuggerPresent(void);
+BOOL    HeapValidate(HANDLE heap, DWORD flags, LPCVOID mem);
+VOID    DebugBreak(void);
+DWORD   GetTempPathA(DWORD size, LPSTR buf);
+BOOL    CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa);
+#ifndef ERROR_ALREADY_EXISTS
+#define ERROR_ALREADY_EXISTS 183u
+#endif
+#ifndef ERROR_PATH_NOT_FOUND
+#define ERROR_PATH_NOT_FOUND 3u
+#endif
+#ifndef ERROR_NOT_OWNER
+#define ERROR_NOT_OWNER 288u
+#endif
+#ifndef MAXIMUM_WAIT_OBJECTS
+#define MAXIMUM_WAIT_OBJECTS 64
+#endif
+
+/* VirtualQuery state/type values */
+#define MEM_FREE    0x10000u
+#define MEM_PRIVATE 0x20000u
+#define MEM_MAPPED  0x40000u
+#define MEM_IMAGE   0x1000000u
+
+/* 64-bit stdio seeks (MSVC names) */
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+
+
+/* ---- Pieces the OpenTricky port uses on top of the runtime's needs ----- */
+#define INVALID_FILE_ATTRIBUTES ((DWORD)0xFFFFFFFF)
+DWORD GetFileAttributesA(LPCSTR path);
+DWORD GetFullPathNameA(LPCSTR path, DWORD size, LPSTR out, LPSTR *filePart);
+BOOL  CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa);   /* 16-bit WCHAR path, UTF-16 */
+#include <wchar.h>
+#define MAPVK_VSC_TO_VK_EX 3
+#define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+static inline UINT MapVirtualKeyW(UINT code, UINT type) { (void)code; (void)type; return 0; }
+static inline HWND GetForegroundWindow(void) { return NULL; }
+#define _snwprintf swprintf
+static inline int _putenv_s(const char *n, const char *v) { return setenv(n, v, 1); }
+#define WC_NO_BEST_FIT_CHARS 0x00000400u            /* host wchar_t (32-bit); used for paths handed to no-op sinks */
+#define PAGE_GUARD 0x100u
+#include "ot_vk.h"
+#if defined(__aarch64__)
+#define YieldProcessor() __asm__ __volatile__("yield")
+#else
+#define YieldProcessor() __asm__ __volatile__("pause")
+#endif
+
+/* winmm timer resolution: nothing to do on a host with a high-resolution clock. */
+#define TIMERR_NOERROR 0
+static inline UINT timeBeginPeriod(UINT ms) { (void)ms; return TIMERR_NOERROR; }
+static inline UINT timeEndPeriod(UINT ms)   { (void)ms; return TIMERR_NOERROR; }
+
+/* shell: known folders and ShellExecute. Documents is $HOME/Documents; opening a
+ * folder in the file manager is not wired (ShellExecuteW reports failure). */
+typedef struct { int id; } KNOWNFOLDERID;
+extern const KNOWNFOLDERID FOLDERID_Documents;
+#define REFKNOWNFOLDERID const KNOWNFOLDERID *
+#define SUCCEEDED(hr) ((HRESULT)(hr) >= 0)
+#ifndef FAILED
+#define FAILED(hr) ((HRESULT)(hr) < 0)
+#endif
+HRESULT SHGetKnownFolderPath(const KNOWNFOLDERID *id, DWORD flags, HANDLE token, PWSTR *out);
+VOID    CoTaskMemFree(LPVOID p);
+HINSTANCE ShellExecuteW(HWND owner, LPCWSTR verb, LPCWSTR file, LPCWSTR params, LPCWSTR dir, int show);
+#define SW_SHOWNORMAL 1
+int     MessageBoxW(HWND hwnd, LPCWSTR text, LPCWSTR caption, UINT type);
+#ifndef MB_ICONWARNING
+#define MB_ICONWARNING 0x00000030u
+#endif
 
 #ifdef __cplusplus
 }

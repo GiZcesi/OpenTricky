@@ -84,6 +84,8 @@ static inline void xbox_path_normalize(char *p)
 #include <stddef.h>
 #include <stdarg.h>
 #include <string.h>   /* windows.h users relied on string.h being visible */
+#include <stdlib.h>   /* ... and stdlib.h / stdio.h (getenv, fprintf, stderr) */
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -263,6 +265,15 @@ typedef struct _SIZE  { LONG cx, cy; }                   SIZE,  *PSIZE,  *LPSIZE
 #define MAKEWORD(a,b)  ((WORD)(((BYTE)(a)) | ((WORD)((BYTE)(b))) << 8))
 #define MAKELONG(a,b)  ((LONG)(((WORD)(a)) | ((DWORD)((WORD)(b))) << 16))
 #endif
+
+/* Guest-visible widths. Windows is LLP64 and macOS/Linux are LP64, so any of
+ * these silently turning into `long` would change the size of every struct laid
+ * over guest memory. They are fixed-width typedefs above; this keeps them so. */
+_Static_assert(sizeof(LONG) == 4 && sizeof(ULONG) == 4 && sizeof(DWORD) == 4,
+               "LONG/ULONG/DWORD must be 32-bit (guest layout)");
+_Static_assert(sizeof(WORD) == 2 && sizeof(WCHAR) == 2, "WORD/WCHAR must be 16-bit");
+_Static_assert(sizeof(LONGLONG) == 8 && sizeof(ULONGLONG) == 8, "LONGLONG must be 64-bit");
+_Static_assert(sizeof(BOOL) == 4, "BOOL must be 32-bit");
 
 #ifdef __cplusplus
 }

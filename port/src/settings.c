@@ -20,6 +20,9 @@
 #else
 #include <sys/stat.h>
 #include <errno.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #define SEP '/'
 #endif
 
@@ -942,6 +945,16 @@ int settings_game_dir(char *out, size_t out_sz)
     slash = wcsrchr(w, L'\\');
     if (slash) *slash = 0;
     return narrow(w, out, out_sz);
+#elif defined(__APPLE__)
+    /* the folder of the executable, as on Windows */
+    char exe[4096], *slash;
+    uint32_t k = (uint32_t)sizeof exe;
+    const char *home = getenv("OT_HOME_DIR");      /* see GetModuleFileNameA: the app keeps its files outside the bundle */
+    if (home && home[0]) return snprintf(out, out_sz, "%s", home) < (int)out_sz;
+    if (_NSGetExecutablePath(exe, &k) != 0) return 0;
+    slash = strrchr(exe, '/');
+    if (slash) *slash = 0;
+    return snprintf(out, out_sz, "%s", exe) < (int)out_sz;
 #else
     (void)out; (void)out_sz;
     return 0;
