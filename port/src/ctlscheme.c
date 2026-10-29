@@ -269,7 +269,7 @@ static int s_bumper_big;
 static uint32_t s_layout_orig[2][3];
 
 static uint32_t s_glyph_orig[GLYPHS * 2];
-static int s_glyph_saved, s_glyph_ps2, s_tricktext;
+static int s_glyph_saved, s_glyph_ps2, s_tricktext, s_center;
 
 static void glyph_table(int ps2)
 {
@@ -505,6 +505,88 @@ void hook_tricktext_0005CEB0(void)
         }
 }
 
+/* ── Trick text centred on what is drawn ────────────────────────────
+ *
+ * A trick text line (UBER TRICK's "R1 + Square", the trick book, lessons) is
+ * centred on the width its object stores (0x5C950 keeps the measure's result
+ * at +0x14, 0x5CD30 starts at x - width / 2). The measure 0x5CF40 adds each
+ * button's advance (layout row +16); the glyph draw 0x5CEB0 puts a button at
+ * pen + dx (row +8) and draws it at its shape's width, which goes past the
+ * advance. A line that starts or ends with a button is thus drawn to the
+ * right of its centre by (dx of the first + overhang of the last) / 2: 4
+ * units with the game's own Xbox values, more with the wider icons. With
+ * drawn button icons (our layout values), the width the measure returns
+ * also counts the first button's dx and the last one's overhang, so the
+ * drawn line is centred. The Xbox buttons (no icons) keep the game's own
+ * measure. XBOX_FIX_TRICKTEXT_CENTER=0: as the game measures. */
+void sub_0005CF40(void);    /* trick text: width of a text (thiscall, 1 arg, ret 4), in ST(0) */
+
+/* Width drawn by layout row k past its advance, and its dx. */
+static int row_extent(uint32_t mgr, int k, float *dx, float *over)
+{
+    uint32_t row = GLYPH_LAYOUT + 24u * (uint32_t)k, shape = MEM32(row + 20u);
+    float w;
+    if (shape > 200u) return 0;
+    w = MEMF(mgr + 8u + shape * 0x1Cu + 4u);                     /* ShapeManager_GetShape 0xF24F0 */
+    if (s_bumper_big && (shape == 103u || shape == 104u) && w >= 8.0f && w <= 20.0f)
+        w *= SHAPE_SIZE;                                          /* as hook_tricktext_0005CEB0 draws it */
+    *dx = (float)(int32_t)MEM32(row + 8u);
+    *over = *dx + w - (float)(int32_t)MEM32(row + 16u);
+    return w > 0.0f && w < 200.0f;
+}
+
+void hook_trickwidth_0005CF40(void)
+{
+    uint32_t entry = g_esp, buf = entry - 0x30u, app, mgr = 0, i, n, lead, trail;
+    int before = g_fp_top, k;
+    float extra = 0.0f, dx, over;
+    uint8_t first, last;
+    sub_0005CF40();
+    /* the text the measure built is still in its frame, below the stack:
+     * esp at entry - 0x40 (0x38 of locals, esi, edi), the text at +0x10 */
+    if (before - g_fp_top < 1 || (app = MEM32(0x001E3C7Cu)) < 0x1000u || (mgr = MEM32(app + 0x724u)) < 0x1000u)
+        return;
+    for (n = 0; n < 0x30u && MEM8(buf + n); n++) {}
+    if (!n || n == 0x30u) return;
+    /* blanks at the ends are measured (a space, 0x1876C8, before the buttons
+     * of a command) but draw nothing: the drawn line is what lies between */
+    for (lead = 0; lead < n && MEM8(buf + lead) == ' '; lead++) {}
+    if (lead == n) return;
+    for (trail = 0; MEM8(buf + n - 1 - trail) == ' '; trail++) {}
+    extra = ((float)lead - (float)trail) * MEMF(0x001876C8u);
+    first = MEM8(buf + lead);
+    last = MEM8(buf + n - 1 - trail);
+    for (i = 0; i < 2; i++) {
+        uint8_t c = i ? last : first;
+        for (k = 0; k < GLYPHS; k++)
+            if (MEM8(GLYPH_LAYOUT + 24u * (uint32_t)k) == c) break;
+        if (k < GLYPHS && row_extent(mgr, k, &dx, &over))
+            extra += i ? over : dx;
+    }
+    {   /* XBOX_TRICKTEXT_LOG=1: the first 40 texts measured (debug) */
+        static int s_log = -1, s_n;
+        if (s_log < 0) { const char *e = getenv("XBOX_TRICKTEXT_LOG"); s_log = e && e[0] == '1'; }
+        if (s_log && s_n < 40) {
+            char t[0x31];
+            for (i = 0; i < n; i++) t[i] = (char)(MEM8(buf + i) >= 32 && MEM8(buf + i) < 127 ? MEM8(buf + i) : '?');
+            t[n] = 0;
+            if (!s_n)
+                for (k = 0; k < GLYPHS; k++) {
+                    uint32_t row = GLYPH_LAYOUT + 24u * (uint32_t)k, sh = MEM32(row + 20u);
+                    fprintf(stderr, "[TRICKTEXT] row %c dx %d dy %d adv %d shape %u %.2f x %.2f\n", (char)MEM8(row),
+                            (int32_t)MEM32(row + 8u), (int32_t)MEM32(row + 12u), (int32_t)MEM32(row + 16u), sh,
+                            sh < 200u ? MEMF(mgr + 8u + sh * 0x1Cu + 4u) : 0.0f, sh < 200u ? MEMF(mgr + 8u + sh * 0x1Cu + 8u) : 0.0f);
+                }
+            s_n++;
+            fprintf(stderr, "[TRICKTEXT] \"%s\" width %.2f + %.2f\n", t, g_fp_stack[g_fp_top & 7], extra);
+        }
+    }
+    if (extra != 0.0f && extra > -64.0f && extra < 64.0f) {
+        g_fp_stack[g_fp_top & 7] += extra;
+        g_x87_st0 = g_fp_stack[g_fp_top & 7];
+    }
+}
+
 void sub_000EF960(void);    /* HUD shapes: size and UVs of shapes 0-139 (thiscall, no arg, plain ret) */
 
 /* The HUD's shape set is filled by 0xEF960 (immediates, once per race or
@@ -638,6 +720,7 @@ void (*ctlscheme_lookup(unsigned int xbox_va))(void)
 {
     if (s_on && s_lesson && xbox_va == 0x000565B0u) return hook_lesson_000565B0;
     if (s_on && s_tricktext && xbox_va == 0x0005CEB0u) return hook_tricktext_0005CEB0;
+    if (s_on && s_center && btnicons_on() && xbox_va == 0x0005CF40u) return hook_trickwidth_0005CF40;
     if ((btnicons_wide_bumpers() || btnicons_ps2()) && xbox_va == 0x000EF960u) return hook_shapes_000EF960;
     return 0;
 }
@@ -648,10 +731,12 @@ void ctlscheme_init(void)
     const char *o = getenv("XBOX_PS2_SHOULDERS");
     const char *l = getenv("XBOX_FIX_LESSON_PS2");
     const char *t = getenv("XBOX_FIX_TRICKTEXT_PS2");
+    const char *c = getenv("XBOX_FIX_TRICKTEXT_CENTER");
     s_on = !(e && !_stricmp(e, "xbox"));
     s_order = o && (o[0] == 'b' || o[0] == 'B');
     s_lesson = !(l && l[0] == '0');
     s_tricktext = !(t && t[0] == '0');
+    s_center = !(c && c[0] == '0');
     if (!s_on) {
         fprintf(stderr, "[CTLSCHEME] XBOX_CONTROL_SCHEME=xbox: original Xbox layout (debug)\n");
         return;

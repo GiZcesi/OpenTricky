@@ -65,11 +65,25 @@ typedef struct {
     const void        *ps_consts;
     unsigned           ps_consts_size;
     int                raster;          /* as d3d8_nv2a_draw */
+    uint32_t           ztie_nsub;       /* stable ties: the first indices drawn in three passes (raster 0x40) */
+    uint32_t           zdecal_nsub;     /* stable decals: the first indices drawn nearer by a few depth steps (raster 0x80) */
 } Nv2aVshDraw;
 
 /* 1 if drawn; 0 if this draw cannot go through the GPU path (the caller then
  * runs the program on the CPU). */
 int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d);
+
+/* XBOX_ZDECAL_COST=1 (diagnostics, set by nv2a_pgraph_d3d11.c): QPC ticks and
+ * counts of the final DrawIndexed calls of program draws -- [0] ticks / [1]
+ * draws drawn in one piece, [2] ticks / [3] draws split by stable ties or
+ * decals (raster 0x40 / 0x80). */
+extern int g_d3d8_zcost;
+extern unsigned long long g_d3d8_zc[4];
+
+/* For any draw of the translator: 0 as usual, 1 not drawn, 2 the two passes
+ * (d3d8_ghost_pass 0 = depth only, 1 = colour mixed, 2 = states back). */
+int  d3d8_ghost_mode(void);
+void d3d8_ghost_pass(void *ctx, int pass);   /* ctx: ID3D11DeviceContext * */
 
 /* XBOX_FIX_POINTS_GPU (default 1): program draws in point mode
  * (the particles) take the GPU path, their squares built by a geometry

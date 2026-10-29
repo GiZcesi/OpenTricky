@@ -16,7 +16,8 @@ int g_gpuprof_on;
 
 static const char *const k_cat_name[GP_N] = {
     "g0", "g1", "g2", "g3", "g4", "g5", "g6", "persp>=7", "hud", "other",
-    "clear", "post_split", "post_present", "prevframe", "resolve", "blit", "soft_shadow"
+    "clear", "post_split", "post_present", "prevframe", "resolve", "blit", "soft_shadow",
+    "render_scale", "lights"
 };
 
 typedef struct {

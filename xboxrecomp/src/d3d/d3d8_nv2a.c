@@ -15,7 +15,7 @@
 #include "../kernel/xbox_perf.h"
 #include "d3d8_internal.h"
 #include "d3d8_gpuprof.h"
-#include "d3d8_shcache.h"
+#include "d3d8_temporal.h"
 #include <d3dcompiler.h>
 #include <intrin.h>
 #include <math.h>
@@ -27,29 +27,35 @@ void d3d8_UpRingReserve(UINT total, UINT pieces);
 
 /* Vertex layout written by nv2a_pgraph_d3d11.c (ProgVertex): screen x, y,
  * z (0..1) and rhw; oD0; oD1; the fog factor; oT0..oT3. */
-static const char g_vs_src[] =
-    "cbuffer NvVS : register(b0) { float4 screen; };\n"
-    "struct VSIn {\n"
-    "    float4 pos : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n"
-    "    float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
-    "};\n"
-    "struct VSOut {\n"
-    "    float4 pos : SV_POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n"
-    "    float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
-    "};\n"
-    "VSOut main(VSIn i) {\n"
-    "    VSOut o;\n"
-    /* Undo the divide by w so the rasteriser interpolates perspective-correctly. */
-    /* rhw is never 0 and keeps w's sign (nv2a_pgraph_d3d11.c clamps w away
-     * from zero), so a vertex behind the eye gets a negative clip w and the
-     * rasteriser clips its triangles at the near plane, as xemu relies on. */
-    "    float w = 1.0 / i.pos.w;\n"
-    "    o.pos = float4((i.pos.x / screen.x * 2.0 - 1.0) * w,\n"
+/* Undo the divide by w so the rasteriser interpolates perspective-correctly.
+ * rhw is never 0 and keeps w's sign (nv2a_pgraph_d3d11.c clamps w away
+ * from zero), so a vertex behind the eye gets a negative clip w and the
+ * rasteriser clips its triangles at the near plane, as xemu relies on. */
+#define NV_VS_HEAD \
+    "cbuffer NvVS : register(b0) { float4 screen; };\n" \
+    "struct VSIn {\n" \
+    "    float4 pos : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n" \
+    "    float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n" \
+    "};\n" \
+    "struct VSOut {\n" \
+    "    float4 pos : SV_POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n" \
+    "    float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n" \
+    "};\n" \
+    "VSOut main(VSIn i) {\n" \
+    "    VSOut o;\n" \
+    "    float w = 1.0 / i.pos.w;\n" \
+    "    o.pos = float4((i.pos.x / screen.x * 2.0 - 1.0) * w,\n" \
     "                   (1.0 - i.pos.y / screen.y * 2.0) * w, i.pos.z * w, w);\n"
-    "    o.d0 = i.d0; o.d1 = i.d1; o.fog = i.fog;\n"
-    "    o.t0 = i.t0; o.t1 = i.t1; o.t2 = i.t2; o.t3 = i.t3;\n"
-    "    return o;\n"
-    "}\n";
+#define NV_VS_TAIL \
+    "    o.d0 = i.d0; o.d1 = i.d1; o.fog = i.fog;\n" \
+    "    o.t0 = i.t0; o.t1 = i.t1; o.t2 = i.t2; o.t3 = i.t3;\n" \
+    "    return o;\n" \
+    "}\n"
+static const char g_vs_src[] = NV_VS_HEAD NV_VS_TAIL;
+/* Fork: with XBOX_TEMPORAL (d3d8_temporal.h), the same text plus the
+ * image's sub-pixel jitter in clip space (screen.zw, NDC; 0 outside the 3D
+ * of a race). Without it the shader is the one above, unchanged. */
+static const char g_vs_src_jit[] = NV_VS_HEAD "    o.pos.xy += screen.zw * w;\n" NV_VS_TAIL;
 
 static ID3D11VertexShader *g_vs;
 static ID3D11InputLayout  *g_layout;
@@ -92,8 +98,11 @@ static int nv_init(void)
 
     if (g_vs) return 1;
     if (g_init_failed || !dev) return 0;
-    hr = D3DCompile(g_vs_src, strlen(g_vs_src), "vs_nv2a", NULL, NULL, "main", "vs_5_0",
-                    0, 0, &blob, &err);
+    {
+        const char *src = d3d8_temporal_wanted() ? g_vs_src_jit : g_vs_src;
+        hr = d3d8_shader_compile_logged(src, strlen(src), "vs_nv2a", NULL, "main", "vs_5_0",
+                                        0, &blob, &err);
+    }
     if (FAILED(hr)) {
         fprintf(stderr, "[NV2A-PSH] vertex shader failed: %s\n",
                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
@@ -132,63 +141,16 @@ static double nv_now_ms(void)
 /* XBOX_SHADER_CACHE, default 1; =0 previous path: the bytecode of
  * the pump's two compiles (combiner pixel shaders, vertex programs) is kept
  * on disk (d3d8_shcache.c) and read back by a later session instead of
- * calling D3DCompile. The compiler build is part of the key: the version of
- * d3dcompiler_47.dll loaded (its PE time stamp and image size). */
-#ifndef D3DCOMPILER_DLL_A
-#define D3DCOMPILER_DLL_A "d3dcompiler_47.dll"
-#endif
+ * calling D3DCompile; the layer's other shaders go through the same cache
+ * (d3d8_shcompile.c). */
 volatile long g_nv_shc_hits = 0;
-static uint64_t nv_compiler_id(void)
-{
-    uint64_t id = (uint64_t)D3D_COMPILER_VERSION << 56;
-    HMODULE m = GetModuleHandleA(D3DCOMPILER_DLL_A);
-    if (m) {
-        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)m;
-        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const char *)m + dos->e_lfanew);
-        id ^= (uint64_t)nt->FileHeader.TimeDateStamp ^ ((uint64_t)nt->OptionalHeader.SizeOfImage << 32);
-    }
-    return id;
-}
-
-static int nv_shc_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        on = shc_env_on();
-        if (on) on = shc_open(NULL, nv_compiler_id(), 0, 1);
-        fprintf(stderr, "[SHC] XBOX_SHADER_CACHE=%d\n", on);
-    }
-    return on;
-}
 
 /* D3DCompile through the cache; *hit = 1 when the bytecode came from it. */
 static HRESULT nv_compile(const char *src, SIZE_T len, const char *name, const char *profile,
                           UINT flags, ID3DBlob **code, ID3DBlob **err, int *hit)
 {
-    ShcId id;
-    void *bin;
-    size_t n = 0;
-    HRESULT hr;
-
-    *hit = 0;
-    if (!nv_shc_on())
-        return D3DCompile(src, len, name, NULL, NULL, "main", profile, flags, 0, code, err);
-    id = shc_id(src, (size_t)len, name, profile, "main", flags);
-    bin = shc_get(id, &n);
-    if (bin) {
-        hr = D3DCreateBlob(n, code);
-        if (SUCCEEDED(hr)) {
-            memcpy(ID3D10Blob_GetBufferPointer(*code), bin, n);
-            shc_free(bin);
-            *hit = 1;
-            g_nv_shc_hits++;
-            return hr;
-        }
-        shc_free(bin);
-    }
-    hr = D3DCompile(src, len, name, NULL, NULL, "main", profile, flags, 0, code, err);
-    if (SUCCEEDED(hr) && *code)
-        shc_put(id, ID3D10Blob_GetBufferPointer(*code), ID3D10Blob_GetBufferSize(*code));
+    HRESULT hr = d3d8_shader_compile(src, len, name, NULL, "main", profile, flags, code, err, hit);
+    if (*hit) g_nv_shc_hits++;
     return hr;
 }
 
@@ -481,11 +443,16 @@ static void nv_set_raster(ID3D11DeviceContext *ctx, ID3D11Device *dev, int raste
     if (rs[k]) ID3D11DeviceContext_RSSetState(ctx, rs[k]);
 }
 
+/* Every draw as usual (d3d8_nv2a_vsh.h): 0, and never the two passes. */
+int  d3d8_ghost_mode(void) { return 0; }
+void d3d8_ghost_pass(void *ctx, int pass) { (void)ctx; (void)pass; }
+
 HRESULT d3d8_nv2a_draw(D3DPRIMITIVETYPE prim, UINT prim_count, const void *verts, UINT stride,
                        unsigned long long ps_key, const void *ps_consts, UINT ps_consts_size,
                        int raster)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    int lr;                             /* fork: the lights (d3d8_lights.h) */
     ID3D11Device *dev = d3d8_GetD3D11Device();
     ID3D11PixelShader *ps = ps_find(ps_key);
     ID3D11Buffer *vb = NULL;
@@ -515,6 +482,7 @@ HRESULT d3d8_nv2a_draw(D3DPRIMITIVETYPE prim, UINT prim_count, const void *verts
     if (screen[0] <= 0.0f) screen[0] = 640.0f;
     if (screen[1] <= 0.0f) screen[1] = 480.0f;
     screen[2] = screen[3] = 0.0f;
+    d3d8_temporal_jitter_ndc(&screen[2], &screen[3]);      /* fork: 0 when off */
     cb_write(ctx, g_vs_cb, screen, sizeof screen);
     cb_write(ctx, g_ps_cb, ps_consts, ps_consts_size);
 
@@ -531,9 +499,34 @@ HRESULT d3d8_nv2a_draw(D3DPRIMITIVETYPE prim, UINT prim_count, const void *verts
     ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &g_vs_cb);
     ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_ps_cb);
-    if (g_gpuprof_on) gpuprof_draw_begin();
-    ID3D11DeviceContext_Draw(ctx, nv, 0);
-    if (g_gpuprof_on) gpuprof_draw_end();
+    {
+        int gm = d3d8_ghost_mode();
+        if (gm == 1) return S_OK;
+        if (g_gpuprof_on) gpuprof_draw_begin();
+        if (gm == 2) {
+            d3d8_ghost_pass(ctx, 0);
+            ID3D11DeviceContext_Draw(ctx, nv, 0);
+            d3d8_ghost_pass(ctx, 1);
+            ID3D11DeviceContext_Draw(ctx, nv, 0);
+            d3d8_ghost_pass(ctx, 2);
+        } else {
+            lr = g_d3d8_light_mark ? d3d8_lights_pre(ctx) : 0;     /* fork: the lights (d3d8_lights.h) */
+            ID3D11DeviceContext_Draw(ctx, nv, 0);
+            if (lr == 2) {
+                if (d3d8_lights_z_begin(ctx)) { ID3D11DeviceContext_Draw(ctx, nv, 0); d3d8_lights_z_end(ctx); }
+                d3d8_lights_mirror_end(ctx);
+            } else if (lr == 1 && d3d8_lights_mirror_begin(ctx)) {
+                ID3D11DeviceContext_Draw(ctx, nv, 0);
+                if (d3d8_lights_z_begin(ctx)) { ID3D11DeviceContext_Draw(ctx, nv, 0); d3d8_lights_z_end(ctx); }
+                d3d8_lights_mirror_end(ctx);
+            }
+            if (g_d3d8_temporal_mark && lr != 2 && d3d8_temporal_mirror_begin(ctx)) {   /* fork: temporal */
+                ID3D11DeviceContext_Draw(ctx, nv, 0);
+                d3d8_temporal_mirror_end(ctx);
+            }
+        }
+        if (g_gpuprof_on) gpuprof_draw_end();
+    }
     return S_OK;
 }
 
@@ -779,36 +772,44 @@ static uint8_t *vi_ring_map(ID3D11DeviceContext *ctx, UINT size, UINT *off)
  * whose vertex could not be placed. This geometry shader does the same with
  * the same arithmetic: a strip of those four corners rasterises as those two
  * triangles. */
-static const char g_gs_src[] =
-    "cbuffer Params : register(b1) {\n"
+/* NaN read from the bits, as in the vertex programs (d3d8_nv2a_vsh.c). */
+#define NV_GS_CB \
+    "cbuffer Params : register(b1) {\n" \
     "    float4 screen; float4 fogp; float4 flags; float4 vattr[16]; float4 ptparm;\n"
-    "};\n"
-    "struct VSOut {\n"
-    "    float4 pos : SV_POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n"
-    "    float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
-    "    float4 pt : PTS;\n"
-    "};\n"
-    "struct GSOut {\n"
-    "    float4 pos : SV_POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n"
-    "    float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
-    "};\n"
-    /* NaN read from the bits, as in the vertex programs (d3d8_nv2a_vsh.c). */
-    "bool nv_isnan(float x) { return (asuint(x) & 0x7FFFFFFF) > 0x7F800000; }\n"
-    "[maxvertexcount(4)]\n"
-    "void main(point VSOut p[1], inout TriangleStream<GSOut> s) {\n"
-    "    VSOut v = p[0];\n"
-    "    if (nv_isnan(v.pos.w)) return;\n"
-    "    float h = v.pt.z, wc = v.pos.w;\n"
-    "    for (int c = 0; c < 4; c++) {\n"
-    "        GSOut o;\n"
-    "        float x = v.pt.x + ((c & 1) ? h : -h) * ptparm.w, y = v.pt.y + ((c & 2) ? h : -h);\n"
+#define NV_GS_BODY_A \
+    "};\n" \
+    "struct VSOut {\n" \
+    "    float4 pos : SV_POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n" \
+    "    float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n" \
+    "    float4 pt : PTS;\n" \
+    "};\n" \
+    "struct GSOut {\n" \
+    "    float4 pos : SV_POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n" \
+    "    float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n" \
+    "};\n" \
+    "bool nv_isnan(float x) { return (asuint(x) & 0x7FFFFFFF) > 0x7F800000; }\n" \
+    "[maxvertexcount(4)]\n" \
+    "void main(point VSOut p[1], inout TriangleStream<GSOut> s) {\n" \
+    "    VSOut v = p[0];\n" \
+    "    if (nv_isnan(v.pos.w)) return;\n" \
+    "    float h = v.pt.z, wc = v.pos.w;\n" \
+    "    for (int c = 0; c < 4; c++) {\n" \
+    "        GSOut o;\n" \
+    "        float x = v.pt.x + ((c & 1) ? h : -h) * ptparm.w, y = v.pt.y + ((c & 2) ? h : -h);\n" \
     "        o.pos = float4((x / screen.x * 2.0 - 1.0) * wc, (1.0 - y / screen.y * 2.0) * wc, v.pos.z, wc);\n"
-    "        o.d0 = v.d0; o.d1 = v.d1; o.fog = v.fog;\n"
-    "        o.t0 = v.t0; o.t1 = v.t1; o.t2 = v.t2;\n"
-    "        o.t3 = ptparm.z != 0 ? float4((c & 1) ? 1 : 0, (c & 2) ? 1 : 0, 1, 1) : v.t3;\n"
-    "        s.Append(o);\n"
-    "    }\n"
-    "}\n";
+#define NV_GS_BODY_B \
+    "        o.d0 = v.d0; o.d1 = v.d1; o.fog = v.fog;\n" \
+    "        o.t0 = v.t0; o.t1 = v.t1; o.t2 = v.t2;\n" \
+    "        o.t3 = ptparm.z != 0 ? float4((c & 1) ? 1 : 0, (c & 2) ? 1 : 0, 1, 1) : v.t3;\n" \
+    "        s.Append(o);\n" \
+    "    }\n" \
+    "}\n"
+static const char g_gs_src[] = NV_GS_CB NV_GS_BODY_A NV_GS_BODY_B;
+/* Fork: with XBOX_TEMPORAL, the image's jitter (Params.jit, NDC) on every
+ * corner, as the vertex programs add it (d3d8_nv2a_vsh.c). The stream-out
+ * check (XBOX_POINTS_CHECK) keeps the plain shader. */
+static const char g_gs_src_jit[] = NV_GS_CB "    float4 hud; float4 jit;\n" NV_GS_BODY_A
+    "        o.pos.xy += jit.xy * wc;\n" NV_GS_BODY_B;
 static ID3D11GeometryShader *g_gs;
 static int g_gs_failed;
 
@@ -819,9 +820,12 @@ static int gs_init(void)
     HRESULT hr;
     if (g_gs) return 1;
     if (g_gs_failed || !dev) return 0;
-    nv_hlsl_dump("gs_nv2a_points", 0, g_gs_src, (int)strlen(g_gs_src));
-    hr = D3DCompile(g_gs_src, strlen(g_gs_src), "gs_nv2a_points", NULL, NULL, "main", "gs_5_0",
-                    D3DCOMPILE_IEEE_STRICTNESS, 0, &blob, &err);
+    {
+        const char *src = d3d8_temporal_wanted() ? g_gs_src_jit : g_gs_src;
+        nv_hlsl_dump("gs_nv2a_points", 0, src, (int)strlen(src));
+        hr = d3d8_shader_compile_logged(src, strlen(src), "gs_nv2a_points", NULL, "main",
+                                        "gs_5_0", D3DCOMPILE_IEEE_STRICTNESS, &blob, &err);
+    }
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateGeometryShader(dev, ID3D10Blob_GetBufferPointer(blob),
                                                ID3D10Blob_GetBufferSize(blob), NULL, &g_gs);
@@ -886,8 +890,9 @@ static int pc_init(void)
         ID3DBlob *blob = NULL, *err = NULL;
         D3D11_BUFFER_DESC bd;
         D3D11_QUERY_DESC qd;
-        HRESULT hr = D3DCompile(g_gs_src, strlen(g_gs_src), "gs_nv2a_points", NULL, NULL, "main", "gs_5_0",
-                                D3DCOMPILE_IEEE_STRICTNESS, 0, &blob, &err);
+        HRESULT hr = d3d8_shader_compile_logged(g_gs_src, strlen(g_gs_src), "gs_nv2a_points", NULL,
+                                                "main", "gs_5_0", D3DCOMPILE_IEEE_STRICTNESS,
+                                                &blob, &err);
         if (err) ID3D10Blob_Release(err);
         if (FAILED(hr)) return 0;
         hr = ID3D11Device_CreateGeometryShaderWithStreamOutput(dev, ID3D10Blob_GetBufferPointer(blob),
@@ -1015,9 +1020,241 @@ int d3d8_nv2a_vsh_ready(const Nv2aVshDraw *d)
  * below the 2048-byte limit of AlignedByteOffset. */
 #define ZS_WINDOW 256u
 
+/* ── Stable ties inside one mesh (XBOX_ZTIE, raster bit 0x40) ────────────
+ * nv2a_pgraph_d3d11.c marks the draws of meshes whose own faces overlap in
+ * one plane (Garibaldi's stand trusses). Drawn in one pass, the face that
+ * shows there is decided by rounding and flips as the camera moves. Here,
+ * three passes with the same buffers and shaders:
+ *   1. depth only, the title's test: the nearest depth of the mesh;
+ *   2. colour, LESS_EQUAL against it with the depth pulled T steps nearer
+ *      (XBOX_ZTIE_STEPS, 8, plus XBOX_ZTIE_SLOPE x the slope per title pixel,
+ *      0.5), no depth write, and stencil bit 0x80 as "first come": among the
+ *      faces within T of the nearest, the first one in the mesh's order wins,
+ *      always the same one (output order follows primitive order);
+ *   3. stencil bit 0x80 back to 0 on the mesh (no colour, no depth).
+ * Away from ties only one face is within T of the nearest: the same image.
+ * Used only when the title's own state has depth test and write on and its
+ * stencil off; the lights' and temporal mirrors after the draw see one draw
+ * (d3d8_nv2a_draw_program_gpu). */
+#define ZTIE_BIT 0x80u
+static struct { D3D11_DEPTH_STENCIL_DESC d; ID3D11DepthStencilState *p2, *p3; } g_zt_ds[16];
+static struct { ID3D11RasterizerState *orig, *bias; float scale; } g_zt_rs[16];
+static ID3D11BlendState *g_zt_nocolor;
+static int   g_zt_steps = -1;
+static float g_zt_slope = 0.5f;
+static unsigned g_zt_frames_draws;
+int g_d3d8_zcost;
+unsigned long long g_d3d8_zc[4];
+
+static void zt_params(void)
+{
+    const char *e;
+    if (g_zt_steps >= 0) return;
+    e = getenv("XBOX_ZTIE_STEPS");
+    g_zt_steps = e && *e ? atoi(e) : 8;
+    if (g_zt_steps < 0) g_zt_steps = 0;
+    e = getenv("XBOX_ZTIE_SLOPE");
+    if (e && *e) g_zt_slope = (float)atof(e);
+}
+
+/* Passes 2 and 3 for the title's depth-stencil state (cached). */
+static int zt_ds(ID3D11Device *dev, const D3D11_DEPTH_STENCIL_DESC *t,
+                 ID3D11DepthStencilState **p2, ID3D11DepthStencilState **p3)
+{
+    int i;
+    for (i = 0; i < 16; i++)
+        if (g_zt_ds[i].p2 && !memcmp(&g_zt_ds[i].d, t, sizeof *t)) { *p2 = g_zt_ds[i].p2; *p3 = g_zt_ds[i].p3; return 1; }
+    for (i = 0; i < 16; i++)
+        if (!g_zt_ds[i].p2) {
+            D3D11_DEPTH_STENCIL_DESC a = *t, b;
+            a.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+            a.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+            a.StencilEnable = TRUE;
+            a.StencilReadMask = ZTIE_BIT;
+            a.StencilWriteMask = ZTIE_BIT;
+            a.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;          /* bit still 0 (ref 0) */
+            a.FrontFace.StencilPassOp = D3D11_STENCIL_OP_INVERT;       /* set it (only bit 0x80 written) */
+            a.FrontFace.StencilFailOp = a.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+            a.BackFace = a.FrontFace;
+            memset(&b, 0, sizeof b);
+            b.DepthEnable = FALSE;
+            b.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+            b.DepthFunc = D3D11_COMPARISON_ALWAYS;
+            b.StencilEnable = TRUE;
+            b.StencilReadMask = ZTIE_BIT;
+            b.StencilWriteMask = ZTIE_BIT;
+            b.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+            b.FrontFace.StencilPassOp = D3D11_STENCIL_OP_ZERO;
+            b.FrontFace.StencilFailOp = b.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+            b.BackFace = b.FrontFace;
+            if (FAILED(ID3D11Device_CreateDepthStencilState(dev, &a, &g_zt_ds[i].p2))) return 0;
+            if (FAILED(ID3D11Device_CreateDepthStencilState(dev, &b, &g_zt_ds[i].p3))) {
+                ID3D11DepthStencilState_Release(g_zt_ds[i].p2); g_zt_ds[i].p2 = NULL; return 0;
+            }
+            g_zt_ds[i].d = *t;
+            *p2 = g_zt_ds[i].p2; *p3 = g_zt_ds[i].p3;
+            return 1;
+        }
+    return 0;
+}
+
+/* The current rasteriser state with the pass-2 depth bias (cached). */
+static ID3D11RasterizerState *zt_rs(ID3D11Device *dev, ID3D11RasterizerState *orig)
+{
+    float sx = 1.0f, sy = 1.0f;
+    int i;
+    d3d8_GetGuestScale(&sx, &sy);
+    for (i = 0; i < 16; i++)
+        if (g_zt_rs[i].orig == orig && g_zt_rs[i].scale == sx) return g_zt_rs[i].bias;
+    for (i = 0; i < 16; i++)
+        if (!g_zt_rs[i].orig || i == 15) {
+            D3D11_RASTERIZER_DESC rd;
+            if (g_zt_rs[i].bias) { ID3D11RasterizerState_Release(g_zt_rs[i].bias); g_zt_rs[i].bias = NULL; }
+            ID3D11RasterizerState_GetDesc(orig, &rd);
+            rd.DepthBias = -g_zt_steps;
+            rd.SlopeScaledDepthBias = -g_zt_slope * sx;   /* per title pixel, at any render size */
+            /* At most 3 T: a face seen nearly edge-on (huge slope) must not
+             * bring faces far behind it into the band (seen on the snowcat). */
+            rd.DepthBiasClamp = -3.0f * (float)(g_zt_steps > 0 ? g_zt_steps : 1) / 16777215.0f;
+            if (FAILED(ID3D11Device_CreateRasterizerState(dev, &rd, &g_zt_rs[i].bias))) { g_zt_rs[i].orig = NULL; return NULL; }
+            g_zt_rs[i].orig = orig;                        /* cached by pointer: the states live as long as the device */
+            g_zt_rs[i].scale = sx;
+            return g_zt_rs[i].bias;
+        }
+    return NULL;
+}
+
+/* The title's draw (n indices), with stable ties when `raster` has 0x40: the
+ * first nsub indices (the triangles that overlap in one plane) in three
+ * passes, then the others as the title draws them. */
+/* Stable decals over the previous draw (raster bit 0x80, marked by
+ * nv2a_pgraph_d3d11.c): the first nsub indices -- the triangles lying on the
+ * previous draw -- with the title's states but the depth pulled the same few
+ * steps nearer as ZTIE's pass 2 (XBOX_ZTIE_STEPS / _SLOPE, at most 3 T), so
+ * they win their ties with it; then the others as the title draws them. One
+ * pass each: depth test and write as the title's. */
+/* The decals' own pull, smaller than ZTIE's: a decal only has to beat
+ * rounding (0-4 steps seen on Merqury's windows), and a larger pull lets its
+ * edges show through the frame around it (seen at 640x480 with 8 steps +
+ * 0.5 x slope). XBOX_ZDECAL_STEPS (4) and XBOX_ZDECAL_SLOPE (0.25),
+ * diagnostics only; at most 3 x the steps. */
+static struct { ID3D11RasterizerState *orig, *bias; float scale; } g_zd_rs[16];
+static int   g_zd_steps = -1;
+static float g_zd_slope = 0.25f;
+
+static ID3D11RasterizerState *zd_rs(ID3D11Device *dev, ID3D11RasterizerState *orig)
+{
+    float sx = 1.0f, sy = 1.0f;
+    int i;
+    if (g_zd_steps < 0) {
+        const char *e = getenv("XBOX_ZDECAL_STEPS");
+        g_zd_steps = e && *e ? atoi(e) : 4;
+        if (g_zd_steps < 0) g_zd_steps = 0;
+        e = getenv("XBOX_ZDECAL_SLOPE");
+        if (e && *e) g_zd_slope = (float)atof(e);
+    }
+    d3d8_GetGuestScale(&sx, &sy);
+    for (i = 0; i < 16; i++)
+        if (g_zd_rs[i].orig == orig && g_zd_rs[i].scale == sx) return g_zd_rs[i].bias;
+    for (i = 0; i < 16; i++)
+        if (!g_zd_rs[i].orig || i == 15) {
+            D3D11_RASTERIZER_DESC rd;
+            if (g_zd_rs[i].bias) { ID3D11RasterizerState_Release(g_zd_rs[i].bias); g_zd_rs[i].bias = NULL; }
+            ID3D11RasterizerState_GetDesc(orig, &rd);
+            rd.DepthBias = -g_zd_steps;
+            rd.SlopeScaledDepthBias = -g_zd_slope * sx;
+            rd.DepthBiasClamp = -3.0f * (float)(g_zd_steps > 0 ? g_zd_steps : 1) / 16777215.0f;
+            if (FAILED(ID3D11Device_CreateRasterizerState(dev, &rd, &g_zd_rs[i].bias))) { g_zd_rs[i].orig = NULL; return NULL; }
+            g_zd_rs[i].orig = orig;
+            g_zd_rs[i].scale = sx;
+            return g_zd_rs[i].bias;
+        }
+    return NULL;
+}
+
+static void zd_draw_indexed(ID3D11DeviceContext *ctx, ID3D11Device *dev, UINT n, UINT nsub)
+{
+    ID3D11RasterizerState *ors = NULL, *brs;
+    ID3D11DeviceContext_RSGetState(ctx, &ors);
+    if (!ors || !(brs = zd_rs(dev, ors))) {
+        ID3D11DeviceContext_DrawIndexed(ctx, n, 0, 0);
+    } else {
+        ID3D11DeviceContext_RSSetState(ctx, brs);
+        ID3D11DeviceContext_DrawIndexed(ctx, nsub, 0, 0);
+        ID3D11DeviceContext_RSSetState(ctx, ors);
+        if (n > nsub) ID3D11DeviceContext_DrawIndexed(ctx, n - nsub, nsub, 0);
+    }
+    if (ors) ID3D11RasterizerState_Release(ors);
+}
+
+/* A mirror of the title's draw (the lights' emission and emitters' depth,
+ * the temporal mask): drawn as the title's was. A stable decal's first nsub
+ * triangles wrote their depth pulled nearer (zd_draw_indexed); unpulled,
+ * their mirror lost its LESS_EQUAL test against that depth, and a sign drawn
+ * as a decal on its frame glowed only on the images ZDECAL left it alone. */
+/* Diagnostics port (set zdmirror 0): the mirrors unpulled, as before -- the
+ * comparison on one held image. */
+static int s_zd_mirror = 1;
+void d3d8_nv2a_set_zd_mirror(int on) { s_zd_mirror = on ? 1 : 0; }
+
+static void mirror_draw_indexed(ID3D11DeviceContext *ctx, ID3D11Device *dev, const Nv2aVshDraw *d)
+{
+    if (s_zd_mirror && (d->raster & 0x80) && d->zdecal_nsub && d->zdecal_nsub <= d->nindices)
+        zd_draw_indexed(ctx, dev, d->nindices, d->zdecal_nsub);
+    else
+        ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0);
+}
+
+static void zt_draw_indexed(ID3D11DeviceContext *ctx, ID3D11Device *dev, int raster, UINT n, UINT nsub)
+{
+    ID3D11DepthStencilState *ods = NULL, *p2 = NULL, *p3 = NULL;
+    ID3D11BlendState *obs = NULL;
+    ID3D11RasterizerState *ors = NULL, *brs;
+    D3D11_DEPTH_STENCIL_DESC dd;
+    FLOAT bf[4];
+    UINT oref = 0, omask = 0;
+    if ((raster & 0x80) && nsub && nsub <= n) { zd_draw_indexed(ctx, dev, n, nsub); return; }
+    if (!(raster & 0x40) || !nsub || nsub > n) { ID3D11DeviceContext_DrawIndexed(ctx, n, 0, 0); return; }
+    zt_params();
+    ID3D11DeviceContext_OMGetDepthStencilState(ctx, &ods, &oref);
+    ID3D11DeviceContext_OMGetBlendState(ctx, &obs, bf, &omask);
+    ID3D11DeviceContext_RSGetState(ctx, &ors);
+    if (ods) ID3D11DepthStencilState_GetDesc(ods, &dd);
+    if (!g_zt_nocolor) {
+        D3D11_BLEND_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.RenderTarget[0].RenderTargetWriteMask = 0;
+        ID3D11Device_CreateBlendState(dev, &bd, &g_zt_nocolor);
+    }
+    if (!ods || !ors || !g_zt_nocolor || !dd.DepthEnable || dd.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ALL ||
+        dd.StencilEnable || !zt_ds(dev, &dd, &p2, &p3) || !(brs = zt_rs(dev, ors))) {
+        ID3D11DeviceContext_DrawIndexed(ctx, n, 0, 0);      /* not for this state: as the title draws it */
+    } else {
+        ID3D11DeviceContext_OMSetBlendState(ctx, g_zt_nocolor, bf, omask);           /* 1. depth */
+        ID3D11DeviceContext_DrawIndexed(ctx, nsub, 0, 0);
+        ID3D11DeviceContext_OMSetBlendState(ctx, obs, bf, omask);                    /* 2. colour */
+        ID3D11DeviceContext_OMSetDepthStencilState(ctx, p2, 0);
+        ID3D11DeviceContext_RSSetState(ctx, brs);
+        ID3D11DeviceContext_DrawIndexed(ctx, nsub, 0, 0);
+        ID3D11DeviceContext_OMSetBlendState(ctx, g_zt_nocolor, bf, omask);           /* 3. bit back to 0 */
+        ID3D11DeviceContext_OMSetDepthStencilState(ctx, p3, 0);
+        ID3D11DeviceContext_RSSetState(ctx, ors);
+        ID3D11DeviceContext_DrawIndexed(ctx, nsub, 0, 0);
+        ID3D11DeviceContext_OMSetBlendState(ctx, obs, bf, omask);                    /* the title's states back */
+        ID3D11DeviceContext_OMSetDepthStencilState(ctx, ods, oref);
+        if (n > nsub) ID3D11DeviceContext_DrawIndexed(ctx, n - nsub, nsub, 0);   /* the others */
+        g_zt_frames_draws++;
+    }
+    if (ods) ID3D11DepthStencilState_Release(ods);
+    if (obs) ID3D11BlendState_Release(obs);
+    if (ors) ID3D11RasterizerState_Release(ors);
+}
+
+
 int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    int lr;                             /* fork: the lights (d3d8_lights.h) */
     ID3D11Device *dev = d3d8_GetD3D11Device();
     ID3D11PixelShader *ps = ps_find(d->ps_key);
     D3D11_INPUT_ELEMENT_DESC el[16];
@@ -1028,7 +1265,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     D3D11_PRIMITIVE_TOPOLOGY topo;
     int vi, a, g, ngrp = 0, nel = 0;
     uint16_t done = 0;
-    struct { float screen[4], fog[4], flags[4], vattr[16][4], point[4], hud[4]; } params;
+    struct { float screen[4], fog[4], flags[4], vattr[16][4], point[4], hud[4], jit[4]; } params;
     double pt = 0.0;                    /* XBOX_PERF sub-zones */
     int use_cbr, vsc_changed = 0;       /* constant ring */
     static int g_cbr_was;
@@ -1173,6 +1410,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     params.hud[1] = d->hud_ax;
     params.hud[2] = d->hud_ky;
     params.hud[3] = d->hud_ay;
+    d3d8_temporal_jitter_ndc(&params.jit[0], &params.jit[1]);   /* fork: 0 when off */
     if (d->attr_const) memcpy(params.vattr, d->attr_const, sizeof params.vattr);
     if (!use_cbr) cb_write(ctx, g_vsp_cb, &params, sizeof params);
 
@@ -1218,8 +1456,21 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
             ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)g_so_q);
         }
         if (g_gpuprof_on) gpuprof_draw_begin();
+        lr = !chk && g_d3d8_light_mark ? d3d8_lights_pre(ctx) : 0;     /* fork: the lights */
         ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0);
         if (g_gpuprof_on) gpuprof_draw_end();
+        if (lr == 2) {
+            if (d3d8_lights_z_begin(ctx)) { ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0); d3d8_lights_z_end(ctx); }
+            d3d8_lights_mirror_end(ctx);
+        } else if (lr == 1 && d3d8_lights_mirror_begin(ctx)) {
+            ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0);
+            if (d3d8_lights_z_begin(ctx)) { ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0); d3d8_lights_z_end(ctx); }
+            d3d8_lights_mirror_end(ctx);
+        }
+        if (!chk && g_d3d8_temporal_mark && lr != 2 && d3d8_temporal_mirror_begin(ctx)) {   /* fork: temporal */
+            ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0);
+            d3d8_temporal_mirror_end(ctx);
+        }
         if (chk) {
             ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)g_so_q);
             ID3D11DeviceContext_SOSetTargets(ctx, 0, NULL, NULL);
@@ -1232,9 +1483,43 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
         return 1;
     }
     if (g_perf_on) { double t = perf_now(); perf_add(PZ_DSTATE, t - pt); pt = t; }
-    if (g_gpuprof_on) gpuprof_draw_begin();
-    ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0);
-    if (g_gpuprof_on) gpuprof_draw_end();
+    {
+        int gm = d3d8_ghost_mode();
+        if (gm == 1) return 1;
+        if (g_gpuprof_on) gpuprof_draw_begin();
+        if (gm == 2) {
+            d3d8_ghost_pass(ctx, 0);
+            ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0);
+            d3d8_ghost_pass(ctx, 1);
+            ID3D11DeviceContext_DrawIndexed(ctx, d->nindices, 0, 0);
+            d3d8_ghost_pass(ctx, 2);
+        } else {
+            lr = g_d3d8_light_mark ? d3d8_lights_pre(ctx) : 0;     /* fork: the lights (d3d8_lights.h) */
+            if (g_d3d8_zcost) {
+                LARGE_INTEGER q0, q1;
+                int split = (d->raster & 0xC0) && ((d->raster & 0x80) ? d->zdecal_nsub : d->ztie_nsub);
+                QueryPerformanceCounter(&q0);
+                zt_draw_indexed(ctx, dev, d->raster, d->nindices, (d->raster & 0x80) ? d->zdecal_nsub : d->ztie_nsub);
+                QueryPerformanceCounter(&q1);
+                g_d3d8_zc[split ? 2 : 0] += (unsigned long long)(q1.QuadPart - q0.QuadPart);
+                g_d3d8_zc[split ? 3 : 1]++;
+            } else
+            zt_draw_indexed(ctx, dev, d->raster, d->nindices, (d->raster & 0x80) ? d->zdecal_nsub : d->ztie_nsub);   /* stable ties (XBOX_ZTIE) / decals */
+            if (lr == 2) {
+                if (d3d8_lights_z_begin(ctx)) { mirror_draw_indexed(ctx, dev, d); d3d8_lights_z_end(ctx); }
+                d3d8_lights_mirror_end(ctx);
+            } else if (lr == 1 && d3d8_lights_mirror_begin(ctx)) {
+                mirror_draw_indexed(ctx, dev, d);
+                if (d3d8_lights_z_begin(ctx)) { mirror_draw_indexed(ctx, dev, d); d3d8_lights_z_end(ctx); }
+                d3d8_lights_mirror_end(ctx);
+            }
+            if (g_d3d8_temporal_mark && lr != 2 && d3d8_temporal_mirror_begin(ctx)) {   /* fork: temporal */
+                mirror_draw_indexed(ctx, dev, d);
+                d3d8_temporal_mirror_end(ctx);
+            }
+        }
+        if (g_gpuprof_on) gpuprof_draw_end();
+    }
     if (g_perf_on) { perf_add(PZ_DDRAW, perf_now() - pt); perf_gpu_draw(g_nv_maps - maps0, (unsigned)ngrp); }
     return 1;
 }

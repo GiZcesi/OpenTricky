@@ -1,6 +1,49 @@
 # Changelog
 
-All notable changes to OpenTricky. Versions follow [Semantic Versioning](https://semver.org/); `-unstable` marks test releases.
+All notable changes to OpenTricky. Versions follow [Semantic Versioning](https://semver.org/); `-unstable` marked the test releases before 0.1.4, the first stable one.
+
+## [0.1.4] — 2026-10-29
+
+The first stable release: everything since 0.1.3, with evenly paced frames, an HD race display, new graphics options and a round of fixes to the picture and to stability.
+
+### Fixed
+- **Flicker**: the lattice towers and the speaker pole on Garibaldi, and the lit windows of Merqury City, no longer flicker.
+- **Race display above 60 FPS**: the rival icon stays on its rider; the Tricky meter spins at the original speed instead of too fast (up to 2.3 times as fast at 144 FPS in our tests).
+- **Tricky meter at any *Race HUD size***: the gauge stays in one piece, and its letters stay on it, when it bounces or a trick's points fly past.
+- **Pause menu with *HD HUD***: the pause screens look as in the original game, like the screens after a race; the HD display comes back on the first frame after the pause.
+- **Stutter from the log file**: the game's log is now written in the background, and its periodic diagnostics are left out of it, so it causes far fewer slow frames in a race (in our tests, about three quarters fewer frames over 8 ms).
+- **Thin lines** (cables, wires) keep their width at high resolutions; the **Replay** panel reaches both edges on ultrawide screens; **trick names** are centred on their button icons.
+- ***Look like the Xbox***: its fixes (fog volumes, lens flares, board tops, colours) are now always on, and the setting is gone.
+- **Rare freezes and crashes**: when the game has no room left for a rider's model or shadow, that piece is skipped instead of freezing the game; a disc image the game can't start from gives a message instead of a crash. Fixes to the game's internal clocks, the sound and some translated code.
+- **`settings.ini`** is fully written before it replaces the old file; *PLAY* says when the settings can't be saved. Disc images and folders with accented names now open when Windows is set to use UTF-8.
+- **Screenshots (F12)** keep your window's size and no longer overwrite each other in the same second; a `.txt` beside each one notes the track and your settings, without your folder names. *Shift+F12* saves a burst.
+
+### Improved
+- **Frame pacing**: at 60 FPS with *VSync* on, on a 60, 120 or 240 Hz screen that reports its refresh timing, almost every frame stays on screen for the same time, at the cost of a few milliseconds of delay (in our tests, about 3 ms on a 240 Hz screen, more on a 60 Hz one). On a screen above 60 Hz, *Match screen* follows the screen's exact refresh rate, with less delay than 0.1.3 (in our tests, 1 to 2 ms less on a 240 Hz screen); on a 60 Hz screen, it runs at 60 FPS, like *60 (Xbox)*. Above 60 FPS, with a frame rate limit, frames are evenly spaced when your PC keeps up, and each one shows the game at the time it reaches the screen, so motion stays smooth.
+- **Riders** are always drawn with their most detailed model.
+- **Texture filtering** is *16x* in *Recommended* and *Steam Deck*.
+- **Launcher**: shorter help and the same clear focus ring on every control; every connected controller works in the launcher, not only the first one; *Find my disc image* (click the disc label or the drop area to pick from the SSX Tricky (USA) disc images found on this computer); the window's shape stays between 16:10 and 2:1 when you resize it (at least 960×600); *PLAY* says when the game is already running or when Windows won't start it; dropping a file that isn't a disc image shows a message; the launcher goes through all ten track themes before repeating one.
+- **Updates**: a *Check now* button; *Cancel* stops the download and changes nothing. An update or a restore cut short is put right at the next start: finished if every file was already in place; otherwise undone, so the version you were using comes back as it was.
+- **About and licences**: *About OpenTricky* now credits SSX Tricky PC, xboxrecomp, xemu, SSX-Library, SMAA and the HUD art; `THIRD-PARTY-LICENSES.txt` also includes the licences of the game's third-party code, not only the launcher's.
+- **Launcher look**: clear status labels for your disc image and for updates, sharper buttons and panels on every screen.
+
+### New
+- **HD HUD** (*Graphics*): the race display in HD. HUD art by Bl4ckH4nd.
+- **Render scale** (*Display*, 50 to 200%); **Lightmap smoothing**, **Snow look** and **Shadow softness** (40 to 150%) in *Graphics*; **Smoother terrain seams** in *Advanced* (the seams are cached instead of being worked out on every frame). Most new options show a preview in the launcher.
+
+### Changed
+- **Release zip name**: `OpenTricky-<version>-win64.zip` (no `-unstable`).
+- *Update channel*: *Unstable* is now *Beta*. *Smoother legs in turns* is no longer experimental.
+- **Shorter setting names**: in *Frame rate limit*, *The screen's refresh rate* is now *Match screen* and *60 (as on Xbox)* is *60 (Xbox)*; in *Race HUD size*, *Like the Xbox (stretched)* is now *Stretched (Xbox)*; in *Texture filtering*, *Off (as on Xbox)* is now *Off (Xbox)*; *Save games folder* is now *Save folder*.
+
+### Known issues
+- **Above 60 FPS, the controls respond one game step later** (about 17 ms): set *Frame rate limit* to *60 (Xbox)* for the original game's exact timing.
+- Only Xbox-style (XInput) controllers are supported natively; with Steam Input or DS4Windows, pick *PlayStation modern* or *PS2 original* in *Button style*.
+- **Linux / Steam Deck (Proton):** with Proton Experimental, performance may be lower: if so, try Proton 10 or PortProton.
+- **At 60 FPS on a 60 Hz screen that doesn't report its refresh timing** (the Steam Deck, some laptops), frames can wait in a queue and reach the screen later than in 0.1.3.
+- *Smoother terrain seams* hides most seams, not all.
+
+See also [Known issues](README.md#known-issues) in the README.
 
 ## [0.1.3-unstable] — 2026-10-13
 

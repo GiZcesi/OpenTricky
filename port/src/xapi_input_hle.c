@@ -38,11 +38,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include "netplay/np_racebench.h"
+#include "netplay/np_net.h"
 #include <stdlib.h>
 
 #include "recomp/recomp_types.h"
 #include "controls.h"
+#include "../../xboxrecomp/src/kernel/xbox_logstats.h"
 
 extern __thread uint32_t g_eax;
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
@@ -121,6 +122,7 @@ static int pad2_test(void)
     return v;
 }
 
+
 static uint32_t gamepad_mask(void)
 {
     uint32_t m = pad2_test() ? 3u : 1u;   /* port 0: pad or keyboard */
@@ -161,20 +163,6 @@ static const struct { const char *name; WORD bit; int analog; } names[] = {
 #define STICK 100
 #define NNAMES (sizeof(names) / sizeof(names[0]))
 
-/* Live presses from the diag port (`press A 150`): the tick each button is
- * held until. Written by the diag thread, read by the game's poll. */
-static volatile DWORD g_live_until[NNAMES];
-
-int xinput_hle_press(const char *name, int ms)
-{
-    unsigned k;
-    for (k = 0; k < NNAMES; k++)
-        if (!_stricmp(name, names[k].name)) {
-            g_live_until[k] = GetTickCount() + (DWORD)(ms > 0 ? ms : 150);
-            return 1;
-        }
-    return 0;
-}
 
 /* `list` ("LT+WHITE") names `one`. */
 #define AUTOPRESS_MAX 2048            /* held combinations repeat every 250 ms in long scripts */
@@ -202,6 +190,7 @@ static void autopress_hold(hle_state_t *s, WORD bit, int analog)
     else s->Gamepad.wButtons |= bit;
 }
 
+
 static void autopress_into(hle_state_t *s)
 {
     static int parsed = 0, n = 0;
@@ -210,9 +199,6 @@ static void autopress_into(hle_state_t *s)
     DWORD now = GetTickCount();
     int i;
     unsigned k;
-    for (k = 0; k < NNAMES; k++)
-        if ((LONG)(g_live_until[k] - now) > 0)
-            autopress_hold(s, names[k].bit, names[k].analog);
     if (!parsed) {
         const char *e = getenv("XBOX_INPUT_AUTOPRESS");
         parsed = 1;
@@ -250,6 +236,28 @@ static void autopress_into(hle_state_t *s)
         if (t >= ev[i].at_ms && t < ev[i].at_ms + 300)
             autopress_hold(s, ev[i].bit, ev[i].analog);
     }
+}
+
+
+/* Port 0 as the game would read it -- the physical pad and the keyboard through the mapping, the scripted and
+ * diagnostic presses -- without the blocks of the game's own read (a view that is not the game's, such as
+ * a spectator's). Game thread. */
+int xinput_hle_peek0(WORD *buttons, BYTE *analog)
+{
+    hle_state_t s;
+    ControlsPad cp;
+    memset(&s, 0, sizeof s);
+    memset(&cp, 0, sizeof cp);
+    if (host_input_enabled() || controls_fake_enabled()) {
+        controls_read_pad(0, &cp);
+        controls_read_keyboard(&cp);
+    }
+    s.Gamepad.wButtons = cp.buttons;
+    memcpy(s.Gamepad.bAnalogButtons, cp.analog, 8);
+    autopress_into(&s);
+    *buttons = s.Gamepad.wButtons;
+    memcpy(analog, s.Gamepad.bAnalogButtons, 8);
+    return 1;
 }
 
 /* ---- the replaced entry points ---- */
@@ -332,10 +340,10 @@ void sub_00180B89(void)   /* XInputGetState */
     if (port >= 0) {
         ControlsPad cp;
         memset(&cp, 0, sizeof cp);
-        if (host_input_enabled() && controls_read_pad((DWORD)port, &cp)) rc = 0;
+        if ((host_input_enabled() || controls_fake_enabled()) && controls_read_pad((DWORD)port, &cp)) rc = 0;
         else g_pad_present[port] = 0;
         if (port == 0) {
-            if (host_input_enabled()) controls_read_keyboard(&cp);
+            if (host_input_enabled() || controls_fake_enabled()) controls_read_keyboard(&cp);
             rc = 0;
         }
         s.Gamepad.wButtons = cp.buttons;
@@ -345,7 +353,12 @@ void sub_00180B89(void)   /* XInputGetState */
         s.Gamepad.sThumbRX = cp.rx;
         s.Gamepad.sThumbRY = cp.ry;
         if (port == 0) autopress_into(&s);
-        if (port == 0 && np_rb_pad_muted()) memset(&s.Gamepad, 0, sizeof s.Gamepad);
+        /* online race: no pause (the others would wait), START is dropped; a build without the online
+         * mode has the constant 0 here */
+        if (port == 0 && np_net_block_pause()) s.Gamepad.wButtons &= (WORD)~0x0010u;   /* XINPUT_GAMEPAD_START */
+        /* online, after this player's arrival and until the final ranking (or the host gone, or the wait over):
+         * nothing reaches the game's results menu */
+        if (port == 0 && np_direct_block_menu()) memset(&s.Gamepad, 0, sizeof s.Gamepad);
         if (port == 1 && pad2_test()) {
             rc = 0;
             autopress_into(&s);
@@ -373,7 +386,7 @@ void sub_00180B89(void)   /* XInputGetState */
                 static LONG held_lines = 0;
                 if (held && InterlockedIncrement(&held_lines) <= 400) {
                     fprintf(stderr, "  [XINPUT] input port0 held 0x%08X\n", (unsigned)held);
-                    fflush(stderr);
+                    xbox_log_flush();
                 }
             }
         }

@@ -477,6 +477,27 @@ BOOLEAN __stdcall xbox_KeSetTimer(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, PXB
     return xbox_KeSetTimerEx(Timer, DueTime, 0, Dpc);
 }
 
+/* A due time on the performance counter itself (QPC ticks), for a
+ * timer whose expiry the port places more finely than the title's whole
+ * milliseconds (frame_clock.c, the title's 60 Hz frame timer). One-shot,
+ * no DPC; otherwise as KeSetTimerEx. */
+static __thread LONGLONG s_due_qpc_abs;   /* > 0: the next xbox_KeSetTimerEx on this thread takes it */
+
+BOOLEAN xbox_KeSetTimerAtQpc(PXBOX_KTIMER Timer, LONGLONG due_qpc)
+{
+    LARGE_INTEGER z;
+    z.QuadPart = 0;
+    xbox_ensure_timer_queue();
+    s_due_qpc_abs = due_qpc > 0 ? due_qpc : 1;
+    return xbox_KeSetTimerEx(Timer, z, 0, NULL);
+}
+
+LONGLONG xbox_kt_qpf(void)
+{
+    xbox_ensure_timer_queue();
+    return g_kt_qpf;
+}
+
 BOOLEAN __stdcall xbox_KeSetTimerEx(
     PXBOX_KTIMER Timer,
     LARGE_INTEGER DueTime,
@@ -484,10 +505,11 @@ BOOLEAN __stdcall xbox_KeSetTimerEx(
     PXBOX_KDPC Dpc)
 {
     BOOLEAN was_inserted;
-    LONGLONG rel_100ns;
+    LONGLONG rel_100ns, due_abs = s_due_qpc_abs;
     LARGE_INTEGER now;
     int i;
 
+    s_due_qpc_abs = 0;
     if (!Timer)
         return FALSE;
 
@@ -518,7 +540,8 @@ BOOLEAN __stdcall xbox_KeSetTimerEx(
         i = g_kt_n++;
     if (i >= 0) {
         g_kt[i] = Timer;
-        g_kt_due[i] = now.QuadPart + (LONGLONG)((double)rel_100ns * (double)g_kt_qpf / 1e7);
+        g_kt_due[i] = due_abs > 0 ? due_abs
+                    : now.QuadPart + (LONGLONG)((double)rel_100ns * (double)g_kt_qpf / 1e7);
         g_kt_period[i] = Period > 0 ? (LONGLONG)Period * g_kt_qpf / 1000 : 0;
         Timer->Inserted = TRUE;
     } else {

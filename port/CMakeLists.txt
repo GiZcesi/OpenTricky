@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.20)
 # docs/building.md.
 # ============================================================================
 
-project(ssx_tricky C)
+project(ssx_tricky C CXX)
 
 # The game's icon and manifest (src/ssx_recomp.rc.in) need the resource
 # compiler (windres with MinGW, rc.exe with MSVC).
@@ -24,6 +24,17 @@ add_compile_definitions(
     WIN32_LEAN_AND_MEAN
     NOMINMAX
 )
+
+# Floating point: no contraction of a*b+c into one fused multiply-add. GCC's
+# default in GNU C mode is -ffp-contract=fast, which rounds once instead of
+# twice wherever the target has FMA: the game's simulation would then depend
+# on the -march it was built for. Without -march there is no FMA and this
+# changes no instruction; it keeps it so if a -march is ever added. Set before
+# the runtime below so it covers the game and the runtime alike (C only: not
+# the resource compiler).
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:-ffp-contract=off>)
+endif()
 
 # The PS2 button style (XBOX_BUTTON_ICONS=ps2, assets/btnicons/ps2/):
 # built in by default; OFF leaves its pictures out of the executable (a
@@ -113,22 +124,21 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/pass_tags.c
     src/fps_cap.c
+    src/frame_clock.c
     src/aspect.c
     src/drawdist.c
     src/terrain_seams.c
     src/pumplag.c
     src/strmwalk.c
     src/chantfix.c
+    src/riderlod.c
+    src/shadowvb.c
     src/ctlscheme.c
     src/ps2legend.c
+    src/extras_off.c
     src/fullfade.c
     src/hud_anchor.c
-    src/ticktrace.c
     src/perf_hooks.c
-    src/netplay/np_cmdlog.c
-    src/netplay/np_ghost.c
-    src/netplay/np_racebench.c
-    src/netplay/np_net.c
     src/xapi_input_hle.c
     src/recomp/recomp_probe.c
 )
@@ -174,12 +184,29 @@ message(STATUS "Executable will be named: ${GAME_TITLE}.exe")
 
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # no C / C++ runtime DLL beside the game
+    target_link_options(${PROJECT_NAME} PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+target_link_libraries(${PROJECT_NAME} PRIVATE dwmapi)
+
+# Screenshots (src/hostui.c): the PNG writer of miniz 3.1.2, MIT
+# (third_party/miniz, unmodified, also in the launcher), deflate only.
+add_library(ssx_miniz STATIC third_party/miniz/miniz.c)
+target_include_directories(ssx_miniz PUBLIC third_party/miniz)
+target_compile_definitions(ssx_miniz PUBLIC MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_INFLATE_APIS
+    MINIZ_NO_ZLIB_COMPATIBLE_NAMES)
+target_link_libraries(${PROJECT_NAME} PRIVATE ssx_miniz)
+
 # A release build: the version without "-dev" (src/version.h). Only the release
 # tools turn it on; every other build says "-dev".
 option(OT_RELEASE "Release build (version without -dev)" OFF)
 if(OT_RELEASE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE OT_RELEASE=1)
 endif()
+# Modules of the private test builds (src/netplay/np_build.cmake): not in the
+# public tree, where this line does nothing (np_net.h is then the empty stub).
+include(${CMAKE_CURRENT_SOURCE_DIR}/src/netplay/np_build.cmake OPTIONAL)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -193,7 +220,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dxguid
     $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # XInput 1.4 ships with Windows
     winmm
-    ws2_32      # netplay over UDP (XBOX_NET)
     # Launcher: controls dialog, file/folder pickers, shell
     comctl32
     ole32
@@ -211,7 +237,18 @@ if(SSX_BUILD_TESTS)
     if(WIN32)
         target_link_libraries(settings_test PRIVATE shell32 ole32 uuid)
     endif()
+    # Tick -> ns / us conversion of the APU and NV2A clocks (no overflow)
+    add_executable(clock_test tests/clock_test.c)
+    target_include_directories(clock_test PRIVATE
+        ${XBOXRECOMP_DIR}/src/nv2a)
 endif()
+
+# The extras (extras.cmake): not in the stable build, OFF by default; not in
+# the public tree, where this line does nothing.
+include(${CMAKE_CURRENT_SOURCE_DIR}/extras.cmake OPTIONAL)
+# The developer tools (devtools.cmake): never in a public build, OFF by
+# default; not in the public tree either.
+include(${CMAKE_CURRENT_SOURCE_DIR}/devtools.cmake OPTIONAL)
 
 if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE /LARGEADDRESSAWARE)

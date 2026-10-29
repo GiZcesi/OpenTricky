@@ -1,0 +1,12 @@
+# Addresses with more than one hook body, on purpose (fix_manual_hook_calls.py).
+# One line per address: the address, then every body as file:hook (paths from
+# port/src). Any other second body for an address stops the regen. A tree may
+# hold fewer of the listed bodies (the public tree has no online code).
+# These addresses are never routed from direct calls: the tree has no direct
+# call to any of them, and the regen stops if one appears.
+
+# The race tick and the race render: the frame profile (XBOX_PERF) hooks time
+# the call and chain to the tick trace, then to the frame cap, themselves.
+0x000AD4A0 perf_hooks.c:hook_tick
+0x000AB610 perf_hooks.c:hook_render fps_cap.c:hook_AB610
+

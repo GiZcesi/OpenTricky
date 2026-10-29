@@ -59,6 +59,15 @@ int  aspect_init(double aspect);
 /* Parses XBOX_ASPECT; render_w x render_h gives "auto" its shape. 0 = unset. */
 double aspect_from_env(unsigned render_w, unsigned render_h);
 void (*aspect_lookup(unsigned int xbox_va))(void);
+/* The race camera's own field of view and distance (render only, the
+ * tuning panel; XBOX_CAMERA_FOV / XBOX_CAMERA_DISTANCE in percent): the
+ * angle's tangent times fov, the follow camera's eye moved back (or forth)
+ * by (distance - 1) of its depth to the rider, on top of the ultra-wide
+ * back-off. 1, 1 = the original. aspect_cam_hooks: the camera hooks are
+ * handed out even at 16:9 / 4:3 (asked for by the panel, these variables or
+ * the speed camera). */
+void aspect_set_camera(float fov, float distance);
+int  aspect_cam_hooks(void);
 /* 1: the frame about to be rendered is shown in a centred 16:9 frame (the
  * title's own 16:9 x-scale), 0: wide (see hud_anchor.h). */
 void aspect_frame(int boxed);
@@ -69,6 +78,10 @@ const char *aspect_fov_name(int mode);      /* "NoStretch", "Balanced", "Full" (
 int  aspect_fov_parse(const char *s, int fallback);
 /* XBOX_WIDE_FOV when set, else `chosen`; call before aspect_init. */
 void aspect_set_fov(int chosen);
+/* Arguments of the last perspective projection built (fov as narrowed here, aspect, near, far): out[0..3].
+ * 0 if none was built yet (the hook is on only for a display wider than 16:9 or a camera setting). Render
+ * thread: for what is drawn over the 3D at a point of the scene. */
+int  aspect_last_perspective(float out[4]);   /* not aspect_last_projection (speedfx.c) */
 
 /* Menus out of a race on screens wider than 4:3:
  *   16:9  the title's own widescreen menus (art x1.33), in a centred 16:9

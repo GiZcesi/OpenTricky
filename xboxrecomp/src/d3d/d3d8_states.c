@@ -11,6 +11,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "d3d8_temporal.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -303,6 +304,7 @@ static D3D11_FILTER d3d8_to_d3d11_filter(DWORD mag, DWORD min, DWORD mip)
  * filtering; 2..16 = anisotropic for every texture the title filters
  * linearly. Point-sampled textures (pixel fonts) are left alone. */
 static int g_host_aniso = 0;
+static int s_tmp_wanted = -1;           /* fork: XBOX_TEMPORAL, read once */
 
 void d3d8_SetAnisotropy(int n)
 {
@@ -354,6 +356,10 @@ void d3d8_states_apply_sampler(DWORD stage)
      * with no mip filter -- the base level only. */
     bias.u = tss[D3DTSS_MIPMAPLODBIAS];
     sd.MipLODBias = (bias.f == bias.f && bias.f > -16.0f && bias.f < 16.0f) ? bias.f : 0.0f;
+    /* Fork: the temporal jitter's negative bias (d3d8_temporal.h), on the 3D
+     * of a race only; 0 when off. */
+    if (s_tmp_wanted < 0) s_tmp_wanted = d3d8_temporal_wanted();
+    if (s_tmp_wanted) sd.MipLODBias += d3d8_temporal_mip_bias();
     sd.MinLOD = (FLOAT)tss[D3DTSS_MAXMIPLEVEL];
     sd.MaxLOD = (tss[D3DTSS_MIPFILTER] == D3DTEXF_NONE) ? sd.MinLOD : D3D11_FLOAT32_MAX;
 

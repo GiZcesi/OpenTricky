@@ -70,13 +70,13 @@ static const char *const k_res[2][B_COUNT] = {
       "BTN_P_DPAD", "BTN_P_LSTICK", "BTN_P_RSTICK" },
 };
 
-/* PS2 original (MODE_PS2): the PS2 button pictures of port/assets/btnicons/ps2/
- * (4x, nearest neighbour). Resource "PS2_" + set + name, one set per PS2 atlas:
- * the trick HUD's (hudtrick, also used for the menus' fe_1 and the loading
- * screens' hud) and the race HUD's (hudgame: same pictures, its own
- * palette). The menus take the HUD's light face buttons, not the darker ones
- * of the PS2 front end's own atlas, which read badly on the grey panels.
- * The PS2 pad has one stick picture, for both sticks. */
+/* PS2 original (MODE_PS2): the "ps2" style's pictures, port/assets/btnicons/ps2/
+ * (drawn nearest neighbour). Resource "PS2_" + set + name, in two sets, by the
+ * Xbox atlas they are composed into: the trick HUD's (hudtrick, also used for
+ * the menus' fe_1 and the loading screens' hud) and the race HUD's (hudgame:
+ * the same pictures in its own colours). The menus use the light face
+ * buttons, which read well on the grey panels.
+ * The style has one stick picture, for both sticks. */
 enum { SET_TRICK, SET_GAME, N_SETS };
 static const char *const k_set_name[N_SETS] = { "PS2_", "PS2_GAME_" };
 static const char *const k_res_ps2[B_COUNT] = {
@@ -145,8 +145,8 @@ static int g_icons_loaded;
  * under it (the Duke's place, texels 0-179). Pictures already 4x, pasted
  * texel for texel, never resampled:
  *   - MODE_PS2: the PS2-style pictures (resources "PS2_LESSON_*",
- *     port/assets/btnicons/ps2/); the pad is the PS2 atlas' own box
- *     (0,0) 256 x 126, the origin of the PS2 lesson's marker positions;
+ *     port/assets/btnicons/ps2/); the pad's box is (0,0) 256 x 126, the
+ *     origin of the lesson's marker positions;
  *   - MODE_PS and MODE_MODERN: a DualShock 4 / Xbox One drawing in its own
  *     shape and its markers drawn from its buttons' outlines (resources
  *     "PSM_LESSON_*" / "XBM_LESSON_*", port/assets/btnicons/pads/make_pads.py,
@@ -201,7 +201,7 @@ static const LessonStyle *g_ls;     /* the style's, once loaded (lesson_ready) *
 /* The lesson's shapes (the trick HUD's table, written by 0xEF960 on each
  * course or tutorial load): pad 96 and the markers' shapes of the title's
  * table 0x1AA6C8, each with the game's own record (checked before it is
- * changed) and the PS2 picture it shows, mirrored as the PS2 pad needs it
+ * changed) and the style's picture it shows, mirrored as its pad needs it
  * (the right shoulders, the D-pad's left and down arms; a mirrored UV runs
  * from its right or bottom edge, as the game's own 125 / 131 / 132 do). */
 typedef struct {
@@ -408,7 +408,7 @@ static void thin_letters(const Img *im, Img *out)
 /* Configure Controller (options menu): shape 61 of the front end's atlas,
  * texels (0,0)-(218,171), the pad and its legend lines, gets the style's
  * picture (4x, pasted texel for texel; port/assets/btnicons/pads/
- * make_config.py; the PS2 one: port/assets/btnicons/ps2/ps2_config.png). The labels'
+ * make_config.py; the ps2 style's: port/assets/btnicons/ps2/ps2_config.png). The labels'
  * layout that matches it is ps2legend.c's. */
 #define CFG_W 218
 #define CFG_H 171
@@ -731,12 +731,12 @@ static void draw_icon(uint8_t *dst, int dw, const Img *im, int rx, int ry, int r
         }
 }
 
-/* MODE_PS2: the whole picture (the PS2 glyph's box, the size the shape
+/* MODE_PS2: the whole picture (the picture's own box, the size the shape
  * sizes of ctlscheme.c are worked out from), nearest neighbour: its pixels
  * are kept as they are, never blended. fill: it fills the rectangle,
- * stretched on each axis, for the glyphs whose shapes are drawn at the PS2
- * size, which undoes the stretch on screen; else it fits inside, aspect kept
- * and centred. */
+ * stretched on each axis, for the glyphs whose shapes are drawn at the
+ * picture's size, which undoes the stretch on screen; else it fits inside,
+ * aspect kept and centred. */
 static void draw_ps2(uint8_t *dst, int dw, const Img *im, int rx, int ry, int rw, int rh, int fill)
 {
     int bx = 0, by = 0, bw = im->w, bh = im->h, ox, oy, fw, fh, x, y;
@@ -765,11 +765,11 @@ static void draw_ps2(uint8_t *dst, int dw, const Img *im, int rx, int ry, int rw
 
 /* MODE_PS2, trick and race HUDs (hud1): the shape that shows each button, as
  * measured in game (UV rectangle in texels, texel centres; the game's shape
- * size is the UV size + 1, the same in hudtrick and hudgame), and the PS2
- * glyph's size. The PS2 picture fills the UV rectangle, stretched on each
- * axis, and ctlscheme.c gives the shape the PS2 size (btnicons_ps2_shape),
- * which undoes the stretch on screen. RT's rectangle starts one texel inside
- * LT's: each keeps clear of that shared texel (cut). */
+ * size is the UV size + 1, the same in hudtrick and hudgame), and the
+ * picture's size. The picture fills the UV rectangle, stretched on each
+ * axis, and ctlscheme.c gives the shape the picture's size
+ * (btnicons_ps2_shape), which undoes the stretch on screen. RT's rectangle
+ * starts one texel inside LT's: each keeps clear of that shared texel (cut). */
 typedef struct {
     uint16_t shape;
     uint8_t button, cut_l, cut_r, pw, ph;
@@ -925,7 +925,7 @@ static IDirect3DTexture8 *compose(const Atlas *a, const uint8_t *src, uint32_t w
         paste(pix, (int)W, &g_cfg, 0, 0, sc);
     }
     if (a->set == SET_TRICK && a->slots == k_hud1 && lesson_ready()) {
-        /* the lesson: Duke and markers out, the PS2 pad and markers in (the
+        /* the lesson: Duke and markers out, the style's pad and markers in (the
          * rows' right end below them: the Duke's ring and arrow markers) */
         fill(pix, (int)W, 0, 0, (int)W, LESSON_CLEAR_H * sc, 0x00000000u);
         fill(pix, (int)W, 216 * sc, LESSON_CLEAR_H * sc, 40 * sc, 2 * sc, 0x00000000u);
@@ -1092,7 +1092,7 @@ int btnicons_lesson_shape(int i, unsigned *shape, float game[6], float ps2[6])
     game[4] = l->game[4] / 256.0f;
     game[5] = l->game[5] / 256.0f;
     /* the picture's texels, centre to centre; the shape's size is the UV's
-     * + 1 (the game's rule), so one texel is one unit, as on the PS2 */
+     * + 1 (the game's rule), so one texel is one unit */
     x0 = g_ls->at[l->pic].x + 0.5f;
     y0 = g_ls->at[l->pic].y + 0.5f;
     x1 = x0 + g_ls->at[l->pic].w - 1.0f;
@@ -1120,7 +1120,7 @@ int btnicons_ps2_shape(int i, unsigned *shape, float uv[4], float game_wh[2], fl
     uv[0] = u->u0; uv[1] = u->v0; uv[2] = u->u1; uv[3] = u->v1;
     game_wh[0] = uw + 1.0f;                 /* the game's own size: UV + 1 */
     game_wh[1] = uh + 1.0f;
-    /* the PS2 glyph (pw texels) fills uw - cuts of the uw texels the shape shows */
+    /* the picture (pw texels) fills uw - cuts of the uw texels the shape shows */
     ps2_wh[0] = (u->pw + 1.0f) * uw / (uw - u->cut_l - u->cut_r);
     ps2_wh[1] = (u->ph + 1.0f);
     return 1;

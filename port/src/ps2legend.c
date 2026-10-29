@@ -112,6 +112,7 @@
 #include "xbox_file_hook.h"
 #include "ps2legend.h"
 #include "ctlscheme.h"
+#include "speedfx.h"
 
 int btnicons_cfg_style(void);           /* nv2a_btnicons.c */
 
@@ -518,6 +519,7 @@ static void hook_replayhelp_000EC800(void)
     uint32_t w0 = MEM32(REPLAY_BACK_WORD), w1 = MEM32(REPLAY_BACK_WORD + 4u), s0, s1;
     int swap = memcmp(&w0, k_back, 4) == 0 && memcmp(&w1, k_back + 4, 4) == 0;
 
+    speedfx_note_replay();              /* a replay: no speed effect (speedfx.h) */
     if (swap) {
         memcpy(&s0, k_select, 4);
         memcpy(&s1, k_select + 4, 4);

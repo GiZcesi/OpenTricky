@@ -57,6 +57,7 @@
  * in order to bounds-check vertex stream offsets. Header-only use -- it
  * adds no link dependency from nv2a back onto the kernel library. */
 #include "../kernel/xbox_memory_layout.h"
+#include "../kernel/xbox_logstats.h"
 #define XBOX_GUEST_RAM_BYTES ((uint32_t)XBOX_TOTAL_RAM)
 
 /* Push-buffer command header encoding (same as nv2a_pb_replay.c). */
@@ -623,7 +624,7 @@ void nv2a_live_pb_tick(uint8_t *mem_base)
             }
         }
 
-        if (g_batches <= 12 || (g_batches % 200) == 0)
+        if (g_batches <= 12 || (xbox_log_stats() && (g_batches % 200) == 0))
             fprintf(stderr, "[LIVE-PB] batch %u: 0x%08X -> 0x%08X %s%u dwords"
                             " (limit 0x%08X)\n",
                     g_batches, prev_wp, wp,
@@ -648,10 +649,11 @@ void nv2a_live_pb_tick(uint8_t *mem_base)
         /* Stats reporting runs on its own timer, not inside the present
          * path. Presenting moved to the title's frame boundary, which made
          * that block rare, and the counters silently stopped being reported
-         * -- which reads as a regression when only the metric moved. */
+         * -- which reads as a regression when only the metric moved.
+         * Development statistics: XBOX_LOG_STATS=1 (xbox_logstats.h). */
           {
                 static DWORD last_report = 0;
-                if (now - last_report >= 5000) {
+                if (xbox_log_stats() && now - last_report >= 5000) {
                     PgraphD3D11Stats st;
                     last_report = now;
                     pgraph_d3d11_get_stats(&st);

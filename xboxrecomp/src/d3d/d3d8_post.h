@@ -102,7 +102,11 @@ void d3d8_SetPostSplit(int on);
 int  d3d8_GetPostSplit(void);
 int  d3d8_post_split_active(void);
 int  d3d8_post_split_wanted(void);
+/* The pass phase callback is wanted (split, render scale, bloom, temporal). */
+int  d3d8_post_wanted(void);
 int  d3d8_post_cycle(unsigned present_no);
+/* 1 around the run at the FRAME_END marker (the speed effect runs there only). */
+void d3d8_post_split_call(int on);
 
 /* Write src (w x h) into rtv, every sample of a multisampled target, by the
  * identity pass (exact, alpha kept). State saved and restored. */

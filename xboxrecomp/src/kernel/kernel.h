@@ -722,6 +722,14 @@ BOOLEAN  __stdcall xbox_KeCancelTimer(PXBOX_KTIMER Timer);
 VOID               xbox_KeReleaseTimerResources(PXBOX_KTIMER Timer);
 BOOLEAN  __stdcall xbox_KeSetTimer(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, PXBOX_KDPC Dpc);
 BOOLEAN  __stdcall xbox_KeSetTimerEx(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, LONG Period, PXBOX_KDPC Dpc);
+/* One-shot expiry at an absolute performance-counter time (QPC
+ * ticks), and the counter's frequency the timer queue uses. */
+BOOLEAN            xbox_KeSetTimerAtQpc(PXBOX_KTIMER Timer, LONGLONG due_qpc);
+LONGLONG           xbox_kt_qpf(void);
+/* Set by the port (frame_clock.c). Asked for every one-shot guest
+ * KeSetTimer(Ex) with a relative due time: 0 = as asked, else the absolute
+ * QPC due time to use instead. Called with the bridge's timer map lock held. */
+extern LONGLONG (*g_xbox_ktimer_due_filter)(uint32_t timer_va, LONGLONG rel_100ns);
 VOID     __stdcall xbox_KeInitializeTimerEx(PXBOX_KTIMER Timer, XBOX_TIMER_TYPE Type);
 
 VOID     __stdcall xbox_KeInitializeDpc(PXBOX_KDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine, PVOID DeferredContext);

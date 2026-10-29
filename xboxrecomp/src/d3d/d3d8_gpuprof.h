@@ -36,6 +36,8 @@ enum {
     GP_RESOLVE,         /* MSAA resolve at present */
     GP_BLIT,            /* copy / blit (+ DAC gamma) to the swap chain */
     GP_SOFTSHADOW,      /* soft shadows: stencil mask, blur, apply */
+    GP_RSCALE,          /* render scale: the 3D to the render size (resample + depth) */
+    GP_LIGHTS,          /* the lights: selective bloom */
     GP_N
 };
 

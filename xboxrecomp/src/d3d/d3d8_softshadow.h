@@ -18,7 +18,7 @@
  *      Gaussian of the distance times a depth term (relative depth
  *      difference, ~5 %), so the mask never leaks onto an object in front of
  *      or behind the shadowed surface; radius proportional to the render
- *      height (2.5 px at 480 lines);
+ *      height (2.5 px at 480 lines, times XBOX_SOFT_SHADOW_WIDTH / 100);
  *   3. apply: the scene colour (and alpha, as the quad did) is multiplied by
  *      lerp(1, shade, blurred mask): the inside of a shadow keeps exactly the
  *      title's darkness, the edge fades over a few pixels.
@@ -40,6 +40,17 @@ extern "C" {
 
 /* XBOX_SOFT_SHADOWS=1, read once. */
 int d3d8_softshadow_enabled(void);
+
+/* XBOX_SOFT_SHADOW_WIDTH: the width of the soft edge in percent of the
+ * default (2.5 px at 480 lines), 10..300, read once; 100 when unset or out
+ * of range. Only the blur's radius changes, never the shadow's darkness. */
+int d3d8_softshadow_width(void);
+
+/* Live change (diagnostics port, picture captures). Turning the soft shadows
+ * on needs the depth view made at start: only a game started with them on
+ * can turn them off and back on. */
+void d3d8_softshadow_set(int on);
+void d3d8_softshadow_set_width(int pct);
 
 /* The three passes. depth is a shader view of the depth buffer bound as dsv
  * (R24_UNORM_X8_TYPELESS, multisampled when msaa > 1). cmp is a

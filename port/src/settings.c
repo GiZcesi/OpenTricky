@@ -16,6 +16,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
+#include <io.h>
 #define SEP '\\'
 #else
 #include <sys/stat.h>
@@ -34,7 +35,7 @@ static const SettingChoice k_display_mode[] = {
 /* Same order as LAUNCHER_ASPECT_* (launcher.h). */
 static const SettingChoice k_aspect[] = {
     { "4:3", "4:3" }, { "16:9", "16:9" }, { "21:9", "21:9" }, { "32:9", "32:9" },
-    { "auto", "Auto (the screen's shape)" },
+    { "auto", "Auto" },
 };
 static const SettingChoice k_menus[] = {
     { "4:3", "Original 4:3" }, { "16:9", "Xbox 16:9" },
@@ -45,33 +46,56 @@ static const SettingChoice k_fov[] = {
 };
 /* hud_anchor.h sizes (100, 90, 85, 80, 70 %), then the Xbox's stretched HUD. */
 static const SettingChoice k_race_hud[] = {
-    { "100", "100 %" }, { "90", "90 %" }, { "85", "85 %" }, { "80", "80 %" }, { "70", "70 %" },
-    { "xbox", "Like the Xbox (stretched)" },
+    { "100", "100%" }, { "90", "90%" }, { "85", "85%" }, { "80", "80%" }, { "70", "70%" },
+    { "xbox", "Stretched (Xbox)" },
 };
 static const SettingChoice k_fps_limit[] = {
-    { "monitor", "The screen's refresh rate" }, { "60", "60 (as on Xbox)" }, { "120", "120" },
+    { "monitor", "Match screen" }, { "60", "60 (Xbox)" }, { "120", "120" },
     { "144", "144" }, { "240", "240" }, { "unlimited", "Unlimited" },
 };
 static const SettingChoice k_vsync[] = {
     { "on", "On" }, { "adaptive", "Adaptive" }, { "off", "Off" },
 };
+/* HD textures: launcher.c LAUNCHER_HD_* order. Files of earlier versions have
+ * 0 / 1, or off / hud / all (normalize: 1 and all = on, 0 and hud = off; a
+ * file's "hud" also turns HD HUD on: settings_parse). */
+static const SettingChoice k_hd_textures[] = {
+    { "off", "Off" }, { "on", "On" },
+};
 static const SettingChoice k_tex_filter[] = {
-    { "off", "Off (as on Xbox)" }, { "2", "2x" }, { "4", "4x" }, { "8", "8x" }, { "16", "16x" },
+    { "off", "Off (Xbox)" }, { "2", "2x" }, { "4", "4x" }, { "8", "8x" }, { "16", "16x" },
 };
 /* Same order as XBOX_SMAA_PRESET's levels (0 = off). */
 static const SettingChoice k_smaa[] = {
     { "off", "Off" }, { "low", "Low" }, { "medium", "Medium" }, { "high", "High" }, { "ultra", "Ultra" },
 };
+/* The 3D drawn smaller or larger than the resolution (XBOX_RENDER_SCALE);
+ * the HUD, menus and text stay at the resolution. Same steps as d3d8_rscale. */
+static const SettingChoice k_render_scale[] = {
+    { "50", "50%" }, { "67", "67%" }, { "75", "75%" }, { "85", "85%" }, { "100", "100%" },
+    { "125", "125%" }, { "150", "150%" }, { "175", "175%" }, { "200", "200%" },
+};
+/* The width of the soft shadows' edge, in percent of the first one
+ * (XBOX_SOFT_SHADOW_WIDTH); 60 = the "40 % less" the edge was tried at. */
+static const SettingChoice k_shadow_softness[] = {
+    { "40", "40%" }, { "60", "60%" }, { "80", "80%" }, { "100", "100%" },
+    { "125", "125%" }, { "150", "150%" },
+};
 static const SettingChoice k_draw_distance[] = {
-    { "original", "Original" }, { "far", "Far (x1.5)" }, { "max", "Max (x2)" },
+    { "original", "Original" }, { "far", "Far" }, { "max", "Max" },
+};
+/* XBOX_SNOW_LOOK (the hidden "mixed" is not offered). The token stays "ps2"
+ * (settings.ini, XBOX_SNOW_LOOK); only the label shown is "Soft". */
+static const SettingChoice k_snow_look[] = {
+    { "original", "Original" }, { "ps2", "Soft" },
 };
 static const SettingChoice k_speakers[] = {
     { "auto", "Auto" }, { "stereo", "Stereo" }, { "5.1", "5.1" },
 };
 /* Audio buffers of 5.33 ms (XBOX_AUDIO_QUEUE); the delay is ~ (n - 1) x 5.33 + 39 ms. */
 static const SettingChoice k_audio_delay[] = {
-    { "4", "Short (55 ms, may crackle)" }, { "8", "Normal (76 ms)" },
-    { "12", "Long (98 ms)" }, { "16", "Longer (119 ms, the old port)" },
+    { "4", "Short (55 ms)" }, { "8", "Normal (76 ms)" },
+    { "12", "Long (98 ms)" }, { "16", "Longer (119 ms)" },
 };
 static const SettingChoice k_launcher_sounds[] = {
     { "off", "Off" }, { "low", "Low" }, { "medium", "Medium" },
@@ -98,7 +122,7 @@ static const SettingChoice k_check_updates[] = {
     { "ask", "Ask before installing" }, { "never", "Never" },
 };
 static const SettingChoice k_update_channel[] = {
-    { "stable", "Stable" }, { "unstable", "Unstable" },
+    { "stable", "Stable" }, { "unstable", "Beta" },
 };
 /* The launcher's theme: a track's colours, emblem and card (read from the disc). */
 static const SettingChoice k_theme[] = {
@@ -147,74 +171,93 @@ const char *const *settings_key_names(void) { return k_key_names; }
 
 static const SettingDef k_reg[SETTINGS_COUNT] = {
     /* ── DISPLAY ── */
-    [S_MONITOR] = { "Display", "Monitor", T_DISPLAY, "SCREEN", "Monitor",
-        "The screen the game opens on: 0 = the main screen, 1, 2... = the others, in Windows' order.",
+    [S_MONITOR] = { "Display", "Monitor", T_DISPLAY, "SCREEN", "Screen",
+        "The screen the game opens on.",
         SETTING_INT, NULL, 0, 0, 16, "0", "XBOX_MONITOR", SETTING_PENDING, NOP },
     [S_RESOLUTION] = { "Display", "Resolution", T_DISPLAY, "SCREEN", "Resolution",
-        "The size the game is drawn at, among the sizes of the chosen screen shape. Auto: the screen's own size in fullscreen, the largest that fits in a window.",
+        "The size of the picture. Auto uses your screen's size in fullscreen, or the largest size that fits in a window.",
         SETTING_RESOLUTION, NULL, 0, 0, 0, "auto", NULL, 0, P("auto", "auto", "1280x800") },
+    [S_RENDER_SCALE] = { "Display", "RenderScale", T_DISPLAY, "SCREEN", "Render scale",
+        "Draws the 3D below or above your resolution. Lower is lighter on the graphics card but softer; higher looks smoother and finer but is much heavier. Menus and the race display stay sharp.",
+        CHOICE(k_render_scale, "100"), "XBOX_RENDER_SCALE", SETTING_PC, P("100", "100", "100") },
     [S_DISPLAY_MODE] = { "Display", "DisplayMode", T_DISPLAY, "SCREEN", "Display mode",
         "Window or borderless fullscreen. Alt+Enter (or F11) switches while playing.",
         CHOICE(k_display_mode, "fullscreen"), NULL, 0, P("fullscreen", "fullscreen", "fullscreen") },
     [S_ASPECT] = { "Display", "ScreenShape", T_DISPLAY, "SCREEN", "Screen shape",
-        "4:3, or 16:9 for the game's own widescreen mode; 21:9, 32:9 and Auto widen that view to wider screens.",
+        "Match your screen. 16:9 is the game's own widescreen mode; 21:9 and 32:9 widen it further. Auto follows your screen.",
         CHOICE(k_aspect, "auto"), NULL, 0, P("auto", "auto", "auto") },
     [S_MENUS] = { "Display", "Menus", T_DISPLAY, "WIDE SCREENS", "Menus",
-        "Original 4:3 keeps the menus exactly as the Xbox drew them, centred on wide screens. Xbox 16:9 uses the game's own widescreen menu layout. Races are the same with both.",
+        "Original 4:3 shows the menus as in the original game, centred. Xbox 16:9 uses the game's widescreen menus. Races look the same either way.",
         CHOICE(k_menus, "4:3"), "XBOX_WIDE_MENUS", 0, P("4:3", "4:3", "4:3") },
     [S_FOV] = { "Display", "FieldOfView", T_DISPLAY, "WIDE SCREENS", "Field of view",
-        "Wider than 16:9 only. No stretch keeps the 16:9 width of view; Full shows more, stretched at the edges; Balanced is halfway.",
+        "How much you see on screens wider than 16:9. No stretch keeps the 16:9 view; Full shows more, stretched at the edges; Balanced is in between.",
         CHOICE(k_fov, "NoStretch"), "XBOX_WIDE_FOV", 0, NOP },
     [S_RACE_HUD] = { "Display", "RaceHud", T_DISPLAY, "WIDE SCREENS", "Race HUD size",
-        "The race HUD in its own proportions at the edges of the screen, at this size; Like the Xbox stretches it to the screen as the console did.",
+        "The size of the race display (timer, position, boost). Stretched (Xbox) spreads it across the screen, as in the original game.",
         CHOICE(k_race_hud, "85"), "XBOX_HUD_SHAPE, XBOX_HUD_SIZE", 0, P("xbox", "85", "85") },
     [S_FPS_LIMIT] = { "Display", "FrameRateLimit", T_DISPLAY, "FRAME RATE", "Frame rate limit",
-        "The game itself always runs at 60 steps a second; above 60, the frames in between are smoothed.",
+        "The highest frame rate shown. Above 60, extra frames are smoothed in between; the game itself always runs at 60, like the original game.",
         CHOICE(k_fps_limit, "monitor"), "XBOX_FPS_CAP", SETTING_PC, P("60", "monitor", "60") },
     [S_VSYNC] = { "Display", "VSync", T_DISPLAY, "FRAME RATE", "VSync",
-        "On: no tearing. Adaptive: like On, but may tear (a shifted band) when the frame rate stays below the screen's. Off: least delay, may tear.",
+        "On: no tearing. Adaptive: smoother when the frame rate drops, with some tearing. Off: lowest input delay, with tearing.",
         CHOICE(k_vsync, "on"), "XBOX_SYNC", 0, P("on", "on", "on") },
 
     /* ── GRAPHICS ── */
+    [S_HD_HUD] = { "Graphics", "HdHud", T_GRAPHICS, "TEXTURES", "HD HUD",
+        "The race display in HD: timer, gauges, positions and their text, sharper at any resolution. Off: the original display.",
+        BOOL_("1"), "XBOX_HD_HUD", SETTING_PC, P("0", "1", "1") },
     [S_HD_TEXTURES] = { "Graphics", "HdTextures", T_GRAPHICS, "TEXTURES", "HD textures",
-        "Uses the HD textures of your HD pack folder.",
-        BOOL_("0"), "XBOX_HD_TEXTURES", SETTING_PC, P("0", "0", "0") },
+        "Sharper textures from your HD pack, except the menu pictures and the race display (see HD HUD).",
+        CHOICE(k_hd_textures, "off"), "XBOX_HD_TEXTURES, XBOX_HD_TEXTURES_HUD", SETTING_PC, P("off", "off", "off") },
     [S_HD_PACK_FOLDER] = { "Graphics", "HdPackFolder", T_GRAPHICS, "TEXTURES", "HD pack folder",
-        "The folder of your HD texture pack; a relative path is relative to the folder of OpenTricky.exe.",
+        "The folder that holds your HD pack.",
         SETTING_PATH, NULL, 0, 0, 0, "", "XBOX_HD_TEXTURES", 0, NOP },
     [S_TEX_FILTER] = { "Graphics", "TextureFiltering", T_GRAPHICS, "TEXTURES", "Texture filtering",
-        "Off: the textures as on the Xbox. 2x to 16x: sharper textures on slopes far away (anisotropic filtering).",
-        CHOICE(k_tex_filter, "off"), "XBOX_ANISO", SETTING_PC, P("off", "off", "off") },
+        "Sharper textures on distant slopes. Off looks like the original game.",
+        CHOICE(k_tex_filter, "16"), "XBOX_ANISO", SETTING_PC, P("off", "16", "16") },
     [S_SMAA] = { "Graphics", "SmoothEdges", T_GRAPHICS, "EDGES AND SHADOWS", "Smooth edges (SMAA)",
-        "Removes jagged outlines after drawing; menus and the HUD stay sharp.",
+        "Smooths jagged edges in races. Menus and the race display stay sharp.",
         CHOICE(k_smaa, "high"), "XBOX_SMAA, XBOX_SMAA_PRESET", SETTING_PC, P("off", "high", "high") },
     [S_SOFT_SHADOWS] = { "Graphics", "SoftShadows", T_GRAPHICS, "EDGES AND SHADOWS", "Soft shadows",
-        "The edges of the shadows fade over a few pixels; off = hard edges, as on the Xbox.",
+        "Softens the edges of shadows. Off gives hard edges, like the original game.",
         BOOL_("1"), "XBOX_SOFT_SHADOWS", SETTING_PC, P("0", "1", "0") },
+    [S_SHADOW_SOFTNESS] = { "Graphics", "ShadowSoftness", T_GRAPHICS, "EDGES AND SHADOWS", "Shadow softness",
+        "The width of the shadows' soft edge, with Soft shadows on. Lower is crisper, higher is softer.",
+        CHOICE(k_shadow_softness, "100"), "XBOX_SOFT_SHADOW_WIDTH", SETTING_PC, P("100", "100", "100") },
     [S_DRAW_DISTANCE] = { "Graphics", "DrawDistance", T_GRAPHICS, "WORLD", "Draw distance",
-        "How far the scenery is drawn: Original as on the Xbox, or farther, always within what each track can hold.",
+        "How far ahead the scenery appears. Original is the game's own distance; Far and Max show more of each track.",
         CHOICE(k_draw_distance, "original"), "XBOX_DRAW_DISTANCE", SETTING_PC, P("original", "original", "original") },
-    [S_LOOK_LIKE_XBOX] = { "Graphics", "LookLikeXbox", T_GRAPHICS, "WORLD", "Look like the Xbox",
-        "Fixes that make the picture match the Xbox (fog, lens flares, board tops, the title's gamma). Leave it on.",
-        BOOL_("1"), "XBOX_FIX_CULLWIND, XBOX_FIX_OCCLUSION, XBOX_FIX_TEXPASSTHRU, XBOX_FIX_GAMMA", 0, P("1", "1", "1") },
+    [S_SNOW_LOOK] = { "Graphics", "SnowLook", T_GRAPHICS, "WORLD", "Snow look",
+        "Soft: smoother snow without grain, with visible board trails. Original: the original grainy snow.",
+        CHOICE(k_snow_look, "ps2"), "XBOX_SNOW_LOOK", SETTING_PC, P("original", "ps2", "ps2") },
+    [S_LIGHTMAP_SMOOTH] = { "Graphics", "LightmapSmoothing", T_GRAPHICS, "WORLD", "Lightmap smoothing",
+        "Smooths the light baked into the snow and the slopes: no more diamond-shaped steps in it. The light itself stays the same.",
+        BOOL_("1"), "XBOX_LIGHTMAP_FILTER", SETTING_PC, P("0", "1", "1") },
+    /* The fixes of the port's picture (fog volumes, lens flares, board tops,
+     * gamma): always on, no line, in no preset; the key of earlier versions is
+     * still read (a file is not "not understood") but changes nothing. Each fix
+     * can still be turned off alone for troubleshooting (the Fix* keys below). */
+    [S_LOOK_LIKE_XBOX] = { "Graphics", "LookLikeXbox", T_NONE, NULL, "Picture fixes",
+        "Always on: the fog, lens flares, board tops and colours drawn as the game draws them. Ignored (see the Fix keys).",
+        BOOL_("1"), "XBOX_FIX_CULLWIND, XBOX_FIX_OCCLUSION, XBOX_FIX_TEXPASSTHRU, XBOX_FIX_GAMMA", SETTING_HIDDEN, NOP },
 
     /* ── AUDIO ── */
     [S_SPEAKERS] = { "Audio", "Speakers", T_AUDIO, "GAME SOUND", "Speakers",
-        "Stereo by default. Auto follows your Windows sound setup. 5.1 plays the game's surround mix; with headphones, turn on Windows Sonic or Dolby Atmos in Windows to hear it.",
+        "Auto follows Windows. 5.1 plays the game's surround mix; for headphones, turn on Windows Sonic or Dolby Atmos.",
         CHOICE(k_speakers, "stereo"), "XBOX_AUDIO_OUTPUT", SETTING_PC, NOP },
     [S_AUDIO_DELAY] = { "Audio", "AudioDelay", T_AUDIO, "GAME SOUND", "Audio delay",
         "Shorter is more responsive; make it longer if the sound crackles.",
         CHOICE(k_audio_delay, "8"), "XBOX_AUDIO_QUEUE", 0, NOP },
-    [S_LAUNCHER_MUSIC] = { "Launcher", "Music", T_AUDIO, "LAUNCHER", "Launcher music",
-        "The game's title music, quietly, while the launcher is open (read from your disc).",
-        BOOL_("1"), NULL, SETTING_LAUNCHER, NOP },
-    [S_LAUNCHER_SOUNDS] = { "Launcher", "Sounds", T_AUDIO, "LAUNCHER", "Launcher sounds",
-        "The game's own menu sounds in the launcher (read from your disc).",
-        CHOICE(k_launcher_sounds, "low"), NULL, SETTING_LAUNCHER, NOP },
+    [S_LAUNCHER_MUSIC] = { "Launcher", "Music", T_NONE, NULL, "Launcher music",
+        "Ignored: the launcher plays no music.",
+        BOOL_("1"), NULL, SETTING_LAUNCHER | SETTING_HIDDEN, NOP },
+    [S_LAUNCHER_SOUNDS] = { "Launcher", "Sounds", T_NONE, NULL, "Launcher sounds",
+        "Ignored: the launcher plays no sounds.",
+        CHOICE(k_launcher_sounds, "low"), NULL, SETTING_LAUNCHER | SETTING_HIDDEN, NOP },
 
     /* ── CONTROLS ── */
     [S_BUTTON_STYLE] = { "Controls", "ButtonStyle", T_CONTROLS, "LOOK", "Button style",
-        "How buttons are drawn in the game's menus and help. Auto picks the style of the controller you are using.",
+        "How buttons are drawn in the game's menus and help. Auto shows the Xbox modern buttons.",
         CHOICE(k_button_style, "auto"), "XBOX_BUTTON_ICONS", 0, NOP },
     [S_KEY_FIRST + 0]  = BIND_KEY("Cross",           "Cross",           "Space"),
     [S_KEY_FIRST + 1]  = BIND_KEY("Circle",          "Circle",          "Escape"),
@@ -261,43 +304,49 @@ static const SettingDef k_reg[SETTINGS_COUNT] = {
     [S_DISC_IMAGE] = { "Game", "DiscImage", T_GAME, "DISC AND SAVES", "Disc image",
         "Your SSX Tricky (USA) Xbox disc image (.iso or .xiso). PLAY stays off until it is set.",
         SETTING_PATH, NULL, 0, 0, 0, "", NULL, 0, NOP },
-    [S_SAVE_FOLDER] = { "Game", "SaveFolder", T_GAME, "DISC AND SAVES", "Save games folder",
-        "Empty = automatic: Documents\\My Games\\SSX Tricky\\Saves (or Saves beside OpenTricky.exe with portable.txt, or the hdd folder of an earlier version).",
+    [S_SAVE_FOLDER] = { "Game", "SaveFolder", T_GAME, "DISC AND SAVES", "Save folder",
+        "Where your saves are kept. Automatic uses Documents\\My Games\\SSX Tricky\\Saves, or the Saves folder beside OpenTricky.exe with portable.txt, or an earlier version's hdd folder.",
         SETTING_PATH, NULL, 0, 0, 0, "", NULL, 0, NOP },
     [S_SAVE_PROFILE] = { "Game", "SaveProfile", T_GAME, "DISC AND SAVES", "Save profile",
-        "My save: your own progress. Unlock all: everything open (the game's own unlock cheat), with a separate save in the UnlockAll folder; your own save is never touched.",
+        "My save: your own progress. Unlock all: everything open, in a separate save.",
         CHOICE(k_save_profile, "mine"), "XBOX_UNLOCK_ALL", 0, NOP },
     [S_SAVE_BACKUP] = { "Game", "SaveBackup", T_GAME, "DISC AND SAVES", "Save backup copy",
-        "Before the game writes your save, a copy of the previous one is kept (UDATA-backup), so a damaged save can be brought back.",
+        "Keeps a copy of your previous save, so a damaged save can be recovered.",
         BOOL_("1"), "XBOX_SAVE_BACKUP", 0, NOP },
-    [S_PAUSE_IN_BACKGROUND] = { "Game", "PauseInBackground", T_GAME, "WHEN THE GAME IS IN THE BACKGROUND", "Pause the game",
+    [S_PAUSE_IN_BACKGROUND] = { "Game", "PauseInBackground", T_GAME, "IN THE BACKGROUND", "Pause the game",
         "Pauses the game while another window is in front.",
         BOOL_("1"), "XBOX_BACKGROUND_PAUSE", SETTING_PENDING, NOP },
-    [S_MUTE_IN_BACKGROUND] = { "Game", "MuteInBackground", T_GAME, "WHEN THE GAME IS IN THE BACKGROUND", "Mute the game",
+    [S_MUTE_IN_BACKGROUND] = { "Game", "MuteInBackground", T_GAME, "IN THE BACKGROUND", "Mute the game",
         "Mutes the game while another window is in front.",
         BOOL_("1"), "XBOX_BACKGROUND_MUTE", SETTING_PENDING, NOP },
+    [S_TC_GHOST] = { "Game", "TimeChallengeGhost", T_NONE, NULL, "Ghost of your best run",
+        "Your best Time Challenge run on the track rides along, see-through. It cannot touch you or change your race.",
+        BOOL_("0"), "XBOX_TC_GHOST", SETTING_PC | SETTING_HIDDEN, P("0", "0", "0") },
 
     /* ── ADVANCED ── */
     [S_CHECK_UPDATES] = { "Launcher", "CheckForUpdates", T_ADVANCED, "UPDATES", "Check for updates",
-        "Ask before installing: the launcher looks for a new version on GitHub and asks before anything is downloaded. Never: no check.",
+        "Looks for a new version and asks before installing. Never turns off the automatic check.",
         CHOICE(k_check_updates, "ask"), NULL, SETTING_LAUNCHER, NOP },
     [S_UPDATE_CHANNEL] = { "Launcher", "UpdateChannel", T_ADVANCED, "UPDATES", "Update channel",
-        "Stable releases only, or also the unstable ones (newer, less tested).",
+        "Stable releases only, or betas too (newer, less tested).",
         CHOICE(k_update_channel, "stable"), NULL, SETTING_LAUNCHER, NOP },
     [S_SKIP_LAUNCHER] = { "Launcher", "SkipLauncher", T_ADVANCED, "LAUNCH", "Skip launcher next time",
-        "Starts the game straight away. Hold Shift (or Select on a controller) at start to see the launcher again.",
+        "Starts the game directly.",
         BOOL_("0"), NULL, SETTING_LAUNCHER, NOP },
     [S_SHOW_FPS] = { "Advanced", "ShowFrameRate", T_ADVANCED, "LAUNCH", "Show frame rate",
-        "The frame rate in the game window's title bar: in a window only, not in fullscreen.",
+        "Shows the frame rate in the window's title bar (window mode only).",
         BOOL_("0"), NULL, 0, NOP },
-    [S_THEME] = { "Launcher", "Theme", T_ADVANCED, "LAUNCH", "Launcher theme",
-        "The track whose colours and card the launcher wears; Random picks one at each start.",
-        CHOICE(k_theme, "random"), NULL, SETTING_LAUNCHER, NOP },
-    [S_SMOOTH_LEGS] = { "Advanced", "SmoothLegs", T_ADVANCED, "EXPERIMENTAL", "Smoother legs in turns",
-        "Experimental, visual only (PC). Smooths the leg and board shake riders have when carving, which comes from the original game. Gameplay is not affected. On by default; Original Xbox preset turns it off.",
+    [S_THEME] = { "Launcher", "Theme", T_NONE, NULL, "Launcher theme",
+        "Ignored: the launcher picks its track at each start.",
+        CHOICE(k_theme, "random"), NULL, SETTING_LAUNCHER | SETTING_HIDDEN, NOP },
+    [S_SMOOTH_LEGS] = { "Advanced", "SmoothLegs", T_ADVANCED, "SMOOTHING", "Smoother legs in turns",
+        "Smooths the leg and board shake riders have when carving, a quirk of the original game. Visual only.",
         BOOL_("1"), "XBOX_FPS_SMOOTH_LEGS", SETTING_PC, P("0", "1", "1") },
+    [S_SMOOTH_SEAMS] = { "Advanced", "SmoothTerrainSeams", T_ADVANCED, "SMOOTHING", "Smoother terrain seams",
+        "Hides most of the lines between pieces of terrain, a quirk of the original game. Visual only.",
+        BOOL_("1"), "XBOX_TERRAIN_BLEND, XBOX_TERRAIN_BLEND_WIDTH, XBOX_TERRAIN_CLAMP", SETTING_PC, P("0", "1", "1") },
     [S_LOG_FILE] = { "Advanced", "LogFile", T_ADVANCED, "TROUBLESHOOTING", "Log file",
-        "Writes what the game reports to SSX Tricky.log beside this file, for bug reports.",
+        "Keeps a log of the game for bug reports.",
         BOOL_("1"), NULL, 0, NOP },
 
     /* ── hidden: troubleshooting only, written only when changed ── */
@@ -308,20 +357,23 @@ static const SettingDef k_reg[SETTINGS_COUNT] = {
         "1 = the HD pack also replaces the menu and interface pictures.",
         BOOL_("0"), "XBOX_HD_TEXTURES_MENUS", SETTING_HIDDEN, NOP },
     [S_FIX_CULL_WINDING] = { "Graphics", "FixCullWinding", T_NONE, NULL, "Back-face culling winding",
-        "Part of Look like the Xbox: fog volumes.",
+        "A fix of the picture: fog volumes. 0 = off, for troubleshooting only.",
         BOOL_("1"), "XBOX_FIX_CULLWIND", SETTING_HIDDEN, NOP },
     [S_FIX_OCCLUSION] = { "Graphics", "FixOcclusion", T_NONE, NULL, "Occlusion queries",
-        "Part of Look like the Xbox: lens flares.",
+        "A fix of the picture: lens flares. 0 = off, for troubleshooting only.",
         BOOL_("1"), "XBOX_FIX_OCCLUSION", SETTING_HIDDEN, NOP },
     [S_FIX_TEX_PASSTHROUGH] = { "Graphics", "FixTexturePassThrough", T_NONE, NULL, "Pass-through texture stages",
-        "Part of Look like the Xbox: board tops, terrain fog.",
+        "A fix of the picture: board tops, terrain fog. 0 = off, for troubleshooting only.",
         BOOL_("1"), "XBOX_FIX_TEXPASSTHRU", SETTING_HIDDEN, NOP },
     [S_FIX_GAMMA] = { "Graphics", "FixGamma", T_NONE, NULL, "Gamma ramp",
-        "Part of Look like the Xbox: the title's gamma ramp.",
+        "A fix of the picture: the title's gamma ramp. 0 = off, for troubleshooting only.",
         BOOL_("1"), "XBOX_FIX_GAMMA", SETTING_HIDDEN, NOP },
     [S_FIX_KICKWAIT] = { "Advanced", "FixKickWait", T_NONE, NULL, "No wait on the GPU flush",
         "1 = the game does not busy-wait on the GPU write-combine flush (default); 0 = the original port's wait.",
         BOOL_("1"), "XBOX_FIX_KICKWAIT", SETTING_HIDDEN, NOP },
+    [S_TC_GHOST_OPACITY] = { "Game", "TimeChallengeGhostOpacity", T_NONE, NULL, "Ghost opacity",
+        "How solid the Time Challenge ghost looks, in percent (10 to 90).",
+        SETTING_INT, NULL, 0, 10, 90, "45", "XBOX_TC_GHOST_ALPHA", SETTING_HIDDEN | SETTING_PC, NOP },
 };
 
 const SettingDef *settings_registry(void) { return k_reg; }
@@ -357,7 +409,8 @@ const char *settings_tab_name(int tab)
 const char *settings_preset_name(int preset)
 {
     static const char *const names[SETTINGS_PRESET_COUNT + 1] = {
-        "Original Xbox", "Recommended", "Steam Deck", "Custom"
+        "Original Xbox", "Recommended", "Steam Deck",
+        "Custom"
     };
     return (preset >= 0 && preset <= SETTINGS_PRESET_COUNT) ? names[preset] : names[SETTINGS_PRESET_CUSTOM];
 }
@@ -417,6 +470,16 @@ static int normalize(const SettingDef *d, const char *value, char *out)
         int i;
         for (i = 0; i < d->nchoices; i++)
             if (ieq(value, d->choices[i].token)) { strcpy(out, d->choices[i].token); return 1; }
+        if (d->choices == k_hd_textures) {      /* earlier versions: 0 / 1, then off / hud / all */
+            if (!strcmp(value, "1") || ieq(value, "all") || ieq(value, "true") || ieq(value, "yes")) {
+                strcpy(out, "on");
+                return 1;
+            }
+            if (!strcmp(value, "0") || ieq(value, "hud") || ieq(value, "false") || ieq(value, "no")) {
+                strcpy(out, "off");
+                return 1;
+            }
+        }
         return 0;
     }
     case SETTING_INT: {
@@ -562,10 +625,128 @@ static void keep_line(Settings *s, const char *section, const char *k, const cha
     sprintf(s->extra + n, "%s\x01%s=%s\n", section, k, v);
 }
 
+/* ── The presets' revision ──
+ * A launcher writes every shown line, so a file holds the values of the
+ * preset its player had chosen, as that preset was then. [Meta] Presets=2
+ * marks a file written since the presets below changed (the stable build:
+ * Texture filtering 16x and Lightmap smoothing on, in Recommended and Steam
+ * Deck). A file without it that matched a preset of its time is moved to that
+ * preset as it is now, for the changed settings and the ones it did not have
+ * yet (k_since_013) only (a Modern of the
+ * development builds, Lightmap smoothing on, reads as Recommended); a file
+ * that matched none keeps its values (presets_upgrade: the settings it did
+ * not have yet, from its closest preset). Once written again it has the mark,
+ * and a value chosen since stays. Presets=3: HD HUD (on in Recommended and
+ * Steam Deck), which files of revision 2 do not have yet. */
+#define SETTINGS_PRESETS_REV 3
+static const struct { int id, rev; const char *was[SETTINGS_PRESET_COUNT]; } k_presets_rev2[] = {
+    /* the revision that changed it; the values each preset gave before; "a|b" = either */
+    { S_TEX_FILTER,      2, { "off", "off", "off" } },
+    { S_LIGHTMAP_SMOOTH, 2, { "0", "0|1", "0" } },
+    { S_HD_HUD,          3, { "0", "0", "0" } },
+};
+
+/* The settings with a preset value that the 0.1.3 did not have: a file without
+ * the mark (revision 1) has no line for them. Such a file is matched on the
+ * lines it has, and the preset it matched gives them its own values (a 0.1.3
+ * at Original Xbox stays Original Xbox: Snow look Original, Lightmap
+ * smoothing, terrain seams and HD HUD off). A setting the 0.1.3 had and the
+ * file lacks still counts at its default: a file with almost no lines is not
+ * taken for a preset. */
+static const int k_since_013[] = {
+    S_RENDER_SCALE, S_HD_HUD, S_SHADOW_SOFTNESS, S_SNOW_LOOK, S_LIGHTMAP_SMOOTH,
+    S_TC_GHOST, S_SMOOTH_SEAMS,
+};
+
+static int since_013(int id, int rev)
+{
+    int k;
+    if (rev >= 2) return 0;
+    for (k = 0; k < COUNT(k_since_013); k++)
+        if (k_since_013[k] == id) return 1;
+    return 0;
+}
+
+static int in_list(const char *list, const char *v)
+{
+    size_t n = strlen(v);
+    while (*list) {
+        const char *bar = strchr(list, '|');
+        size_t k = bar ? (size_t)(bar - list) : strlen(list);
+        if (k == n && !strncmp(list, v, n)) return 1;
+        list += k + (bar ? 1 : 0);
+    }
+    return 0;
+}
+
+/* Does setting i of the file agree with preset p? -1: not counted (a setting
+ * the file's version did not have, or a changed one it does not have). */
+static int preset_agrees(const Settings *s, const unsigned char *seen, int rev, int p, int i)
+{
+    int j, changed = -1;
+    if (!k_reg[i].preset[p]) return -1;
+    if (!seen[i] && since_013(i, rev)) return -1;           /* not in the file's version: the preset's */
+    for (j = 0; j < COUNT(k_presets_rev2); j++)
+        if (k_presets_rev2[j].id == i && k_presets_rev2[j].rev > rev) changed = j;
+    if (changed < 0) return !strcmp(s->v[i], k_reg[i].preset[p]);
+    if (!seen[i]) return -1;
+    return in_list(k_presets_rev2[changed].was[p], s->v[i]);
+}
+
+/* A file of the 0.1.3 that matched no preset (Custom) keeps its values; the
+ * settings it did not have yet take those of the preset it is closest to:
+ * the most settings with that preset's value, among those the presets set
+ * (Original Xbox + 144 fps: the new ones off; Recommended at another
+ * resolution: on). A tie goes to the first, Original Xbox, which leaves the
+ * picture as it was. */
+static void presets_upgrade(Settings *s, const unsigned char *seen, int rev)
+{
+    int p, i, j, best = -1, best_n = -1;
+    for (p = 0; p < SETTINGS_PRESET_COUNT; p++) {
+        int match = 1, n = 0;
+        for (i = 0; i < SETTINGS_COUNT; i++) {
+            int a = preset_agrees(s, seen, rev, p, i);
+            if (a == 0) match = 0;
+            else if (a > 0) n++;
+        }
+        if (match) {
+            for (j = 0; j < COUNT(k_presets_rev2); j++)
+                if (k_presets_rev2[j].rev > rev)
+                    settings_set(s, k_presets_rev2[j].id, k_reg[k_presets_rev2[j].id].preset[p]);
+            for (i = 0; i < SETTINGS_COUNT; i++)
+                if (k_reg[i].preset[p] && !seen[i] && since_013(i, rev))
+                    settings_set(s, i, k_reg[i].preset[p]);
+            return;
+        }
+        if (n > best_n) { best_n = n; best = p; }
+    }
+    if (best >= 0 && rev < 2)
+        for (i = 0; i < SETTINGS_COUNT; i++)
+            if (k_reg[i].preset[best] && !seen[i] && since_013(i, rev))
+                settings_set(s, i, k_reg[i].preset[best]);
+}
+
+/* The settings of the extras (port/extras.cmake) that a build
+ * without them leaves out: a file of a build with them is read without a
+ * note, its lines kept as they are. */
+static int extras_key(const char *section, const char *key)
+{
+    static const char *const graphics[] = {
+        "DistantHaze", "LightsInHaze", "SpeedEffect", "Bloom", "Vignette", "SpeedCamera",
+    };
+    int i;
+    if (ieq(section, "Controls")) return ieq(key, "StickDeadZone");
+    if (!ieq(section, "Graphics")) return 0;
+    for (i = 0; i < COUNT(graphics); i++)
+        if (ieq(key, graphics[i])) return 1;
+    return 0;
+}
+
 int settings_parse(Settings *s, const char *text, size_t len, int *bad)
 {
     char section[64] = "", *buf, *p, *end;
-    int version = 0, nbad = 0, line = 0;
+    int version = 0, nbad = 0, line = 0, presets_rev = 1, hd_hud_only = 0;
+    unsigned char seen[SETTINGS_COUNT];
 
     settings_defaults(s);
     if (bad) *bad = 0;
@@ -605,6 +786,7 @@ int settings_parse(Settings *s, const char *text, size_t len, int *bad)
         }
     }
     if (version < 1) { free(buf); return SETTINGS_LOAD_NOT_V1; }
+    memset(seen, 0, sizeof seen);
 
     while (p < end) {
         char *nl = memchr(p, '\n', (size_t)(end - p)), *line_end = nl ? nl : end, *l, *eq;
@@ -631,11 +813,18 @@ int settings_parse(Settings *s, const char *text, size_t len, int *bad)
             char *k = trim(l, eq), *v = eq + 1;
             int id;
             while (*v == ' ' || *v == '\t') v++;
-            if (ieq(section, "Meta")) continue;
+            if (ieq(section, "Meta")) {
+                if (ieq(k, "Presets")) presets_rev = atoi(v);
+                continue;
+            }
             id = settings_find(section, k);
+            if (id >= 0) seen[id] = 1;
+            if (id == S_HD_TEXTURES && ieq(v, "hud")) hd_hud_only = 1;
             if (id < 0) {                           /* another version's setting: kept */
-                nbad++;
-                note_ignored(s, k[0] ? k : where);
+                if (!extras_key(section, k)) {      /* not one this build leaves out on purpose */
+                    nbad++;
+                    note_ignored(s, k[0] ? k : where);
+                }
                 keep_line(s, section, k, v);
             } else if (!settings_set(s, id, v)) {   /* not valid: the default */
                 nbad++;
@@ -644,6 +833,8 @@ int settings_parse(Settings *s, const char *text, size_t len, int *bad)
         }
     }
     free(buf);
+    if (presets_rev < SETTINGS_PRESETS_REV) presets_upgrade(s, seen, presets_rev);
+    if (hd_hud_only && !seen[S_HD_HUD]) settings_set(s, S_HD_HUD, "1");   /* HdTextures=hud: the HUD in HD */
     if (bad) *bad = nbad;
     return version > SETTINGS_VERSION ? SETTINGS_LOAD_NEWER : SETTINGS_LOAD_OK;
 }
@@ -842,10 +1033,11 @@ size_t settings_format(const Settings *s, char *out, size_t out_sz)
         "; OpenTricky -- SSX Tricky settings, written by the launcher (OpenTricky.exe)\n"
         "; and read by the game (SSX Tricky.exe) at start.\n"
         "; Safe to edit by hand while both are closed. A line that is missing or not\n"
-        "; valid takes its default. \"PC\" = not on the original Xbox.\n"
+        "; valid takes its default. \"PC\" = not in the original game.\n"
         "\n"
         "[Meta]\n"
-        "Version=%d\n", SETTINGS_VERSION);
+        "Version=%d\n"
+        "Presets=%d\n", SETTINGS_VERSION, SETTINGS_PRESETS_REV);
 
     /* Sections in the order they first appear in the registry. */
     for (i = 0; i < SETTINGS_COUNT; i++) {
@@ -921,7 +1113,12 @@ int settings_save(const Settings *s, const char *path)
     f = u8_fopen(tmp, "w");             /* text mode: CRLF on Windows */
     ok = f != NULL;
     if (f) {
-        ok = fwrite(text, 1, len, f) == len;
+        ok = fwrite(text, 1, len, f) == len && fflush(f) == 0;
+#ifdef _WIN32
+        /* On the disk before it replaces the old file: a power cut then
+         * leaves one or the other, never an empty settings.ini. */
+        if (ok) FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f)));     /* best effort (a share may refuse it) */
+#endif
         if (fclose(f) != 0) ok = 0;
     }
     if (ok) ok = u8_replace(tmp, path);
@@ -1002,6 +1199,21 @@ int settings_install_root(char *out, size_t out_sz)
 {
     char exe[SETTINGS_VALUE_MAX];
     return settings_game_dir(exe, sizeof exe) && settings_install_root_of(exe, out, out_sz);
+}
+
+int settings_instance_name(const char *what, char *out, size_t out_sz)
+{
+    char root[SETTINGS_VALUE_MAX];
+    unsigned long long h = 14695981039346656037ull;      /* FNV-1a, 64 bits */
+    const char *p;
+    if (!settings_install_root(root, sizeof root)) return 0;
+    for (p = root; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '/') c = '\\';
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');   /* Windows folder names: case does not count */
+        h = (h ^ c) * 1099511628211ull;
+    }
+    return snprintf(out, out_sz, "Local\\OpenTricky-%s-%08x%08x", what, (unsigned)(h >> 32), (unsigned)h) < (int)out_sz;
 }
 
 /* Can a settings file be written in `dir`? An existing file must open for

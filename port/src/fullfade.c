@@ -11,6 +11,7 @@
 #include "recomp/recomp_types.h"
 #include "fullfade.h"
 #include "pass_tags.h"
+#include "../../xboxrecomp/src/kernel/xbox_logstats.h"
 
 void sub_001009D0(void);    /* world-quads node: draw (thiscall node, arg gfx, ret 4) */
 
@@ -61,7 +62,7 @@ static int widen(uint32_t q, float l, float t, float r, float b)
             fprintf(stderr, "[FULLFADE] full-screen quad widened to %.0f..%.0f x %.0f..%.0f "
                     "(colour %08X, %llu so far, %llu unframed)\n", l, r, t, b, MEM32(q + 0x10u),
                     s_widened, s_unframed);
-            fflush(stderr);
+            xbox_log_flush();
         }
         s_last_tick = now;
     }

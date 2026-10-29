@@ -4,7 +4,8 @@ OpenTricky continues [SSX Tricky PC](https://github.com/MatiasRiveraC/SSX-Tricky
 
 ## OpenTricky
 
-- **GiZcesi**: project lead of OpenTricky. Sets the goals (Xbox fidelity first, then performance, then optional extras), decides what to fix and add, and tests every build on real PCs.
+- **GiZcesi**: project lead of OpenTricky. Sets the goals (the original game first, then performance, then optional extras), decides what to fix and add, and tests every build on real PCs.
+- **Archy (GlitcherOG)** and the [SSX-Library](https://github.com/GlitcherOG/SSX-Library) contributors (Erickson400, swax, 8bitgentleman): their research on SSX file formats was a reference for understanding the game's code and data (no code from it is included).
 
 ## SSX Tricky PC
 

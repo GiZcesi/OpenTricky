@@ -9,6 +9,7 @@
 #include <windows.h>
 #include "recomp/recomp_types.h"
 #include "hud_anchor.h"
+#include "../../xboxrecomp/src/kernel/xbox_logstats.h"
 #include "aspect.h"
 
 void sub_000C6730(void);    /* HUD_DrawRaceOverlay (thiscall, ret 20) */
@@ -46,8 +47,11 @@ static int   s_trlog;               /* XBOX_HUD_TRLOG=N: the elements of every N
 static int   s_diag;                /* XBOX_HUD_DIAG=1 (diagnostic), 2: + race HUD records left unscaled, 3: + joins across sides, 4: + every record */
 static int   s_slide = 1;           /* XBOX_FIX_HUD_ANCHOR: 1 (default) or 2 sliding anchor, 0 by thirds */
 static int   s_side = 1;            /* XBOX_FIX_HUD_ANCHOR=1 (default): elements join on the same side only (2: they need not) */
+static int   s_tall_join = 1;       /* XBOX_FIX_HUD_TALL=0: a tall narrow element joins a wider one stacked 16 px apart at most, as before (tests) */
+static int   s_gauge = 1;           /* XBOX_FIX_HUD_GAUGE=0: the Tricky gauge's pieces join by the general rules, as before (tests) */
 static int   s_banner_watch;        /* the 0xD2D80 hook looks at what the banner draws */
 static int   s_panel_log;           /* XBOX_PANEL_LOG=1 (diagnostic) */
+static int   s_panel_backing = 1;   /* XBOX_FIX_PANEL_BACKING=0: a backing inset from one end keeps that side (tests) */
 
 static const char *const k_mode_name[HUD_SHAPE_COUNT] = { "Proportional", "Xbox" };
 static const int k_size[HUD_SIZE_COUNT] = { 100, 90, 85, 80, 70 };
@@ -127,6 +131,8 @@ void hud_anchor_set(double shape, int mode, int size)
     g_panel_on = !(e && e[0] == '0') && (g_race2d_on || !(shape > 4.0 / 3.0 + 0.005));
     e = getenv("XBOX_PANEL_LOG");
     s_panel_log = e ? atoi(e) : 0;
+    e = getenv("XBOX_FIX_PANEL_BACKING");
+    s_panel_backing = !(e && e[0] == '0');
     if (g_panel_on)
         printf("Panels:     edge to edge, their content %s\n",
                g_race2d_on ? "at 4:3 proportions" : "as drawn");
@@ -167,6 +173,7 @@ static struct {
     uint32_t obj, base, gen;
     View     view;
     uint32_t seg;               /* the HUD call that appended it */
+    uint32_t gauge;             /* appended by the block of 0xC44E0 that draws the Tricky gauge */
     uint32_t frame, tag, tag_y; /* the render frame the tags were worked out for */
 } s_tag[NTAG];
 static unsigned long long s_marked, s_found, s_full, s_elements, s_stale;
@@ -196,18 +203,20 @@ static int mark_live(unsigned h)
     return b < NBUF && s_buf[b].gen == s_tag[h].gen;
 }
 
-static void mark_put(uint32_t obj, uint32_t base, uint32_t gen, const View *v, uint32_t seg)
+static void mark_put(uint32_t obj, uint32_t base, uint32_t gen, const View *v, uint32_t seg, uint32_t gauge)
 {
     unsigned h = slot_of(obj), i;
     for (i = 0; i < 16u; i++, h = (h + 1u) & (NTAG - 1u)) {
         if (!s_tag[h].obj || s_tag[h].obj == obj || !mark_live(h)) {
             s_tag[h].obj = obj; s_tag[h].base = base; s_tag[h].gen = gen; s_tag[h].view = *v; s_tag[h].seg = seg;
+            s_tag[h].gauge = gauge;
             s_tag[h].frame = 0; s_tag[h].tag = s_tag[h].tag_y = 0;
             s_marked++;
             return;
         }
     }
-    s_full++;
+    if (s_full++ < 20u)                 /* an error: written when it happens (the first 20) */
+        fprintf(stderr, "[HUD] mark table full (16 slots tried): record %08X not marked\n", (unsigned)obj);
 }
 
 /* The live mark of obj in the list at base, or -1. */
@@ -221,6 +230,29 @@ static int mark_find(uint32_t obj, uint32_t base)
             return s_tag[h].base == base && mark_live(h) ? (int)h : -1;
     }
     return -1;
+}
+
+/* The Tricky gauge as the game draws it: one block of 0xC44E0's code, from
+ * 0xC4648 to 0xC4F6E -- the rail and its rings, the head (the ball), the
+ * logo's six letters, the marks under the rail, the S under the rail's foot,
+ * each part under its bit of HUD + 0xFC (0x1000, 0x2000, 0x8000, 0x4000,
+ * 0x80) -- whose two ends the regen marks (port/tools/fork/fix_hudgauge.py).
+ * What that block appends to a view's list, [e0, e1), is the gauge. Game
+ * thread only. */
+static struct { uint32_t e0, e1; } s_gauge_rng[VIEW_COUNT];
+static int s_gauge_open;
+
+void hud_anchor_gauge(int begin)
+{
+    uint32_t gfx = MEM32(GFX_GLOBAL), views;
+    int i;
+    if (!gfx || (views = MEM32(gfx + GFX_VIEWS)) < 0x1000u) return;
+    for (i = 0; i < VIEW_COUNT; i++) {
+        uint32_t e = MEM32(views + (uint32_t)i * VIEW_STRIDE + VIEW_LIST_END);
+        if (begin) s_gauge_rng[i].e0 = s_gauge_rng[i].e1 = e;
+        else if (s_gauge_open) s_gauge_rng[i].e1 = e;
+    }
+    s_gauge_open = begin;
 }
 
 /* The race HUD is two methods of the HUD object (vtable 0x19BE20): 0xC9BB0
@@ -247,8 +279,26 @@ static void hud_call(void (*body)(void), int has_view)
         vw.h = MEMF(g_esp + 20u);
         if (!(vw.w > 1.0f && vw.w <= 2048.0f && vw.x >= 0.0f && vw.x < 2048.0f &&
               vw.h > 1.0f && vw.h <= 2048.0f && vw.y >= 0.0f && vw.y < 2048.0f)) vw = k_full;
+        if (s_diag && body == sub_000C44E0) {
+            /* tests: the player's rider (its Tricky letters at +0x56A8, letter timer
+             * +0x24) and the gauge's state (+0xA4: the head's bounce), as 0xC44E0
+             * finds them from its first argument, the player's index */
+            static uint32_t last_rider, last_state;
+            uint32_t idx = MEM32(g_esp + 4u), app = MEM32(0x001E3C7Cu), lvl, rider = 0;
+            uint32_t state = g_ecx + idx * 0x138u + 0x10Cu;
+            if (idx < 4u && app >= 0x1000u && (lvl = MEM32(app + 0x72Cu)) >= 0x1000u)
+                rider = MEM32(lvl + (idx << 7) + 0xA4u);
+            if (rider != last_rider || state != last_state) {
+                last_rider = rider; last_state = state;
+                fprintf(stderr, "[HUDDIAG] Tricky gauge of player %u: rider %08X, gauge state %08X\n", idx, rider, state);
+            }
+        }
     }
     seg = ++s_seg;
+    if (body == sub_000C44E0) {     /* the gauge's block of this call (hud_anchor_gauge) */
+        memset(s_gauge_rng, 0, sizeof s_gauge_rng);
+        s_gauge_open = 0;
+    }
     views = MEM32(gfx + GFX_VIEWS);
     for (i = 0; i < VIEW_COUNT; i++) {
         unsigned b;
@@ -261,6 +311,7 @@ static void hud_call(void (*body)(void), int has_view)
         s_buf[b].calls++;
     }
     body();
+    if (body == sub_000C44E0 && s_gauge_open) hud_anchor_gauge(0);
     for (i = 0; i < VIEW_COUNT; i++) {
         uint32_t e1 = MEM32(views + (uint32_t)i * VIEW_STRIDE + VIEW_LIST_END);
         unsigned b;
@@ -268,7 +319,8 @@ static void hud_call(void (*body)(void), int has_view)
         s_buf[b].last_end = e1;
         if (has_view) {
             for (r = e0[i]; r < e1; r += 0x18u)
-                if (MEM32(r)) mark_put(MEM32(r), base[i], s_buf[b].gen, &vw, seg);
+                if (MEM32(r)) mark_put(MEM32(r), base[i], s_buf[b].gen, &vw, seg,
+                                       body == sub_000C44E0 && r >= s_gauge_rng[i].e0 && r < s_gauge_rng[i].e1);
         } else {
             /* the method: what its inner calls did not mark takes the view
              * of the next marked record */
@@ -279,7 +331,7 @@ static void hud_call(void (*body)(void), int has_view)
                 if (!MEM32(r)) continue;
                 h = mark_find(MEM32(r), base[i]);
                 if (h >= 0) { next = s_tag[h].view; continue; }
-                mark_put(MEM32(r), base[i], s_buf[b].gen, &next, seg);
+                mark_put(MEM32(r), base[i], s_buf[b].gen, &next, seg, 0);
             }
         }
     }
@@ -287,8 +339,29 @@ static void hud_call(void (*body)(void), int has_view)
 
 void hook_hud_000C6730(void) { hud_call(sub_000C6730, 1); }
 void hook_hud_000C44E0(void) { hud_call(sub_000C44E0, 1); }
-void hook_hud_000C9BB0(void) { hud_call(sub_000C9BB0, 0); }
-void hook_hud_000C9D70(void) { hud_call(sub_000C9D70, 0); }
+/* The race HUD's methods called since the last RenderFrame started (H1): the
+ * image that RenderFrame draws shows the race HUD (the HD HUD's font gate,
+ * hud_anchor_hd_gate). Every render fills the HUD's lists that the next
+ * RenderFrame draws, the extra renders above 60 fps too (the whole race
+ * render), so each image has its own answer. Game thread. */
+static int s_hud_calls;
+#define HUD_ORDER(ev) ((void)0)
+void hook_hud_000C9BB0(void) { s_hud_calls++; HUD_ORDER('B'); hud_call(sub_000C9BB0, 0); }
+void hook_hud_000C9D70(void) { s_hud_calls++; HUD_ORDER('D'); hud_call(sub_000C9D70, 0); }
+
+/* GameState_ShouldSkipGameplayTick 0xAB170 (thiscall on InGameState, reads
+ * only): the gate the riders' update asks at each tick (its only callers:
+ * 0x36990, 0x455ED, 0xB41D0); true while the race's gameplay is frozen: the
+ * pause (its panel, OverlayManager slot 6, shown and blocking) and its
+ * sub-screens, the other blocking overlays. Its last answer is the state the
+ * next image shows: the tick that opens the pause has already moved the
+ * riders and its image shows the race (the pause panel fades in from
+ * there); the tick that closes it has not, and its image shows the
+ * pause (game thread). */
+void sub_000AB170(void);
+static volatile int s_tick_frozen;
+void hook_hud_000AB170(void) { sub_000AB170(); s_tick_frozen = (g_eax & 0xFFu) != 0u; }
+int hud_anchor_tick_frozen(void) { return s_tick_frozen; }
 
 /* The finish banner (FINISH / TIME UP, "1st PLACE", the time, the medal):
  * method [1] of an overlay object of its own (vtable 0x19C600, the same
@@ -467,6 +540,19 @@ static int joinable(const Box *a, const Box *b, float vw)
         float oy = (a->y1 < b->y1 ? a->y1 : b->y1) - (a->y0 > b->y0 ? a->y0 : b->y0);
         if (!s_slide || ox + 2.0f >= 0.5f * (wa < wb ? wa : wb) || oy + 2.0f >= 0.5f * (ha < hb ? ha : hb)) return 1;
     }
+    /* XBOX_FIX_HUD_TALL (default): a tall narrow element (64 px high or more,
+     * half the other's width at most) lying wholly within the other's columns
+     * joins it stacked up to 72 px apart: the Tricky gauge's rail under its
+     * head. When a letter is won, the head (logo letters and ball) bounces
+     * up to 40 px (0xC44E0, HUD+0xA4) and the rail does not: 16 px apart at
+     * most, the head was anchored on its own, at the top, 240 (1 - size)
+     * px too high, then fell back at once. */
+    if (s_tall_join && s_slide) {
+        const Box *t = (a->y1 - a->y0 >= 64.0f && a->x1 - a->x0 <= 0.5f * (b->x1 - b->x0)) ? a :
+                       (b->y1 - b->y0 >= 64.0f && b->x1 - b->x0 <= 0.5f * (a->x1 - a->x0)) ? b : NULL;
+        const Box *o = t == a ? b : a;
+        if (t && t->x0 >= o->x0 - 1.0f && t->x1 <= o->x1 + 1.0f && gy <= 72.0f) return 1;
+    }
     if (a->y1 - a->y0 > 64.0f || b->y1 - b->y0 > 64.0f) return 0;
     return near_box(a, b) || near_box(b, a) ? 2 : 0;
 }
@@ -573,10 +659,23 @@ static void diag_record(uint32_t gfx, uint32_t obj, int h, const Box *b)
     }
 }
 
+/* XBOX_FIX_HUD_GAUGE (default): the Tricky gauge is one element, apart from
+ * everything else, as the game draws it: its pieces are the records that the
+ * gauge's block of 0xC44E0 appends (hud_anchor_gauge, s_tag[].gauge) -- the
+ * rail and its rings, the head, the logo's letters (silver, or red once won:
+ * other sizes), the marks and the S under the rail. They join each other whatever their
+ * gaps, and never anything else. Joined by nearness, as the ball spun edge on
+ * the head lost its link to the rail and took the top anchor (36 px up at
+ * 85 %), the logo's letters joined a trick's banner flying past (anchored in
+ * the middle: 165 px left), and a points label or a banner's end flying to the
+ * score joined the gauge and left it again. */
+
 static void work_out_list(uint32_t gfx, uint32_t base, uint32_t end)
 {
     static Box rb[MAX_REC], eb[MAX_REC];
     static int slot[MAX_REC], par[MAX_REC];
+    static uint32_t vt[MAX_REC];
+    static unsigned char gz[MAX_REC];
     uint32_t r;
     int n = 0, i, j, ne = 0, changed, pass;
 
@@ -591,11 +690,13 @@ static void work_out_list(uint32_t gfx, uint32_t base, uint32_t end)
         if (rb[n].x1 - rb[n].x0 >= 0.9f * s_tag[h].view.w) continue;  /* full width (fades, wipes): stretched */
         slot[n] = h;
         par[n] = n;
+        vt[n] = MEM32(MEM32(r));
         if (s_diag >= 4)
-            fprintf(stderr, "[HUDREC] frame %u list %u rec %d seg %u %.1f..%.1f x %.1f..%.1f\n", s_frame, s_lists, n,
-                    s_tag[h].seg, rb[n].x0, rb[n].x1, rb[n].y0, rb[n].y1);
+            fprintf(stderr, "[HUDREC] frame %u list %u rec %d seg %u vt %08X %.1f..%.1f x %.1f..%.1f gauge %u\n", s_frame, s_lists, n,
+                    s_tag[h].seg, vt[n], rb[n].x0, rb[n].x1, rb[n].y0, rb[n].y1, s_tag[h].gauge);
         n++;
     }
+    for (i = 0; i < n; i++) gz[i] = s_gauge && s_slide && s_tag[slot[i]].gauge;
     /* Elements: records joined by nearness, until nothing joins any more
      * (a string's shadow and its glyphs, from either end). */
     for (i = 0; i < n; i++) eb[i] = rb[i];
@@ -606,13 +707,15 @@ static void work_out_list(uint32_t gfx, uint32_t base, uint32_t end)
             int ri = uf_root(par, i);
             for (j = i + 1; j < n; j++) {
                 int rj = uf_root(par, j);
-                int kind;
-                if (ri == rj || s_tag[slot[ri]].seg != s_tag[slot[rj]].seg) continue;
-                if (pass == 0) {
+                int kind = 1;
+                if (ri == rj || s_tag[slot[ri]].seg != s_tag[slot[rj]].seg || gz[ri] != gz[rj]) continue;
+                if (gz[ri]) {
+                    /* two pieces of the Tricky gauge: one element */
+                } else if (pass == 0) {
                     if (!one_line(&eb[ri], &eb[rj]) || eb[ri].x1 - eb[rj].x0 > 0.6f * s_tag[slot[i]].view.w ||
                         eb[rj].x1 - eb[ri].x0 > 0.6f * s_tag[slot[i]].view.w) continue;
                 } else if (!(kind = joinable(&eb[ri], &eb[rj], s_tag[slot[i]].view.w))) continue;
-                if (pass == 1 && (s_side || s_diag >= 3)) {
+                if (!gz[ri] && pass == 1 && (s_side || s_diag >= 3)) {
                     int ok = same_side(&eb[ri], &eb[rj], &s_tag[slot[i]].view, kind);
                     if (s_diag >= 3 && (!ok || side_of(eb[ri].x0, eb[ri].x1, 0.0f, 640.0f) != side_of(eb[rj].x0, eb[rj].x1, 0.0f, 640.0f) ||
                                         side_of(eb[ri].y0, eb[ri].y1, 0.0f, 480.0f) != side_of(eb[rj].y0, eb[rj].y1, 0.0f, 480.0f)))
@@ -640,9 +743,13 @@ static void work_out_list(uint32_t gfx, uint32_t base, uint32_t end)
         s_tag[slot[i]].tag_y = (HUD_TAG_MAGIC_Y << 16) | q16(ay);
         if (ri != i) continue;
         ne++;
-        if (s_trlog > 0 && (s_lists % (unsigned)s_trlog) == 0u)
-            fprintf(stderr, "[HUD] frame %u element %.1f..%.1f x %.1f..%.1f -> anchor %.0f, %.0f\n", s_frame,
-                    eb[i].x0, eb[i].x1, eb[i].y0, eb[i].y1, ax, ay);
+        if (s_trlog > 0 && (s_lists % (unsigned)s_trlog) == 0u) {
+            /* the race's tick (race + 0x18), to line the elements up with a replay */
+            uint32_t app = MEM32(0x001E3C7Cu), lvl = app >= 0x1000u ? MEM32(app + 0x72Cu) : 0u;
+            uint32_t race = lvl >= 0x1000u ? MEM32(lvl + 0x1Cu) : 0u;
+            fprintf(stderr, "[HUD] frame %u tick %u element %.1f..%.1f x %.1f..%.1f -> anchor %.0f, %.0f\n", s_frame,
+                    race >= 0x1000u ? MEM32(race + 0x18u) : 0u, eb[i].x0, eb[i].x1, eb[i].y0, eb[i].y1, ax, ay);
+        }
     }
     s_lists++;
     s_elements += (unsigned long long)ne;
@@ -666,6 +773,32 @@ static int race_state(void)
     if (race < 0x1000u) return -1;
     st = MEM32(race + 0x1Cu);       /* RaceState_SetState 0x2CE10: 1 PreRace, 2 StartRace, 3 Countdown, 4 Race, 5 EndRace... */
     return st > 0xFFFFu ? 0xFFFF : (int)st;
+}
+
+/* The HD HUD's gate of the image RenderFrame starts: at each H1, on the game
+ * thread; pass_tags writes it in the pushbuffer ahead of the image, and the
+ * translator binds that image's fonts and HUD atlases by it (nv2a_hdtex.h,
+ * hdtex_frame_gate), so each image has its own answer, at any frame rate.
+ *   - The HUD's font is HD only while the race runs (countdown or race) with
+ *     its HUD on screen: the menus and end screens, which draw with the same
+ *     font, keep the game's own. After the finish the race state goes back
+ *     to 4 while the results ("Top 5 Record Times", name entry) are shown
+ *     over a replay of the race without its HUD: the HUD's methods (0xC9BB0 /
+ *     0xC9D70) called for this image (s_hud_calls) tell the race HUD from
+ *     those screens.
+ *   - Neither the font nor the HUD's atlases in an image of a frozen race
+ *     (s_tick_frozen above: the pause, its sub-screens -- options, trick
+ *     book, "Are you sure?" -- and the other blocking overlays): the pause
+ *     screen, its menu and the race HUD the game draws dimmed behind
+ *     it, is drawn as with HD HUD off. */
+uint32_t hud_anchor_hd_gate(void)
+{
+    int st = race_state(), hud = s_hud_calls > 0;
+    HUD_ORDER('F');
+    s_hud_calls = 0;
+    if (st < 2) s_tick_frozen = 0;          /* out of a race (a race quit from its pause, too) */
+    else if (s_tick_frozen) return 0u;
+    return HUD_HDGATE_HUD | ((st == 3 || st == 4) && hud ? HUD_HDGATE_FONT : 0u);
 }
 
 static int frame_in_race(int st)
@@ -736,11 +869,18 @@ static int full_width(uint32_t obj)
  *
  * Which records: in a level (the panels before the start grid too), the
  * records of a list of the HUD view that are not the race HUD, read from
- * their quads:
+ * their quads (a world quad from the 2D buffer its record draws from):
  *   - an end piece is at least PANEL_MIN_W wide and is a world quad that
  *     starts at x0 = -20 or ends at x1 = 660 (+- PANEL_TOL), or a race quad
  *     (not a full-width fade or letterbox: x0 > 2, x1 < 638) that starts at
  *     x0 = 10 or ends at x1 = 632 ;
+ *   - a world quad that is an end piece on one side and whose other side
+ *     is within PANEL_BACK_M of the panel's other edge spans the whole
+ *     panel: a backing drawn a little inside one end (the replay's, from
+ *     x = -10 to 660: on screen from 19 to 632). It is an end piece on both
+ *     sides, its inset side going to the screen's edge from where it is
+ *     (its own edge in its tags). A quad over the whole screen (0..640, a
+ *     dim or a fade) stays out: 20 from both ends ;
  *   - a list holds a panel when a left end piece and a right end piece
  *     (or one piece that is both) share rows: the two halves of one bar, or
  *     the backing. A quad that only touches one side (text, a picture
@@ -764,6 +904,7 @@ static int full_width(uint32_t obj)
 #define PANEL_TOL       4.0f
 #define PANEL_MIN_W     48.0f
 #define PANEL_SNAP      3.0f            /* a vertex this close to an edge goes to the screen's */
+#define PANEL_BACK_M    16.0f           /* a backing's inset end, world quad x (under the 20 of a 0..640 quad) */
 #define PANEL_PIECES    32
 #define PANEL_LISTS     8
 
@@ -772,7 +913,15 @@ typedef struct {
     int      found, n;
     float    l, r;                      /* the panel's edges */
     uint32_t piece[PANEL_PIECES];
+    float    pl[PANEL_PIECES], pr[PANEL_PIECES];    /* each piece's edges: the panel's, or a backing's inset end */
 } PanelList;
+
+/* A world quad's x on the title's 640x480 screen: its 2D transform puts
+ * the panel's -20..660 at 10..632. */
+static float panel_screen_x(float x)
+{
+    return PANEL_EDGE_L + (x - PANEL_OBJ_L) * ((PANEL_EDGE_R - PANEL_EDGE_L) / (PANEL_OBJ_R - PANEL_OBJ_L));
+}
 static PanelList s_panel[PANEL_LISTS];
 static unsigned  s_panel_next;
 
@@ -782,9 +931,9 @@ static int rows_meet(const Box *a, const Box *b)
 }
 
 static void panel_log(const PanelList *p, int nrec, int unread, uint32_t unread_vt,
-                      const Box *lb, int nl, const Box *rb, int nr)
+                      const Box *lb, int nl, const Box *rb, int nr, int nback)
 {
-    static struct { uint32_t base; int found, n, nl, nr, nrec, state; } last[PANEL_LISTS];
+    static struct { uint32_t base; int found, n, nl, nr, nrec, state, nback; } last[PANEL_LISTS];
     unsigned i, slot = PANEL_LISTS;
     int k;
     for (i = 0; i < PANEL_LISTS && slot == PANEL_LISTS; i++)
@@ -794,13 +943,14 @@ static void panel_log(const PanelList *p, int nrec, int unread, uint32_t unread_
     if (slot == PANEL_LISTS) slot = 0;
     if (last[slot].base == p->base && last[slot].found == p->found && last[slot].n == p->n &&
         last[slot].nl == nl && last[slot].nr == nr && last[slot].nrec == nrec &&
-        last[slot].state == s_frame_state) return;
+        last[slot].state == s_frame_state && last[slot].nback == nback) return;
     last[slot].base = p->base; last[slot].found = p->found; last[slot].n = p->n;
     last[slot].nl = nl; last[slot].nr = nr; last[slot].nrec = nrec; last[slot].state = s_frame_state;
+    last[slot].nback = nback;
     fprintf(stderr, "[PANEL] frame %u race state %d list %08X: records %d (unread %d, vt %08X), "
-            "left ends %d, right ends %d -> %s %.1f..%.1f, pieces %d\n",
+            "left ends %d, right ends %d -> %s %.1f..%.1f, pieces %d, inset backings %d\n",
             s_frame, s_frame_state, p->base, nrec, unread, unread_vt, nl, nr,
-            p->found ? "panel" : "no panel", p->l, p->r, p->n);
+            p->found ? "panel" : "no panel", p->l, p->r, p->n, nback);
     for (k = 0; k < nl; k++)
         fprintf(stderr, "[PANEL]   left  %.1f..%.1f x %.1f..%.1f\n", lb[k].x0, lb[k].x1, lb[k].y0, lb[k].y1);
     for (k = 0; k < nr; k++)
@@ -835,10 +985,11 @@ static const PanelList *panel_of_list(uint32_t base, uint32_t end)
 {
     static Box lb[PANEL_PIECES], rb[PANEL_PIECES];
     static uint32_t lo[PANEL_PIECES], ro[PANEL_PIECES];
+    static float lt[PANEL_PIECES], rt[PANEL_PIECES];       /* a backing's inset end on screen, else none */
     uint32_t gfx = MEM32(GFX_GLOBAL), r, unread_vt = 0;
     PanelList *p = 0;
     unsigned i;
-    int nl = 0, nr = 0, nrec = 0, unread = 0, a, b;
+    int nl = 0, nr = 0, nrec = 0, unread = 0, nback = 0, a, b;
     int dump = s_panel_log >= 2 && (s_frame % 300u) == 0u;     /* XBOX_PANEL_LOG=2: every record, every 300th frame */
 
     for (i = 0; i < PANEL_LISTS; i++)
@@ -856,7 +1007,8 @@ static const PanelList *panel_of_list(uint32_t base, uint32_t end)
     for (r = base; r < end && nrec < MAX_REC; r += 0x18u, nrec++) {
         uint32_t obj = MEM32(r);
         Box q;
-        int left, right;
+        int left, right, known;
+        float own_l = -1e30f, own_r = 1e30f;
         if (mark_find(obj, base) >= 0) {                    /* the race HUD */
             if (s_panel_log && obj >= 0x1000u && MEM32(obj) == VT_WORLD_QUADS) {
                 q = record_box(gfx, obj);
@@ -866,7 +1018,16 @@ static const PanelList *panel_of_list(uint32_t base, uint32_t end)
             }
             continue;
         }
-        q = record_box(gfx, obj);
+        /* A world quad is drawn from the second 2D buffer when the stage-0
+         * texture of its record's state block is negative (untextured: the
+         * flat backings). GfxContext_ApplyStateBlock 0xFAAE0 copies the
+         * block (record + 4) to gfx+0x14, so that word is gfx+0x20, which
+         * the draw 0x1009D0 tests. The first buffer can hold, at the same
+         * place, another quad of the same panel (the replay's backing is
+         * where its bar's left half is). */
+        known = s_panel_backing && obj >= 0x1000u && MEM32(obj) == VT_WORLD_QUADS;
+        q = known ? box_from(gfx, obj, VT_WORLD_QUADS, (int16_t)MEM16(r + 0x10u) < 0 ? VB_2D_ALT : VB_2D)
+                  : record_box(gfx, obj);
         if (dump)
             fprintf(stderr, "[PANEL] frame %u state %d list %08X rec %d obj %08X vt %08X box %.1f..%.1f x %.1f..%.1f\n",
                     s_frame, s_frame_state, base, nrec, obj, obj >= 0x1000u ? MEM32(obj) : 0u, q.x0, q.x1, q.y0, q.y1);
@@ -880,10 +1041,9 @@ static const PanelList *panel_of_list(uint32_t base, uint32_t end)
              * halves meet at 320), which its 2D transform puts at 10..632 */
             left = q.x1 - q.x0 >= PANEL_MIN_W && fabsf(q.x0 - PANEL_OBJ_L) <= PANEL_TOL;
             right = q.x1 - q.x0 >= PANEL_MIN_W && fabsf(q.x1 - PANEL_OBJ_R) <= PANEL_TOL;
-            if (!left && !right) {
-                /* A world quad is drawn from one of two 2D buffers, picked
-                 * when it is drawn (gfx+0x20): record_box reads the first
-                 * one, and its stale vertices at the same place can look
+            if (!left && !right && !known) {
+                /* XBOX_FIX_PANEL_BACKING=0: record_box reads the first
+                 * buffer, and its stale vertices at the same place can look
                  * valid -- the backing, drawn from the second one, was then
                  * missed now and then. The second buffer's box counts too. */
                 Box q2 = box_from(gfx, obj, VT_WORLD_QUADS, VB_2D_ALT);
@@ -899,14 +1059,29 @@ static const PanelList *panel_of_list(uint32_t base, uint32_t end)
                     }
                 }
             }
+            if (s_panel_backing && left != right) {
+                /* One end at the panel's edge, the other a little inside
+                 * the other edge: the backing across the whole panel (the
+                 * replay's starts at -10). Both its sides go to the screen's
+                 * edges, the inset one from where it is drawn. */
+                if (left && q.x1 >= PANEL_OBJ_R - PANEL_BACK_M) {
+                    right = 1;
+                    own_r = panel_screen_x(q.x1) - PANEL_TOL;
+                    nback++;
+                } else if (right && q.x0 <= PANEL_OBJ_L + PANEL_BACK_M) {
+                    left = 1;
+                    own_l = panel_screen_x(q.x0) + PANEL_TOL;
+                    nback++;
+                }
+            }
         } else {
             if (q.x1 - q.x0 < PANEL_MIN_W) continue;
             if (q.x0 <= 2.0f || q.x1 >= 638.0f) continue;   /* fades, letterbox */
             left = fabsf(q.x0 - PANEL_EDGE_L) <= PANEL_TOL;
             right = fabsf(q.x1 - PANEL_EDGE_R) <= PANEL_TOL;
         }
-        if (left && nl < PANEL_PIECES) { lb[nl] = q; lo[nl++] = obj; }
-        if (right && nr < PANEL_PIECES) { rb[nr] = q; ro[nr++] = obj; }
+        if (left && nl < PANEL_PIECES) { lb[nl] = q; lt[nl] = own_l; lo[nl++] = obj; }
+        if (right && nr < PANEL_PIECES) { rb[nr] = q; rt[nr] = own_r; ro[nr++] = obj; }
     }
     for (a = 0; a < nl && !p->found; a++)
         for (b = 0; b < nr; b++)
@@ -915,27 +1090,39 @@ static const PanelList *panel_of_list(uint32_t base, uint32_t end)
         /* the edges on screen: the race quads' own, else the title's 10..632 */
         p->l = PANEL_EDGE_L + PANEL_TOL;
         p->r = PANEL_EDGE_R - PANEL_TOL;
-        for (a = 0; a < nl; a++) {
+        for (a = 0; a < nl; a++)
             if (MEM32(lo[a]) != VT_WORLD_QUADS && lb[a].x0 < p->l) p->l = lb[a].x0;
-            p->piece[p->n++] = lo[a];
+        for (b = 0; b < nr; b++)
+            if (MEM32(ro[b]) != VT_WORLD_QUADS && rb[b].x1 > p->r) p->r = rb[b].x1;
+        /* each piece's edges: the panel's, a backing's inset end further in */
+        for (a = 0; a < nl; a++) {
+            p->piece[p->n] = lo[a];
+            p->pl[p->n] = lt[a] > p->l ? lt[a] : p->l;
+            p->pr[p->n++] = p->r;
         }
         for (b = 0; b < nr; b++) {
-            int dup = 0;
-            if (MEM32(ro[b]) != VT_WORLD_QUADS && rb[b].x1 > p->r) p->r = rb[b].x1;
-            for (a = 0; a < nl; a++) if (lo[a] == ro[b]) dup = 1;
-            if (!dup && p->n < PANEL_PIECES) p->piece[p->n++] = ro[b];
+            int dup = -1;
+            for (a = 0; a < nl; a++) if (lo[a] == ro[b]) dup = a;    /* piece a is lo[a] */
+            if (dup >= 0) {
+                if (rt[b] < p->pr[dup]) p->pr[dup] = rt[b];
+            } else if (p->n < PANEL_PIECES) {
+                p->piece[p->n] = ro[b];
+                p->pl[p->n] = p->l;
+                p->pr[p->n++] = rt[b] < p->r ? rt[b] : p->r;
+            }
         }
     }
     if (s_panel_log && (nl || nr || p->found))
-        panel_log(p, nrec, unread, unread_vt, lb, nl, rb, nr);
+        panel_log(p, nrec, unread, unread_vt, lb, nl, rb, nr, nback);
     return p;
 }
 
+/* The index of obj among the panel's pieces, or -1. */
 static int panel_piece(const PanelList *p, uint32_t obj)
 {
     int i;
-    for (i = 0; i < p->n; i++) if (p->piece[i] == obj) return 1;
-    return 0;
+    for (i = 0; i < p->n; i++) if (p->piece[i] == obj) return i;
+    return -1;
 }
 
 static uint32_t q14(float v)
@@ -950,16 +1137,17 @@ static uint32_t panel_tag(uint32_t obj, uint32_t view, uint32_t *tag_y)
 {
     const PanelList *p;
     uint32_t base = view + VIEW_LIST;
+    int k;
     if (s_panel_log >= 3 && (s_frame % 300u) == 0u)
         fprintf(stderr, "[PANEL] tag frame %u state %d view %08X obj %08X\n", s_frame, s_frame_state, view, obj);
     if (!g_panel_on || s_frame_state < 0) return 0;
     p = panel_of_list(base, MEM32(view + VIEW_LIST_END));
     if (!p->found) return 0;
-    if (panel_piece(p, obj)) {
+    if ((k = panel_piece(p, obj)) >= 0) {
         /* at 4:3 (no race 2D), x as drawn and the ends to the screen's edges */
-        *tag_y = (HUD_TAG_MAGIC_PANEL_R << 16) | q14(p->r - PANEL_SNAP);
+        *tag_y = (HUD_TAG_MAGIC_PANEL_R << 16) | q14(p->pr[k] - PANEL_SNAP);
         return (HUD_TAG_MAGIC_PANEL << 16) | (s_frame_wide ? HUD_PANEL_WIDE_ONLY : 0u) |
-               q14(p->l + PANEL_SNAP);
+               q14(p->pl[k] + PANEL_SNAP);
     }
     if (!g_race2d_on || s_frame_wide || full_width(obj)) return 0;
     *tag_y = HUD_TAG_MAGIC_PANEL_R << 16;               /* before the race: 4:3 proportions */
@@ -1010,7 +1198,7 @@ uint32_t hud_anchor_tag(uint32_t obj, uint32_t view, uint32_t *tag_y)
         QueryPerformanceCounter(&t1);
         s_work_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
     }
-    if ((++s_found % 100000u) == 1u)
+    if ((++s_found % 100000u) == 1u && (s_found == 1u || xbox_log_stats()))
         fprintf(stderr, "[HUD] elements %llu, records marked %llu, drawn %llu, table full %llu, lists without HUD %llu ; %.4f ms per list\n",
                 s_elements, s_marked, s_found, s_full, s_stale, s_lists ? s_work_ms / (double)s_lists : 0.0);
     if (s_tag[h].frame != s_frame) {
@@ -1030,5 +1218,6 @@ void (*hud_anchor_lookup(unsigned int xbox_va))(void)
     if (xbox_va == 0x000C9BB0u) return hook_hud_000C9BB0;
     if (xbox_va == 0x000C9D70u) return hook_hud_000C9D70;
     if (xbox_va == 0x000D2D80u) return hook_hud_000D2D80;
+    if (xbox_va == 0x000AB170u) return hook_hud_000AB170;
     return 0;
 }

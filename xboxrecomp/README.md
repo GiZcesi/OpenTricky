@@ -423,7 +423,7 @@ The runtime libraries (C) use:
 ## FAQ
 
 **Q: Is this legal?**
-A: This project provides tools and documentation. You must own a legitimate copy of any game you recompile. No copyrighted game code or assets are included in this repository.
+A: This project provides tools and documentation. You must own a legitimate copy of any game you recompile. No copyrighted game code or assets are included in xboxrecomp.
 
 **Q: How is this different from an emulator?**
 A: Emulators interpret or JIT-compile code at runtime. Static recompilation translates the entire binary ahead of time into native C code that compiles to a regular `.exe`. There's no CPU emulation at runtime — the recompiled functions execute directly.

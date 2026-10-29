@@ -5,13 +5,13 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for testing OpenTricky! Please check [Known issues](https://github.com/GiZcesi/OpenTricky#known-issues) first.
+        Thanks for reporting! Please check [Known issues](https://github.com/GiZcesi/OpenTricky#known-issues) first.
         **Never attach your disc image, game files or a link to them.**
   - type: input
     id: version
     attributes:
       label: Version
-      description: The version shown in SETTINGS → ADVANCED → About, or the release name (for example 0.1.1-unstable).
+      description: The version shown in SETTINGS → ADVANCED → About OpenTricky, or the release name (for example 0.1.4).
     validations:
       required: true
   - type: textarea
@@ -40,7 +40,7 @@ body:
     id: settings
     attributes:
       label: Settings
-      description: Resolution, screen shape, field of view, frame rate limit, smooth edges, soft shadows, draw distance, "Look like the Xbox". You can paste your `settings.ini` (next to `OpenTricky.exe`); remove the disc image path if it shows your name.
+      description: Preset, resolution, screen shape, field of view, frame rate limit, smooth edges, soft shadows, draw distance. You can paste your `settings.ini` (next to `OpenTricky.exe`); remove the disc image path if it shows your name.
     validations:
       required: true
   - type: input
@@ -54,9 +54,9 @@ body:
     id: log
     attributes:
       label: Log file
-      description: In the launcher, turn on SETTINGS → ADVANCED → Log file, make the problem happen again, then drag `SSX Tricky.log` here.
+      description: Drag `SSX Tricky.log` (next to `settings.ini`) here before you start the game again, as each start replaces it. SETTINGS → ADVANCED → Log file is on by default. You can also attach the zip that SETTINGS → ADVANCED → Bug report → Prepare… saves on your Desktop.
   - type: textarea
     id: shots
     attributes:
       label: Screenshots
-      description: Press F12 in the game; the pictures are in the Screenshots folder next to the game.
+      description: Press F12 in the game; the pictures are in the Screenshots folder next to `OpenTricky.exe`.

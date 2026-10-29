@@ -138,19 +138,43 @@ static struct {
     ID3D11ShaderResourceView *srv[3];
 } S;
 
+static int s_ss_on = -1, s_ss_pct = -1, s_ss_start = -1;
+
 int d3d8_softshadow_enabled(void)
 {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_SOFT_SHADOWS"); on = e && e[0] == '1'; }
-    return on;
+    if (s_ss_on < 0) { const char *e = getenv("XBOX_SOFT_SHADOWS"); s_ss_on = e && e[0] == '1'; }
+    if (s_ss_start < 0) s_ss_start = s_ss_on;
+    return s_ss_on;
+}
+
+int d3d8_softshadow_width(void)
+{
+    if (s_ss_pct < 0) {
+        const char *e = getenv("XBOX_SOFT_SHADOW_WIDTH");
+        s_ss_pct = e ? atoi(e) : 100;
+        if (s_ss_pct < 10 || s_ss_pct > 300) s_ss_pct = 100;
+    }
+    return s_ss_pct;
+}
+
+void d3d8_softshadow_set(int on)
+{
+    d3d8_softshadow_enabled();
+    s_ss_on = on && s_ss_start;
+}
+
+void d3d8_softshadow_set_width(int pct)
+{
+    if (pct >= 10 && pct <= 300) s_ss_pct = pct;
 }
 
 static ID3D10Blob *compile(const char *entry, const char *target, int msaa)
 {
     static const D3D_SHADER_MACRO ms[] = { { "SS_MSAA", "1" }, { NULL, NULL } };
     ID3D10Blob *code = NULL, *err = NULL;
-    if (FAILED(D3DCompile(k_hlsl, sizeof k_hlsl - 1, "softshadow", msaa ? ms : NULL, NULL,
-                          entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
+    if (FAILED(d3d8_shader_compile_logged(k_hlsl, sizeof k_hlsl - 1, "softshadow", msaa ? ms : NULL,
+                                          entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                                          &code, &err))) {
         fprintf(stderr, "[SOFTSHADOW] shader %s: %s\n", entry,
                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "compile failed");
         if (err) ID3D10Blob_Release(err);
@@ -410,9 +434,10 @@ int d3d8_softshadow_run(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     if (!base_init(dev) || !targets_ensure(dev, w, h, msaa) || !mask_state(dev, cmp, rmask))
         return 0;
 
-    /* Sigma 2.5 px at 480 lines, scaled with the render height; the blur
-     * works in half-size pixels. */
-    sigma = 1.25f * (float)h / 480.0f;
+    /* Sigma 2.5 px at 480 lines, scaled with the render height and the
+     * edge width (XBOX_SOFT_SHADOW_WIDTH, 100 % = 2.5 px); the blur works in
+     * half-size pixels. */
+    sigma = 1.25f * ((float)d3d8_softshadow_width() / 100.0f) * (float)h / 480.0f;
     if (sigma < 0.75f) sigma = 0.75f;
     taps = (int)(sigma * 1.5f + 0.5f);
     if (taps < 1) taps = 1;

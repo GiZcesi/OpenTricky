@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -148,6 +149,32 @@ bool move_any(const std::string &src, const std::string &dst)
 {
     return MoveFileExW(W(src).c_str(), W(dst).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
+/* A file's data on the disk now (a power cut after this keeps it); best effort. */
+void flush_file(const std::string &p)
+{
+    HANDLE h = CreateFileW(W(p).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    FlushFileBuffers(h);
+    CloseHandle(h);
+}
+void flush_tree(const std::string &p)
+{
+    if (!is_dir(p)) { flush_file(p); return; }
+    for (const std::string &n : list_dir(p)) flush_tree(p + "\\" + n);
+}
+/* A small text file written whole or not at all, on the disk when this returns. */
+bool write_durable(const std::string &path, const std::string &text)
+{
+    std::string tmp = path + ".tmp";
+    HANDLE h = CreateFileW(W(tmp).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    bool ok = WriteFile(h, text.data(), (DWORD)text.size(), &put, nullptr) && put == text.size() && FlushFileBuffers(h);
+    CloseHandle(h);
+    ok = ok && move_any(tmp, path);
+    if (!ok) DeleteFileW(W(tmp).c_str());
+    return ok;
+}
 #else
 bool exists(const std::string &p) { return SDL_GetPathInfo(p.c_str(), nullptr); }
 bool is_dir(const std::string &p) { SDL_PathInfo i; return SDL_GetPathInfo(p.c_str(), &i) && i.type == SDL_PATHTYPE_DIRECTORY; }
@@ -156,6 +183,9 @@ std::vector<std::string> list_dir(const std::string &) { return {}; }
 bool remove_any(const std::string &) { return false; }
 bool copy_any(const std::string &, const std::string &) { return false; }
 bool move_any(const std::string &, const std::string &) { return false; }
+void flush_file(const std::string &) {}
+void flush_tree(const std::string &) {}
+bool write_durable(const std::string &, const std::string &) { return false; }
 #endif
 
 std::string lower(std::string s)
@@ -189,7 +219,7 @@ bool has_game(const std::string &dir)
 bool never_touched(const std::string &name)
 {
     std::string n = lower(name);
-    static const char *const names[] = { "settings.ini", "update-cache.txt", "update-cache.txt.tmp", "old", "update-tmp",
+    static const char *const names[] = { "settings.ini", "update-cache.txt", "update-cache.txt.tmp", "theme-order.txt", "old", "update-tmp",
                                          "saves", "crashreports", "hd-pack", "portable.txt", "opentricky.exe.old", "hdd" };
     for (const char *x : names)
         if (n == x) return true;
@@ -238,10 +268,76 @@ bool manifest_name_ok(const std::string &name)
     return !never_touched(leaf);
 }
 
-bool apply_ops(const std::string &base, const std::vector<Op> &ops, const std::string &backup,
-               const std::string &version_now, const std::string &fail_at, std::string &detail)
+/* The journal of an install in progress, update-tmp\installing.txt: on the
+ * disk before the first entry changes, gone once the install is over (done,
+ * or put back). A start that finds it (the launcher killed, a power cut)
+ * undoes the install from its backup, or finishes it when every entry was
+ * already in place (ot_install_recover).
+ *   kind    update | restore
+ *   backup  backup | undo      (the folder of update-tmp\ holding the backup)
+ *   state   applying           (entries are being replaced)
+ *           applied            (all in place; old\ not made yet)
+ *   tries   n                  (starts that could not put it right) */
+const char k_journal_magic[] = "OpenTricky install 1";
+const int k_recover_tries = 3;
+
+std::string journal_path(const std::string &base) { return base + "update-tmp\\installing.txt"; }
+
+bool journal_write(const std::string &base, const std::string &kind, const std::string &backup_leaf, const char *state, int tries = 0)
 {
-    /* 1. The backup of what is there now (nothing changed yet). */
+    return write_durable(journal_path(base), std::string(k_journal_magic) + "\nkind " + kind + "\nbackup " + backup_leaf +
+                                                 "\nstate " + state + "\ntries " + std::to_string(tries) + "\n");
+}
+
+void journal_remove(const std::string &base)
+{
+#ifdef _WIN32
+    DeleteFileW(W(journal_path(base)).c_str());
+#endif
+}
+
+/* The value of "key value" in a journal or a manifest, "" if absent. */
+std::string text_value(const std::string &t, const char *key)
+{
+    const std::string k = std::string(key) + " ";
+    size_t p = 0;
+    while (p < t.size()) {
+        size_t q = t.find('\n', p);
+        if (q == std::string::npos) q = t.size();
+        std::string line = t.substr(p, q - p);
+        p = q + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.compare(0, k.size(), k) == 0) return line.substr(k.size());
+    }
+    return "";
+}
+
+/* old\ and the update's other leftovers once a Restore is over: bin\ goes
+ * when nothing is left in it; with a file of the player's it stays (an older
+ * version does not look at it). A restored version in bin\ keeps it. */
+void restore_tidy_bin(const std::string &base, std::string &detail)
+{
+    if (is_dir(base + k_bin) && !has_game(base + k_bin)) {
+        if (list_dir(base + k_bin).empty()) remove_any(base + k_bin);
+        else detail = "bin\\ kept: it holds files that are not the program's";
+    }
+}
+
+/* Tests: the process ends here, at once, as if killed (a cut install). */
+void test_kill(const std::string &kill_at, const std::string &where)
+{
+    if (kill_at.empty() || lower(kill_at) != lower(where)) return;
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), 0xC0DE);
+#endif
+}
+
+bool apply_ops(const std::string &base, const std::vector<Op> &ops, const std::string &backup,
+               const std::string &version_now, const std::string &fail_at, const std::string &kill_at,
+               const char *kind, std::string &detail)
+{
+    /* 1. The backup of what is there now (nothing changed yet), on the disk
+     * before anything changes: it is the way back after a power cut too. */
     remove_any(backup);
     if (!mkdirs(backup)) { detail = "cannot make " + backup; return false; }
     std::string manifest = "OpenTricky backup 1\nversion " + version_now + "\n";
@@ -251,16 +347,13 @@ bool apply_ops(const std::string &base, const std::vector<Op> &ops, const std::s
         if (!exists(cur)) { manifest += "new " + ops[i].name + "\n"; continue; }
         if (!parent_of(ops[i].name).empty()) mkdirs(backup + "\\" + parent_of(ops[i].name));
         if (!copy_any(cur, backup + "\\" + ops[i].name)) { detail = "cannot back up " + ops[i].name; return false; }
+        flush_tree(backup + "\\" + ops[i].name);
         had[i] = true;
         manifest += "had " + ops[i].name + "\n";
     }
-    SDL_IOStream *io = SDL_IOFromFile((backup + "\\manifest.txt").c_str(), "wb");
-    if (!io || SDL_WriteIO(io, manifest.data(), manifest.size()) != manifest.size()) {
-        if (io) SDL_CloseIO(io);
-        detail = "cannot write the backup's manifest";
-        return false;
-    }
-    SDL_CloseIO(io);
+    if (!write_durable(backup + "\\manifest.txt", manifest)) { detail = "cannot write the backup's manifest"; return false; }
+    const std::string leaf = backup.substr(backup.find_last_of("\\/") + 1);
+    if (!journal_write(base, kind, leaf, "applying")) { detail = "cannot write the install journal"; return false; }
 
     /* 2. Each entry in place; the first failure puts back all those touched. */
     size_t touched = 0;
@@ -282,29 +375,41 @@ bool apply_ops(const std::string &base, const std::vector<Op> &ops, const std::s
             ok = false;
             continue;
         }
+        test_kill(kill_at, op.name);         /* the old entry gone, the new one not there yet */
         if (op.src.empty()) continue;
         if (!parent_of(op.name).empty()) mkdirs(base + parent_of(op.name));
         if (!(op.copy ? copy_any(op.src, cur) : move_any(op.src, cur))) { detail = "cannot put " + op.name + " in place"; ok = false; }
     }
-    if (ok) return true;
+    if (ok) {
+        /* Not written: the journal still says "applying", and the launcher
+         * (the last entry) is the new one, which says the same (ot_install_recover). */
+        journal_write(base, kind, leaf, "applied");
+        test_kill(kill_at, "@applied");
+        return true;
+    }
 
-    /* 3. Back: every touched entry as it was. */
+    /* 3. Back: every touched entry as it was. The journal stays when one
+     * could not be put back: the next start tries again. */
+    bool back = true;
     for (size_t i = touched; i-- > 0;) {
         const Op &op = ops[i];
         std::string cur = base + op.name;
         if (lower(op.name) == lower(k_launcher)) {
             if (exists(cur + ".old")) {
                 remove_any(cur);
-                move_any(cur + ".old", cur);
+                back = move_any(cur + ".old", cur) && back;
             }
             continue;
         }
         bool gone = remove_any(cur);      /* fails on a file still in use: then it is the old one */
-        if (had[i] && (gone || is_dir(cur))) copy_any(backup + "\\" + op.name, cur);
+        if (had[i] && (gone || is_dir(cur))) back = copy_any(backup + "\\" + op.name, cur) && back;
+        else if (!had[i] && !gone) back = false;
     }
 #ifdef _WIN32
     RemoveDirectoryW(W(base + k_bin).c_str());     /* only when empty: a bin\ this attempt made */
 #endif
+    if (back) journal_remove(base);
+    else detail += "; not all of it could be put back (next start)";
     return false;
 }
 
@@ -477,7 +582,10 @@ bool ot_unzip(const std::string &zip, const std::string &dir, std::string &error
 
 std::string ot_program_dir(const std::string &base)
 {
-    return has_game(base + k_bin) ? base + k_bin + "\\" : base;
+    /* The interface decides, not the game: with SSX Tricky.exe gone from bin\ (an
+     * antivirus took it, a partial unzip) the pages load from bin\ui\ all the same, and
+     * PLAY says the game is missing, instead of a window with nothing in it. */
+    return is_dir(base + k_bin + "\\ui") ? base + k_bin + "\\" : base;
 }
 
 bool ot_install_writable(const std::string &base)
@@ -526,7 +634,7 @@ bool ot_install_has_backup(const std::string &base, std::string &version)
 
 void ot_install_tidy_root(const std::string &base, std::vector<std::string> &removed, std::vector<std::string> &failed)
 {
-    if (ot_program_dir(base) == base) return;          /* the game is not in bin\: nothing to tidy */
+    if (!has_game(base + k_bin)) return;               /* the game is not in bin\: nothing to tidy */
     for (const char *c : k_program_copies) {
         if (!exists(base + c)) continue;
         if (remove_any(base + c)) removed.push_back(c);
@@ -534,9 +642,107 @@ void ot_install_tidy_root(const std::string &base, std::vector<std::string> &rem
     }
 }
 
+OtRecovery ot_install_recover(const std::string &base)
+{
+    OtRecovery r;
+    std::string j;
+    if (!exists(journal_path(base))) return r;
+    r.found = true;
+    if (!ot_read_file(journal_path(base), j, 1 << 16) || j.compare(0, sizeof k_journal_magic - 1, k_journal_magic) != 0) {
+        r.detail = "the install journal cannot be read: removed";
+        journal_remove(base);
+        return r;
+    }
+    const std::string kind = text_value(j, "kind"), leaf = text_value(j, "backup"), state = text_value(j, "state");
+    const int tries = atoi(text_value(j, "tries").c_str());
+    r.kind = kind;
+    if ((kind != "update" && kind != "restore") || (leaf != "backup" && leaf != "undo") || (state != "applying" && state != "applied")) {
+        r.detail = "the install journal is not one of this version's: removed";
+        journal_remove(base);
+        return r;
+    }
+    const std::string bdir = base + "update-tmp\\" + leaf;
+    struct Ent { std::string name; bool had; };
+    std::vector<Ent> ents;
+    std::string m;
+    bool have_manifest = ot_read_file(bdir + "\\manifest.txt", m, 1 << 20);
+    r.version = have_manifest ? text_value(m, "version") : "";
+    for (size_t p = 0; p < m.size();) {
+        size_t q = m.find('\n', p);
+        if (q == std::string::npos) q = m.size();
+        std::string line = m.substr(p, q - p);
+        p = q + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        bool had = line.rfind("had ", 0) == 0;
+        if (!had && line.rfind("new ", 0) != 0) continue;
+        Ent e{ line.substr(4), had };
+        if (manifest_name_ok(e.name)) ents.push_back(e);
+    }
+
+    /* Applying, and the launcher (always the last entry) already the new
+     * one: every entry is in place, so the install is finished instead. */
+    bool finish = state == "applied";
+    for (const Ent &e : ents)
+        if (!finish && e.had && lower(e.name) == lower(k_launcher)) {
+            std::string now = ot_sha256_file(base + k_launcher), was = ot_sha256_file(bdir + "\\" + k_launcher);
+            finish = !now.empty() && !was.empty() && now != was;
+        }
+
+    bool ok = true;
+    if (finish) {
+        if (kind == "update") {
+            /* The backup becomes old\ (done already when it is not there any more). */
+            if (is_dir(bdir)) {
+                remove_any(base + "old");
+                if (!move_any(bdir, base + "old") && !copy_any(bdir, base + "old")) r.detail = "finished, but the previous version could not be kept in old\\";
+            }
+        } else {
+            remove_any(base + "old");
+            remove_any(bdir);
+            restore_tidy_bin(base, r.detail);
+        }
+    } else if (!have_manifest) {
+        ok = false;                     /* written before the journal: nothing to go back with */
+        r.detail = "no backup manifest";
+    } else {
+        /* Back: each entry as the backup has it, the last first. The running
+         * launcher is the one from before (its entry was not reached). */
+        for (size_t i = ents.size(); i-- > 0;) {
+            const Ent &e = ents[i];
+            if (lower(e.name) == lower(k_launcher)) continue;
+            std::string cur = base + e.name;
+            bool gone = remove_any(cur);
+            if (e.had) {
+                if (!parent_of(e.name).empty()) mkdirs(base + parent_of(e.name));
+                if ((gone || is_dir(cur)) && copy_any(bdir + "\\" + e.name, cur)) continue;
+                ok = false;
+                r.detail = "cannot put back " + e.name + " (in use?)";
+            } else if (!gone) {
+                ok = false;
+                r.detail = "cannot remove " + e.name + " (in use?)";
+            }
+        }
+#ifdef _WIN32
+        RemoveDirectoryW(W(base + k_bin).c_str());     /* only when empty: a bin\ the cut install made */
+#endif
+    }
+    r.finished = finish;
+    r.ok = ok;
+    if (ok) {
+        journal_remove(base);
+    } else if (tries + 1 >= k_recover_tries) {
+        r.gave_up = true;               /* never a loop: the player reinstalls (the notice says how) */
+        journal_remove(base);
+    } else {
+        journal_write(base, kind, leaf, state.c_str(), tries + 1);
+    }
+    return r;
+}
+
 void ot_install_cleanup(const std::string &base)
 {
-    if (exists(base + "update-tmp")) remove_any(base + "update-tmp");
+    /* An install that could not be put right yet keeps its backup (ot_install_recover). */
+    if (exists(base + "update-tmp") && !exists(journal_path(base))) remove_any(base + "update-tmp");
     /* The launcher that installed us may still be closing: a few tries. */
     std::string old = base + k_launcher + std::string(".old");
     for (int i = 0; i < 30 && exists(old); i++) {
@@ -550,10 +756,15 @@ void ot_install_update(const OtInstallRequest &req, OtInstallState &st)
     const std::string tmp = req.base + "update-tmp", stage = tmp + "\\stage", backup = tmp + "\\backup";
     auto finish = [&](bool ok) {
         if (ok) { std::lock_guard<std::mutex> lk(st.m); st.ok = true; st.fail.clear(); }
-        else remove_any(tmp);           /* nothing of a stopped update stays */
+        else if (st.cancel && st.step < 3) set_fail(st, "cancel", "cancelled by the player");   /* whatever stopped the download */
+        if (!ok && !exists(journal_path(req.base))) remove_any(tmp);   /* nothing of a stopped update stays, but a way back */
         st.done = true;
     };
     st.step = 1;
+    if (exists(journal_path(req.base))) {
+        set_fail(st, "install", "an interrupted install is not put right yet (next start)");
+        return finish(false);
+    }
     remove_any(tmp);
     if (!mkdirs(tmp)) { set_fail(st, "folder", "cannot make " + tmp); return finish(false); }
 
@@ -603,6 +814,7 @@ void ot_install_update(const OtInstallRequest &req, OtInstallState &st)
         if (total > 0) st.total = total;
     };
     OtHttp z = ot_http_get(q);
+    if (st.cancel) { set_fail(st, "cancel", "cancelled by the player"); return finish(false); }
     if (z.status != 200 || !z.error.empty() || (req.zip_size > 0 && z.received != req.zip_size)) {
         set_fail(st, "download", req.zip_name + ": " + (!z.error.empty() ? z.error : z.status != 200 ? "HTTP " + std::to_string(z.status) : "size differs"));
         return finish(false);
@@ -619,20 +831,25 @@ void ot_install_update(const OtInstallRequest &req, OtInstallState &st)
         return finish(false);
     }
 
-    /* 3. In place. */
+    /* 3. In place. The player's Cancel counts until here: nothing changed yet. */
     st.step = 3;
+    if (st.cancel) { set_fail(st, "cancel", "cancelled by the player"); return finish(false); }
     if (ot_install_game_running(req.base)) { set_fail(st, "busy", "the game is running"); return finish(false); }
+    flush_tree(stage);                  /* the new files on the disk before the old ones go */
     std::string detail;
-    if (!apply_ops(req.base, stage_ops(stage, req.base), backup, req.version_now, req.fail_at, detail)) {
-        set_fail(st, "install", detail);
+    if (!apply_ops(req.base, stage_ops(stage, req.base), backup, req.version_now, req.fail_at, req.kill_at, "update", detail)) {
+        set_fail(st, exists(journal_path(req.base)) ? "partial" : "install", detail);
         return finish(false);
     }
-    /* The backup becomes old\ (the previous version, for Restore). */
+    /* The backup becomes old\ (the previous version, for Restore); then the
+     * journal goes: the install is over. */
     remove_any(req.base + "old");
+    test_kill(req.kill_at, "@old");
     if (!move_any(backup, req.base + "old") && !copy_any(backup, req.base + "old")) {
         std::lock_guard<std::mutex> lk(st.m);
         st.detail = "installed, but the previous version could not be kept in old\\";
     }
+    journal_remove(req.base);
     remove_any(stage);
     remove_any(zip);
     st.step = 4;
@@ -691,23 +908,27 @@ void ot_install_restore(const OtInstallRequest &req, OtInstallState &st)
     }
     std::stable_partition(ops.begin(), ops.end(), [](const Op &o) { return lower(o.name) != lower(k_launcher); });
     if (ot_install_game_running(req.base)) { set_fail(st, "busy", "the game is running"); return finish(false); }
+    if (exists(journal_path(req.base))) {
+        set_fail(st, "install", "an interrupted install is not put right yet (next start)");
+        return finish(false);
+    }
     mkdirs(tmp);
     std::string detail;
-    if (!apply_ops(req.base, ops, undo, req.version_now, req.fail_at, detail)) {
-        set_fail(st, "install", detail);
+    if (!apply_ops(req.base, ops, undo, req.version_now, req.fail_at, req.kill_at, "restore", detail)) {
+        set_fail(st, exists(journal_path(req.base)) ? "partial" : "install", detail);
         return finish(false);
     }
     remove_any(old);
     remove_any(tmp + "\\undo");
-    /* bin\ goes when nothing is left in it; with a file of the player's it stays
-     * (an older version does not look at it). A restored version in bin\ keeps it. */
-    if (is_dir(req.base + k_bin) && !has_game(req.base + k_bin)) {
-        if (list_dir(req.base + k_bin).empty()) remove_any(req.base + k_bin);
-        else {
+    {
+        std::string tidy;
+        restore_tidy_bin(req.base, tidy);
+        if (!tidy.empty()) {
             std::lock_guard<std::mutex> lk(st.m);
-            st.detail = "bin\\ kept: it holds files that are not the program's";
+            st.detail = tidy;
         }
     }
+    journal_remove(req.base);
     st.step = 4;
     finish(true);
 }

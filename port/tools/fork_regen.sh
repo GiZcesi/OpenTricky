@@ -95,6 +95,13 @@ for n in sub_0017FF2C sub_00180916 sub_0018098B sub_00180997 sub_00180B89 sub_00
     sed -i -E "s/^void ${n}\(void\)(\r?)\$/void ${n}_lifted(void)\1/" "$f"
     grep -q -E "^void ${n}_lifted\(void\)" "$f" || { echo "rename $n failed"; exit 1; }
 done
+# 0x000A87E0 (the analog reader of the Player's command, a thunk to 0xA8550) is
+# a host body that calls the translated one (port/src/extras_off.c).
+for n in sub_000A87E0; do
+    f=$(grep -l -E "^void ${n}\(void\)"$'\r'"?\$" "$GEN"/recomp_*.c)
+    sed -i -E "s/^void ${n}\(void\)(\r?)\$/void ${n}_lifted(void)\1/" "$f"
+    grep -q -E "^void ${n}_lifted\(void\)" "$f" || { echo "rename $n failed"; exit 1; }
+done
 
 echo "== [3b] hand-written bodies (checked against the XBE bytes)"
 # 0x001788B2 is `ret 0x20` (c2 20 00), the epilogue of sub_00178164 (XGRPH). The
@@ -137,11 +144,13 @@ PASSES=(
   "fork_fpu_cmp_split|$PY \"$FORK/fix_fpu_cmp_split.py\" \"$GEN\""
   "fork_std_scasb|$PY \"$FORK/fix_std_scasb.py\" \"$GEN\""
   "fork_kickwait|$PY \"$FORK/fix_kickwait.py\" \"$GEN\""
+  "fork_getwait|$PY \"$FORK/fix_getwait.py\" \"$GEN\""
   "fork_deadflags|$PY \"$FORK/fix_deadflags.py\" \"$GEN\""
   "fork_riderlist|$PY \"$FORK/fix_riderlist.py\" \"$GEN\""
   "fork_speechhold|$PY \"$FORK/fix_speechhold.py\" \"$GEN\""
   "fork_crowdemit|$PY \"$FORK/fix_crowdemit.py\" \"$GEN\""
   "fork_fadeparity|$PY \"$FORK/fix_fadeparity.py\" \"$GEN\""
+  "fork_hudgauge|$PY \"$FORK/fix_hudgauge.py\" \"$GEN\""
 )
 i=0
 for p in "${PASSES[@]}"; do

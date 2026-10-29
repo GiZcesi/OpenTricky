@@ -8,6 +8,7 @@
 #include <math.h>
 #include "recomp/recomp_types.h"
 #include "aspect.h"
+#include "speedfx.h"
 
 void sub_000F9EA0(void);    /* Renderer_SetScreenMode (thiscall, ret 4) */
 void sub_00103D40(void);    /* Renderer_SetScreenParams (thiscall, ret 4): 5 dwords to +0x530 */
@@ -25,6 +26,47 @@ static uint32_t s_xscale_bits;      /* (4/3) / A as a float */
 static uint32_t s_renderer;         /* Renderer_SetScreenMode's this, in mode 2 */
 static int      s_boxed;            /* this frame shows the title's own 16:9 (aspect_frame) */
 static float    s_cam_zoom = 1.0f;  /* A / (16/9) in NoStretch, else 1 */
+static float    s_view_fov = 1.0f;  /* the race camera's FOV and distance (aspect_set_camera) */
+static float    s_view_dist = 1.0f;
+static int      s_view_read;
+static int      s_cam_hooks = -1;
+
+/* The follow camera's back-off: the ultra-wide one times the distance. */
+static float cam_zoom(void) { return s_cam_zoom * s_view_dist; }
+static int cam_moved(void) { float z = cam_zoom(); return z > 1.001f || z < 0.999f; }
+
+static float env_pct(const char *name, float lo, float hi)
+{
+    const char *e = getenv(name);
+    float v = e && *e ? (float)atof(e) / 100.0f : 1.0f;
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+static void view_read(void)
+{
+    if (s_view_read) return;
+    s_view_read = 1;
+    s_view_fov = env_pct("XBOX_CAMERA_FOV", 0.8f, 1.3f);
+    s_view_dist = env_pct("XBOX_CAMERA_DISTANCE", 0.7f, 1.5f);
+    if (s_view_fov != 1.0f || s_view_dist != 1.0f)
+        fprintf(stderr, "[CAMERA] race camera: field of view x%.2f, distance x%.2f\n", s_view_fov, s_view_dist);
+}
+
+void aspect_set_camera(float fov, float distance)
+{
+    view_read();
+    s_view_fov = fov >= 0.8f && fov <= 1.3f ? fov : 1.0f;
+    s_view_dist = distance >= 0.7f && distance <= 1.5f ? distance : 1.0f;
+}
+
+int aspect_cam_hooks(void)
+{
+    if (s_cam_hooks < 0) {
+        view_read();
+        s_cam_hooks = s_view_fov != 1.0f || s_view_dist != 1.0f;
+    }
+    return s_cam_hooks;
+}
 static int      s_cam_log;         /* XBOX_WIDE_CAMERA_LOG=1 */
 
 static const char *const k_fov_name[ASPECT_FOV_COUNT] = { "NoStretch", "Balanced", "Full" };
@@ -168,14 +210,46 @@ void aspect_frame(int boxed)
         MEM32(s_renderer + 0x53Cu) = boxed ? boxed_bits() : s_xscale_bits;
 }
 
+static float    s_last_proj[4];     /* last perspective projection: fov, aspect, near, far */
+static unsigned s_last_proj_n;
+
 /* Matrix_BuildPerspectiveProjection(out, fov, aspect, near, far), fov the
  * full vertical angle in radians. Only an aspect wider than 16:9 is touched
  * (the views the x-scale above widened): the fov argument is narrowed in
  * place, then the title's body builds the matrix. Pass 13 routes the direct
  * calls here too, so with the hook off this is a plain call. */
+/* The last projection built, for the speed blur (speedfx.c): the tangent
+ * of half its vertical angle and its aspect, as the title's body gets them. */
+static volatile float s_proj_tan, s_proj_aspect, s_proj_near, s_proj_far;
+int aspect_last_projection(float *tan_v, float *aspect)
+{
+    float t = s_proj_tan, a = s_proj_aspect;
+    if (!(t > 0.0f) || !(a > 0.0f)) return 0;
+    *tan_v = t;
+    *aspect = a;
+    return 1;
+}
+
+/* Its near and far planes (Far / Max widen the far one, drawdist.c). */
+int aspect_last_planes(float *n, float *f)
+{
+    float a = s_proj_near, b = s_proj_far;
+    if (!(a > 0.0f) || !(b > a)) return 0;
+    *n = a;
+    *f = b;
+    return 1;
+}
+
 void hook_fov_0017770D(void)
 {
-    float fov = MEMF(g_esp + 8u), a = MEMF(g_esp + 12u);
+    float fov = MEMF(g_esp + 8u), a = MEMF(g_esp + 12u), zoom = 0.0f, k = 1.0f;
+    /* Speed camera (speedfx.h, render only): a wider angle at speed;
+     * nothing changes while it is off or at rest. */
+    int cam = speedfx_camera(&k) && fov > 0.0f && fov < 3.0f;
+    /* the race camera's own angle (aspect_set_camera; races only) */
+    float kv = s_view_fov != 1.0f && fov > 0.0f && fov < 3.0f && !(g_aspect_hook_on && s_boxed) &&
+               speedfx_in_race() ? s_view_fov : 1.0f;
+    if (kv != 1.0f) { k = cam ? k * kv : kv; cam = 1; }
     if (g_aspect_hook_on && g_aspect_fov != ASPECT_FOV_FULL &&
         a > 16.0f / 9.0f + 0.01f && fov > 0.0f && fov < 3.1f) {
         double t = tan(0.5 * (double)fov), t2;
@@ -189,11 +263,38 @@ void hook_fov_0017770D(void)
         /* The title sizes particles from their distance only: scale them
          * with the scene. The views here all share the screen's
          * aspect; the last one built is the one being drawn. */
-        d3d8_SetPointZoom((float)(t / t2));
+        zoom = (float)(t / t2);
     } else if (g_aspect_hook_on && s_boxed) {
-        d3d8_SetPointZoom(1.0f);            /* a 16:9 frame: the title's own sizes */
+        zoom = 1.0f;                        /* a 16:9 frame: the title's own sizes */
+        cam = 0;                            /* menus framed in 16:9: never */
     }
+    if (cam) {
+        double t0 = tan(0.5 * (double)MEMF(g_esp + 8u));
+        MEMF(g_esp + 8u) = (float)(2.0 * atan(t0 * k));
+        zoom = (zoom > 0.0f ? zoom : 1.0f) / k;     /* particles shrink with the scene */
+    }
+    if (zoom > 0.0f) d3d8_SetPointZoom(zoom);
+    {
+        float f = MEMF(g_esp + 8u), aa = MEMF(g_esp + 12u);
+        if (f > 0.0f && f < 3.1f && aa > 0.1f && aa < 10.0f) {
+            s_proj_tan = (float)tan(0.5 * (double)f);
+            s_proj_aspect = aa;
+            s_proj_near = MEMF(g_esp + 16u);
+            s_proj_far = MEMF(g_esp + 20u);
+        }
+    }
+    /* The arguments the matrix is built from (the fov as narrowed above), for what is drawn over the 3D at
+     * the riders' places (aspect_last_perspective). Render thread. */
+    s_last_proj[0] = MEMF(g_esp + 8u); s_last_proj[1] = MEMF(g_esp + 12u);
+    s_last_proj[2] = MEMF(g_esp + 16u); s_last_proj[3] = MEMF(g_esp + 20u);
+    s_last_proj_n++;
     sub_0017770D();
+}
+
+int aspect_last_perspective(float out[4])
+{
+    memcpy(out, s_last_proj, sizeof s_last_proj);
+    return s_last_proj_n != 0u;
 }
 
 /* Follow camera. The title's camera runs as is (same simulation as at
@@ -216,21 +317,54 @@ void hook_fov_0017770D(void)
  * and stays in [cam+0x42C] until the title's next update, which gets its own
  * eye back. Everything at the pivot's depth keeps its size and its place on
  * screen under the NoStretch zoom z = A / (16/9): the rider is framed as at
- * 16:9, lag included; only the background is narrower. */
+ * 16:9, lag included; only the background is narrower.
+ * Only a follow camera (0x75DE0 with its flag) takes a slot; the race
+ * intro's two fixed shots never do. Before, every camera took one and
+ * none was given back: a finished event filled the four (its camera, the
+ * two intro shots, the finish shot), and a camera of another mode (Race
+ * after Showoff, or the reverse) had none, so no back-off until the game
+ * was closed. */
 typedef struct {
     uint32_t cam, k;
+    uint32_t used;                      /* s_cs_clock at its last update; 0 = free */
     int      follow, have_pivot, shown_valid;
     float    pivot[3], sim[3], shown[3];
 } CamSlot;
 static CamSlot  s_cs[4];
+static uint32_t s_cs_clock;
 static CamSlot *s_cs_cur;               /* while 0x75DE0 runs */
+static int      s_cs_any;               /* an eye was moved once: restore it even if the distance went back to 1 */
 
-static CamSlot *cam_slot(uint32_t cam)
+/* The slot a camera holds, or 0; marked as used now. */
+static CamSlot *cam_find(uint32_t cam)
 {
     int i;
-    for (i = 0; i < 4; i++) if (s_cs[i].cam == cam) return &s_cs[i];
-    for (i = 0; i < 4; i++) if (!s_cs[i].cam) { s_cs[i].cam = cam; return &s_cs[i]; }
+    for (i = 0; i < 4; i++)
+        if (s_cs[i].used && s_cs[i].cam == cam) { s_cs[i].used = ++s_cs_clock; return &s_cs[i]; }
     return 0;
+}
+
+/* A slot for a follow camera: its own, else a free one, else the one used
+ * longest ago. The title updates its live cameras every tick, so that one is
+ * a camera it no longer runs (a race left, an intro over): given up as it
+ * is, its eye not written back (the object may be gone or reused by now).
+ * No timer: a pause, a replay or the results, however long, take nothing
+ * from the cameras in use, and a camera back at the same address
+ * finds its slot (cam_restore checks the eye before writing it). */
+static CamSlot *cam_take(uint32_t cam)
+{
+    CamSlot *c = cam_find(cam);
+    int i;
+    if (c) return c;
+    c = &s_cs[0];
+    for (i = 1; i < 4; i++) if (s_cs[i].used < c->used) c = &s_cs[i];
+    if (s_cam_log)
+        printf("CAMSLOT take cam=%08X slot=%d (was %08X, unused for %u updates)\n", cam, (int)(c - s_cs),
+               c->used ? c->cam : 0u, c->used ? s_cs_clock - c->used : 0u);
+    memset(c, 0, sizeof *c);
+    c->cam = cam;
+    c->used = ++s_cs_clock;
+    return c;
 }
 
 /* The title's eye back, unless something wrote the eye since (a cut). */
@@ -246,13 +380,18 @@ static void cam_restore(CamSlot *c)
 void hook_cam_00075DE0(void)
 {
     uint32_t p = MEM32(g_ecx + 0x11Cu), out = MEM32(g_esp + 4u), list = MEM32(g_esp + 8u);
-    CamSlot *c;
-    if (!(s_cam_zoom > 1.001f) || out < 0x10000u || !(c = cam_slot(out - 0x47Cu))) {
+    CamSlot *c = 0;
+    int follow = 0;
+    if (cam_moved() && out >= 0x10000u) {
+        follow = p >= 0x10000u && MEM32(p + 0xC8u) && MEM32(p) && list >= 0x10000u &&
+                 MEM32(list + (MEM32(p + 4u) << 5)) >= 0x10000u;
+        c = follow ? cam_take(out - 0x47Cu) : cam_find(out - 0x47Cu);
+    }
+    if (!c) {
         sub_00075DE0();
         return;
     }
-    c->follow = p >= 0x10000u && MEM32(p + 0xC8u) && MEM32(p) && list >= 0x10000u &&
-                MEM32(list + (MEM32(p + 4u) << 5)) >= 0x10000u;
+    c->follow = follow;
     c->have_pivot = 0;
     s_cs_cur = c->follow ? c : 0;
     sub_00075DE0();
@@ -309,7 +448,7 @@ static int cam_forward(uint32_t cam, float f[3])
 void hook_cam_00078DE0(void)
 {
     uint32_t cam = g_ecx;
-    CamSlot *c = s_cam_zoom > 1.001f ? cam_slot(cam) : 0;
+    CamSlot *c = cam_moved() || s_cs_any ? cam_find(cam) : 0;
     float e[3], f[3], dp = 0.0f, back = 0.0f;
     int i, axis;
     if (c) cam_restore(c);
@@ -323,27 +462,33 @@ void hook_cam_00078DE0(void)
         axis = dp > 1.0f;
     }
     if (axis) {
-        back = (s_cam_zoom - 1.0f) * dp;
+        back = (cam_zoom() - 1.0f) * dp;
         for (i = 0; i < 3; i++) e[i] = c->sim[i] - f[i] * back;
     } else {                            /* no view yet: scale about the pivot */
-        for (i = 0; i < 3; i++) e[i] = c->pivot[i] + (c->sim[i] - c->pivot[i]) * s_cam_zoom;
+        for (i = 0; i < 3; i++) e[i] = c->pivot[i] + (c->sim[i] - c->pivot[i]) * cam_zoom();
     }
     cam_collide(e, c->pivot, c->k);
     for (i = 0; i < 3; i++) MEMF(cam + 0x42Cu + 4u * i) = c->shown[i] = e[i];
     c->shown_valid = 1;
+    s_cs_any = 1;
     if (s_cam_log > 0) {
         static unsigned n;
         if (n++ % 15u == 0u) {
             float mv = 0.0f;
             for (i = 0; i < 3; i++) mv += (e[i] - c->sim[i]) * (e[i] - c->sim[i]);
             printf("CAMLOG z=%.3f axis=%d pivot_depth=%.1f back=%.1f moved=%.1f\n",
-                   s_cam_zoom, axis, dp, back, sqrtf(mv));
+                   cam_zoom(), axis, dp, back, sqrtf(mv));
         }
     }
 }
 
 void (*aspect_lookup(unsigned int xbox_va))(void)
 {
+    view_read();                        /* XBOX_CAMERA_FOV / _DISTANCE, whatever the shape */
+    if (!g_aspect_hook_on) {            /* 16:9 / 4:3: the camera hooks only (aspect_cam_hooks) */
+        if (!aspect_cam_hooks()) return 0;
+        if (xbox_va == 0x000F9EA0u || xbox_va == 0x00103D40u) return 0;
+    }
     if (xbox_va == 0x000F9EA0u) return hook_aspect_000F9EA0;
     if (xbox_va == 0x00103D40u) return hook_aspect_00103D40;
     if (xbox_va == 0x0017770Du) return hook_fov_0017770D;

@@ -55,4 +55,5 @@ int xa2_queued(void);
 #define XA2_QUEUE_MAX 20
 int xa2_target_queued(void);
 
+
 #endif /* APU_XAUDIO2_H */

@@ -194,5 +194,9 @@ int pass_tags_draw_stretched(void);
 
 /* Registers a sink (4 at most). Returns 0 if the table is full. */
 int pass_tags_add_sink(const pass_tags_sink *s);
+/* The same, called before the sinks already registered (the speed
+ * blur notes the view of the image before the EMIT sink publishes the
+ * FRAME_END marker the pump will read). */
+int pass_tags_add_sink_first(const pass_tags_sink *s);
 
 #endif /* PASS_TAGS_H */

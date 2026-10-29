@@ -1,0 +1,141 @@
+/*
+ * tokens.rcss -- the launcher's design tokens: every colour, radius and
+ * shared effect of launcher.rcss, by name. The launcher reads this file
+ * first, in front of launcher.rcss (OtFileInterface, ot_render.cpp), so a
+ * page that links launcher.rcss has them too.
+ *
+ * The look: matte surfaces, 1 dp rules, small spaced capitals for labels,
+ * one accent (the track's colour) for the main action only, a dot and a
+ * word for each state. The same parts as the online screens: chamfered
+ * panels, slanted buttons, the game's face for titles.
+ *
+ * The track's theme fills the $name$ values when the file is read ($acc$
+ * accent, $display$ ...): this is the only file that should use them
+ * (the src= of the theme's pictures in the pages aside).
+ * Note: in RCSS, the alpha of rgba() is 0-255.
+ */
+body {
+    /* The theme (the track of the disc image, ot_theme.c). */
+    --acc: $acc$;
+    --acc-dark: $acc_dark$;
+    --acc-light: $acc_light$;
+    --acc-soft: $acc_soft$;
+    --acc-line: $acc_line$;
+    --play-text: $play_text$;
+    --display: $display$;
+    --display-style: $display_style$;
+    --display-weight: $display_weight$;
+
+    /* Text, three greys under white. */
+    --c-white: #ffffff;
+    --c-t1: #eceef3;           /* values, labels, button text */
+    --c-copy: #c4cbe0;         /* paragraphs */
+    --c-t2: #a7afc0;           /* secondary text, links */
+    --c-t3: #6c7589;           /* keys, group titles, arrows, idle tabs */
+    --c-t4: #3f475a;           /* PLAY without a disc, a page to come */
+    --c-key-ink: #0b0d14;      /* letters on the controller hints */
+    --c-key: #dfe3ea;          /* the controller hints' keys */
+
+    /* States: a dot and a word. */
+    --c-ok: #4cc27a;
+    --c-ok-text: #7fcf9c;
+    --c-warn: #f0a53a;
+    --c-warn-hi: #f6b85a;      /* the orange, hovered */
+    --c-warn-ink: #1a1000;     /* text on the orange */
+    --c-warn-text: #f3cf97;
+    --c-bad: #e5534b;
+    --c-bad-text: #f0b3ae;
+
+    /* Surfaces, darkest to lightest, all opaque or nearly. */
+    --c-bg: #070b16;
+    --c-chip: #0b0f17;         /* the status labels at the top */
+    --c-panel: rgba(11,15,24,242);   /* What's new, the help, the dialogs: the chamfer's colour */
+    --c-side: #090c14;         /* sidebar */
+    --c-foot: rgba(7,10,18,235);
+    --c-ctl: #141925;          /* a control */
+    --c-ctl-hi: #1c2230;       /* a control chosen, hovered */
+    --c-dim: rgba(3,6,14,190);
+    /* Pressed: the fill at 0.82 of its colour (the theme's are set by the launcher). */
+    --c-chip-press: #090c13;
+    --c-ctl-press: #10141e;
+    --c-ctl-hi-press: #171c27;
+    --c-warn-press: #c58730;
+    --acc-press: $acc_press$;
+    --acc-light-press: $acc_light_press$;
+    --acc-dark-press: $acc_dark_press$;
+
+    /* Rules: one hairline, one control outline (1 dp: RmlUi rounds borders to whole pixels). */
+    --line: #242b39;
+    --line-ctl: #353d50;
+
+    /* Radii: two, small. Panels are chamfered (top-right, bottom-left) by a ninepatch. */
+    --r-s: 2dp;
+    --r-m: 6dp;                /* the status labels (the online top bar's) */
+
+    /* Type: five sizes for the text, five for the display face, one for a button in it. */
+    --fs-xs: 9dp;              /* small capitals in labels */
+    --fs-s: 11dp;              /* small capitals: kickers, groups, buttons */
+    --fs-m: 12dp;              /* small lines, status labels */
+    --fs-body: 13.5dp;         /* paragraphs, lists */
+    --fs-l: 14dp;              /* rows, values */
+    --fs-h: 19dp;              /* the help's heading */
+    --fs-d1: 26dp;
+    --fs-d2: 40dp;             /* the Settings title */
+    --fs-d3: 30dp;             /* panel titles (What's new, the disc) */
+    --fs-d4: 44dp;             /* PLAY */
+    --fs-d5: 82dp;
+    /* The display face on a button (Save, a dialog's main button): its capitals
+     * (0.40 em) as tall as the small capitals of the button beside it (Inter,
+     * 0.73 em of --fs-s: 8 dp). */
+    --fs-btn-d: 20dp;
+
+    /* Spacing of the small capitals: --fs-xs labels (in a control, a key), --fs-xs
+     * group titles over a rule, --fs-s labels, --fs-s kickers and tabs, a main
+     * button in the display face, PLAY. Each with its negative (-back): a centred
+     * label gives back the space after its last letter. */
+    --ls-xs: 1.4dp;
+    --ls-grp: 1.8dp;
+    --ls-s: 1.6dp;
+    --ls-m: 2dp;
+    --ls-pri: 1.5dp;
+    --ls-play: 3dp;
+    --ls-xs-back: -1.4dp;
+    --ls-grp-back: -1.8dp;
+    --ls-s-back: -1.6dp;
+    --ls-m-back: -2dp;
+    --ls-pri-back: -1.5dp;
+    --ls-play-back: -3dp;
+
+    /* Type and controls in whole pixels: every size above, these heights (--h-), the
+     * line inside a control (--lh-) and the margin that centres it (--m-) are set
+     * again in whole pixels by the launcher at each layout, from the real metrics of
+     * the fonts (layout_tokens in main.cpp): a text's baseline on a whole pixel, its
+     * capitals in the middle of its frame. The values here are the dp they stand for. */
+    --h-pill: 32dp;  --lh-pill: 30dp;  --lh-disc: 30dp;  --lh-ver: 30dp;  --lh-sw: 30dp;  --h-dot: 8dp;  --m-dot: 11dp;  --r-dot: 4dp;  --h-prog: 2dp;  --m-prog: 4dp;  --h-step: 22dp;  --lh-step: 22dp;  --h-sic: 20dp;  --lh-sic: 18dp;  --m-sic: 1dp;  --h-pb: 22dp;  --lh-pb: 20dp;  --m-pb: 4dp;
+    --h-mode: 34dp;  --lh-mode: 32dp;  --h-soon: 15dp;  --lh-soon: 13dp;  --m-soon: 8.5dp;
+    --h-seg: 30dp;  --lh-seg: 28dp;  --lh-seg-out: 30dp;  --h-tab: 32dp;  --lh-tab: 30dp;
+    --h-row: 40dp;  --lh-row: 40dp;  --h-ab: 22dp;  --lh-ab: 20dp;  --m-ab: 9dp;
+    --h-soonb: 15dp;  --lh-soonb: 13dp;  --m-soonb: 12.5dp;  --h-tog: 18dp;  --m-tog: 11dp;
+    --h-mod: 4dp;  --m-mod: 18dp;  --h-cell: 28dp;  --lh-cell: 26dp;  --m-cell: 6dp;
+    --h-tag: 20dp;  --lh-tag: 18dp;
+    --h-kv: 30dp;  --lh-kv-k: 30dp;  --lh-kv: 30dp;  --h-chip: 15dp;  --lh-chip: 13dp;  --m-chip: 1.5dp;  --lh-dname: 18dp;  --h-dl: 18dp;  --lh-dn: 18dp;  --mb-dn: 0dp;
+    --h-mbtn: 34dp;  --lh-mbtn: 32dp;  --lh-mbtn-pri: 32dp;  --h-ubtn: 36dp;  --lh-ubtn: 36dp;
+    --h-foot: 54dp;  --h-fl: 22dp;  --m-fl: 16dp;  --lh-fl: 22dp;  --h-sep: 12dp;  --m-sep: 5dp;
+    --lh-hint: 22dp;  --h-kb: 18dp;  --m-kb: 2dp;  --lh-kb: 18dp;
+    --h-fbtn: 36dp;  --m-fbtn: 9dp;  --lh-fbtn: 34dp;  --lh-save: 34dp;  --lh-note: 54dp;
+    --h-play: 82dp;  --lh-play: 82dp;  --lh-play-off: 80dp;
+    --pr-pill: 12dp;  --mr-pb: -8dp;  --p5: 5dp;  --p5-r: 3.6dp;  --p6: 6dp;  --p6-r: 4.6dp;  --p7: 7dp;  --p7-r: 5.6dp;  --p9: 9dp;  --p9-r: 7.6dp;
+    --p12: 12dp;  --p15: 15dp;  --p16: 16dp;  --p18: 18dp;
+    --dx-pri: 0px;   /* the main buttons' labels (display face) moved back by half its overhang */
+    /* The chamfered panels' inner margin (What's new, the disc panel, the help, the dialogs). */
+    --pad-panel: 26dp;
+
+    /* The focus of the keyboard and the controller, on every control. */
+    --focus-ring: #ffffff 0 0 0 2dp;
+    --focus-ring-in: #ffffff 0 0 0 2dp inset;   /* the settings lines of the scrolled list, which clips outside */
+    /* The line icons, drawn at their size in pixels (set in whole pixels by apply_layout). */
+    --icon: 22dp;
+    /* Set again in whole pixels by the launcher at each layout (apply_layout). */
+    --play-ring: #ffffff 0 0 0 2dp;
+    --hover-edge: #ffffff 0 0 0 1dp;   /* PLAY hovered (whole pixels, apply_layout) */
+}

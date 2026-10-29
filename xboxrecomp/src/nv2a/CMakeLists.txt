@@ -31,7 +31,7 @@ if(MSVC)
         _CRT_SECURE_NO_WARNINGS
     )
 else()
-    target_compile_options(xbox_nv2a PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+    target_compile_options(xbox_nv2a PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 target_link_libraries(xbox_nv2a PRIVATE platform)

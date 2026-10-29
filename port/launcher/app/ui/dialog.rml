@@ -11,24 +11,27 @@
 
         <div class="box sec" data-if="modal == 'capture'">
             <div class="kick">{{cap_kind}}</div>
-            <div class="dh">PRESS A KEY</div>
+            <!-- cap_kind and conf_kind as main.cpp sets them (capture_start, capture_assign). -->
+            <div class="dh" data-if="cap_kind != 'CONTROLS &#xB7; CONTROLLER'">PRESS A KEY</div>
+            <div class="dh" data-if="cap_kind == 'CONTROLS &#xB7; CONTROLLER'">PRESS A BUTTON</div>
             <p class="c">New for <b>{{cap_for}}</b> &#xB7; now <b>{{cap_now}}</b></p>
             <div class="wait">&#x2026;</div>
             <p class="c dim2">{{cap_hint}}</p>
             <div class="btns c">
-                <span class="mbtn" id="cap-cancel" data-event-click="dlg('cap_cancel')">Esc &#xB7; Cancel</span>
-                <span class="mbtn" id="cap-clear" data-event-click="dlg('cap_clear')">Backspace &#xB7; Clear</span>
+                <span class="mbtn" id="cap-cancel" data-event-click="dlg('cap_cancel')"><span>Esc &#xB7; Cancel</span></span>
+                <span class="mbtn" id="cap-clear" data-event-click="dlg('cap_clear')"><span>Backspace &#xB7; Clear</span></span>
             </div>
         </div>
 
         <div class="box sec" data-if="modal == 'conflict'">
             <div class="kick">{{conf_kind}}</div>
-            <div class="dh">KEY ALREADY USED</div>
+            <div class="dh" data-if="conf_kind != 'CONTROLS &#xB7; CONTROLLER'">KEY ALREADY USED</div>
+            <div class="dh" data-if="conf_kind == 'CONTROLS &#xB7; CONTROLLER'">BUTTON ALREADY USED</div>
             <p>{{conf_line}}</p>
             <div class="note">{{conf_swap}}</div>
             <div class="btns">
-                <span class="mbtn pri" id="swap" data-event-click="dlg('swap')">Swap</span>
-                <span class="mbtn ghost" id="conf-cancel" data-event-click="dlg('conf_cancel')">Cancel</span>
+                <span class="mbtn pri" id="swap" data-event-click="dlg('swap')"><span>Swap</span></span>
+                <span class="mbtn ghost" id="conf-cancel" data-event-click="dlg('conf_cancel')"><span>Cancel</span></span>
             </div>
         </div>
 
@@ -39,21 +42,20 @@
                It never contains your disc image or your saves.</p>
             <div class="mono"><div>{{crash_when}}</div><div>{{crash_version}}</div></div>
             <div class="btns">
-                <span class="mbtn pri" id="crash-report" data-event-click="dlg('report')">Prepare a bug report</span>
-                <span class="mbtn" id="crash-logs" data-event-click="dlg('logs')">Open logs</span>
-                <span class="mbtn ghost" id="crash-close" data-event-click="dlg('close')">Not now</span>
+                <span class="mbtn pri" id="crash-report" data-event-click="dlg('report')"><span>Prepare a bug report</span></span>
+                <span class="mbtn" id="crash-logs" data-event-click="dlg('logs')"><span>Open logs</span></span>
+                <span class="mbtn ghost" id="crash-close" data-event-click="dlg('close')"><span>Not now</span></span>
             </div>
-            <p class="small">The zip is saved on your Desktop. Nothing is sent automatically: attach it to a GitHub issue if you want.</p>
+            <p class="small">The zip is saved on your Desktop. Nothing is sent. Attach it to a GitHub issue.</p>
         </div>
 
         <div class="box sec" data-if="modal == 'report_ask'">
             <div class="kick">TROUBLESHOOTING</div>
             <div class="dh">PREPARE A BUG REPORT?</div>
-            <p>A zip on your Desktop with the launcher's and the game's logs, your settings (folders left out) and the last crash report.
-               Never your disc image or your saves. Nothing is sent.</p>
+            <p>A zip on your Desktop with the logs, your settings and the last crash report. No disc image, no saves. Nothing is sent.</p>
             <div class="btns">
-                <span class="mbtn pri" id="ask-report" data-event-click="dlg('report')">Prepare</span>
-                <span class="mbtn ghost" id="ask-cancel" data-event-click="dlg('close')">Cancel</span>
+                <span class="mbtn pri" id="ask-report" data-event-click="dlg('report')"><span>Prepare</span></span>
+                <span class="mbtn ghost" id="ask-cancel" data-event-click="dlg('close')"><span>Cancel</span></span>
             </div>
         </div>
 
@@ -63,8 +65,8 @@
             <p>Puts back v{{restore_version}}, the version installed before the last update. The launcher restarts.
                Your settings, saves, disc image and HD pack stay as they are.</p>
             <div class="btns">
-                <span class="mbtn pri" id="restore-ok" data-event-click="dlg('restore')">Restore</span>
-                <span class="mbtn ghost" id="restore-cancel" data-event-click="dlg('close')">Cancel</span>
+                <span class="mbtn pri" id="restore-ok" data-event-click="dlg('restore')"><span>Restore</span></span>
+                <span class="mbtn ghost" id="restore-cancel" data-event-click="dlg('close')"><span>Cancel</span></span>
             </div>
         </div>
 
@@ -73,8 +75,8 @@
             <div class="dh">{{notice_head}}</div>
             <p>{{notice_text}}</p>
             <div class="btns">
-                <span class="mbtn pri" id="notice-ok" data-event-click="dlg('close')">OK</span>
-                <span class="mbtn" id="notice-show" data-if="notice_file" data-event-click="dlg('show_file')">Show the file</span>
+                <span class="mbtn pri" id="notice-ok" data-event-click="dlg('close')"><span>OK</span></span>
+                <span class="mbtn" id="notice-show" data-if="notice_file" data-event-click="dlg('show_file')"><span>Show the file</span></span>
             </div>
         </div>
 
@@ -85,33 +87,62 @@
             <p>{{inst_text}}</p>
             <div data-if="inst_phase == 'run' || inst_phase == 'done' || inst_phase == 'done_manual'">
                 <div class="step" data-if="inst_kick != 'RESTORE'" data-class-ok="inst_s1 == 'ok'" data-class-run="inst_s1 == 'run'"><span class="ic">1</span>{{inst_l1}}</div>
-                <div class="step" data-if="inst_kick != 'RESTORE'" data-class-ok="inst_s2 == 'ok'" data-class-run="inst_s2 == 'run'"><span class="ic">2</span>Checked &#xB7; SHA-256 matches the release</div>
+                <div class="step" data-if="inst_kick != 'RESTORE'" data-class-ok="inst_s2 == 'ok'" data-class-run="inst_s2 == 'run'"><span class="ic">2</span>Verified</div>
                 <div class="step" data-class-ok="inst_s3 == 'ok'" data-class-run="inst_s3 == 'run'"><span class="ic">3</span>{{inst_l3}}</div>
                 <div class="bar"><div class="fill" data-style-width="inst_bar"></div></div>
                 <p class="small" data-if="inst_kick != 'RESTORE'">v{{version}} is kept: <b>Settings &#x203A; Advanced &#x203A; Restore</b>.</p>
             </div>
+            <!-- Until the install itself starts (step 3): nothing changed yet. -->
+            <div class="btns" data-if="inst_cancel">
+                <span class="mbtn ghost" id="inst-cancel" data-event-click="dlg('inst_cancel')"><span>Cancel</span></span>
+            </div>
             <div class="btns" data-if="inst_phase == 'fail'">
-                <span class="mbtn pri" id="inst-retry" data-event-click="dlg('inst_retry')">Retry</span>
-                <span class="mbtn ghost" id="inst-later" data-event-click="dlg('close')">Later</span>
+                <span class="mbtn pri" id="inst-retry" data-event-click="dlg('inst_retry')"><span>Retry</span></span>
+                <span class="mbtn ghost" id="inst-later" data-event-click="dlg('close')"><span>Later</span></span>
             </div>
             <div class="btns" data-if="inst_phase == 'nowrite'">
-                <span class="mbtn pri" id="inst-page" data-event-click="dlg('inst_page')">Open the page</span>
-                <span class="mbtn ghost" id="inst-later2" data-event-click="dlg('close')">Later</span>
+                <span class="mbtn pri" id="inst-page" data-event-click="dlg('inst_page')"><span>Open the page</span></span>
+                <span class="mbtn ghost" id="inst-later2" data-event-click="dlg('close')"><span>Later</span></span>
             </div>
             <div class="btns" data-if="inst_phase == 'done_manual'">
-                <span class="mbtn pri" id="inst-ok" data-event-click="dlg('close')">OK</span>
+                <span class="mbtn pri" id="inst-ok" data-event-click="dlg('close')"><span>OK</span></span>
             </div>
+        </div>
+
+        <!-- Find my disc image (main.cpp, find_discs): the SSX Tricky (USA) disc
+             images found on this computer, one button each, for a controller too. -->
+        <div class="box wide sec" data-if="modal == 'discs'">
+            <div class="kick">DISC IMAGE</div>
+            <div class="dh">FIND MY DISC IMAGE</div>
+            <p data-if="disc_found.size > 0">Found on this computer and checked: SSX Tricky (USA) for Xbox. Choose one.</p>
+            <p data-if="disc_found.size == 0">No SSX Tricky (USA) disc image beside OpenTricky, in Downloads, on the Desktop or in Documents.</p>
+            <div class="dlist">
+                <div class="mbtn dimg" data-for="d : disc_found" data-attr-id="'disc' + it_index" data-event-click="disc_pick(it_index)">
+                    <span class="dn">{{d.name}}</span><span class="chip" data-if="d.cur">IN USE</span><span class="dd">{{d.dir}}</span>
+                </div>
+            </div>
+            <div class="btns">
+                <span class="mbtn" id="disc-browse" data-event-click="dlg('disc_browse')"><span>Browse&#x2026;</span></span>
+                <span class="mbtn ghost" id="disc-cancel" data-event-click="dlg('close')"><span>Cancel</span></span>
+            </div>
+            <p class="small">You can also drop the file on this window.</p>
         </div>
 
         <div class="box wide sec" data-if="modal == 'about'">
             <div class="kick">ABOUT</div>
             <div class="dh">OPENTRICKY v{{version}}</div>
             <div class="kv"><span class="k">PROJECT</span><span class="v">OpenTricky by GiZ</span></div>
+            <div class="kv"><span class="k">PORT</span><span class="v">SSX Tricky PC by MatiasRiveraC</span></div>
+            <div class="kv"><span class="k">RECOMPILER</span><span class="v">xboxrecomp by sp00nznet</span></div>
+            <div class="kv"><span class="k">EMULATION</span><span class="v">Parts of xemu (graphics and audio)</span></div>
+            <div class="kv"><span class="k">SSX RESEARCH</span><span class="v">Archy (GlitcherOG) and SSX-Library</span></div>
+            <div class="kv"><span class="k">SMAA</span><span class="v">Jorge Jimenez et al.</span></div>
+            <div class="kv"><span class="k">HUD ART</span><span class="v">Bl4ckH4nd</span></div>
             <div class="kv"><span class="k">HD TEXTURES</span><span class="v">Bl4ckH4nd (not included)</span></div>
             <div class="btns">
-                <span class="mbtn" id="licences" data-event-click="dlg('licences')">Licences</span>
-                <span class="mbtn" id="about-github" data-event-click="dlg('github')">GitHub</span>
-                <span class="mbtn ghost" id="about-close" data-event-click="dlg('close')">Close</span>
+                <span class="mbtn" id="licences" data-event-click="dlg('licences')"><span>Licences</span></span>
+                <span class="mbtn" id="about-github" data-event-click="dlg('github')"><span>GitHub</span></span>
+                <span class="mbtn ghost" id="about-close" data-event-click="dlg('close')"><span>Close</span></span>
             </div>
             <p class="small">SSX Tricky is a trademark of Electronic Arts. OpenTricky is a fan project, not affiliated with or endorsed by EA.
                It needs your own copy of the game.</p>

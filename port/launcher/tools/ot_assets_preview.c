@@ -214,8 +214,7 @@ int main(int argc, char **argv)
             save(out, name, &disc_badge);
         }
         if (hd[t].px) {
-            /* the card as the launcher ships it (ui/cards/<track>.png): the
-             * pack's picture in the card's 16:5 shape, alpha already doubled */
+            /* the pack's card, resized */
             OtImage shaped = { 0 };
             if (ot_image_resize(&hd[t], OT_CARD_HD_W, OT_CARD_HD_H, &shaped)) {
                 snprintf(name, sizeof name, "cardhd_%s.png", ot_track_id(t));

@@ -1,0 +1,13 @@
+<!-- The two pills at the top of the pages: the disc image, the version. -->
+<template name="topbar">
+<head></head>
+<body>
+        <!-- Down from the disc label on the home page: PLAY, or Settings without a disc image (PLAY takes no focus then). -->
+        <div class="pill disc" id="disc" data-class-warn="disc_state == 'warn'" data-class-bad="disc_state == 'bad'"
+             data-style-nav-down="page != 'home' ? 'auto' : have_disc ? '#play' : '#settings-button'"
+             data-event-click="choose_disc"><span class="dot" data-class-ok="disc_state == 'ok'" data-class-warn="disc_state == 'warn'" data-class-bad="disc_state == 'bad'"></span><b>{{disc_title}}</b><span class="sw" data-if="have_disc">{{disc_note}}</span><span class="pb" data-if="!have_disc">{{disc_note}}</span></div>
+        <!-- The version: up to date, a newer one (a small Update button), an update running (the version, then its
+             step and its percentage as words, a bar under them from the text's first edge to its last). -->
+        <div class="pill ver" id="ver" data-class-upd="upd_state == 'update'" data-event-click="upd('pill')"><span class="dot warn" data-if="(upd_state == 'update' || (upd_state == 'error' &amp;&amp; ver_note != '')) &amp;&amp; !inst_busy"></span><b>{{ver_num}}</b><span class="sw" data-class-ok="upd_state == 'latest'" data-class-warn="upd_state == 'error'" data-if="ver_note != '' &amp;&amp; !inst_busy">{{ver_note}}</span><span class="sw busy" data-if="inst_busy">{{inst_word}}</span><span class="sw" data-if="inst_busy">{{inst_bar}}</span><span class="pb upd" data-if="upd_state == 'update' &amp;&amp; !inst_busy">Update</span><div class="prog" data-if="inst_busy"><div class="fill" data-style-width="inst_bar"></div></div></div>
+</body>
+</template>

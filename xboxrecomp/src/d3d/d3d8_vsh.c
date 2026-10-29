@@ -1189,10 +1189,10 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     }
 
     /* Compile HLSL to bytecode */
-    hr = D3DCompile(hlsl_buf, (SIZE_T)hlsl_len, "nv2a_vsh",
-                    NULL, NULL, "main", "vs_5_0",
-                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                    &code, &errors);
+    hr = d3d8_shader_compile_logged(hlsl_buf, (SIZE_T)hlsl_len, "nv2a_vsh",
+                                    NULL, "main", "vs_5_0",
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                                    &code, &errors);
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8 VSH: Compile failed: %s\n",
                 errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");

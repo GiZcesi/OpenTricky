@@ -638,8 +638,8 @@ HRESULT d3d8_shaders_init(void)
     HRESULT hr;
 
     /* Compile vertex shader */
-    hr = D3DCompile(g_vs_source, strlen(g_vs_source), "vs_ffp",
-                    NULL, NULL, "main", "vs_5_0", 0, 0, &g_vs_blob, &errors);
+    hr = d3d8_shader_compile_logged(g_vs_source, strlen(g_vs_source), "vs_ffp",
+                                    NULL, "main", "vs_5_0", 0, &g_vs_blob, &errors);
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: VS compile failed: %s\n",
                 errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
@@ -656,8 +656,8 @@ HRESULT d3d8_shaders_init(void)
     /* Compile pixel shader */
     {
         ID3DBlob *ps_blob = NULL;
-        hr = D3DCompile(g_ps_source, strlen(g_ps_source), "ps_ffp",
-                        NULL, NULL, "main", "ps_5_0", 0, 0, &ps_blob, &errors);
+        hr = d3d8_shader_compile_logged(g_ps_source, strlen(g_ps_source), "ps_ffp",
+                                        NULL, "main", "ps_5_0", 0, &ps_blob, &errors);
         if (FAILED(hr)) {
             fprintf(stderr, "D3D8: PS compile failed: %s\n",
                     errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");

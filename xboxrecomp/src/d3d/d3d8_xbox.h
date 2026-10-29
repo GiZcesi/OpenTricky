@@ -18,6 +18,7 @@
 #ifndef BURNOUT3_D3D8_XBOX_H
 #define BURNOUT3_D3D8_XBOX_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "platform/xbox_winnt.h"
 
@@ -783,8 +784,59 @@ unsigned d3d8_PresentSeq(void);
 /* Soft shadows (XBOX_SOFT_SHADOWS=1), before the title's stencil
  * shadow quad; 1 = applied, the quad must then not write colour. */
 int d3d8_SoftShadowOn(void);
+/* Fork: the image's lights on their own (d3d8_lights.h), the source of the
+ * selective bloom. The translator sets g_d3d8_light_mark around a light draw
+ * while the bloom is on: 1 (additive in the effects group) or 3 (a light
+ * texture, its lit texels only), the device draws it, then again into
+ * emission target 0; 2 (a halo of the title), it is drawn into emission
+ * target 1 only. */
+extern int g_d3d8_light_mark;
+extern unsigned long long g_d3d8_light_tex_key;   /* mark 3: the light texture's key */
+int d3d8_lights_wanted(void);
+int d3d8_lights_active(void);
+struct ID3D11DeviceContext;
+struct ID3D11RenderTargetView;
+int d3d8_lights_mirror_begin(struct ID3D11DeviceContext *ctx);
+/* Before a marked draw: 2 = the draw is redirected into the emission target
+ * only (g_d3d8_light_mark 2, a halo replaced by the bloom; end it with
+ * mirror_end), 1 = draw it, then mirror it, 0 = nothing to do. */
+int d3d8_lights_pre(struct ID3D11DeviceContext *ctx);
+void d3d8_lights_mirror_end(struct ID3D11DeviceContext *ctx);
+/* Around a third draw of the light just drawn into an emission target: into
+ * the emitters' depth (the bloom's occlusion, d3d8_lights.h). */
+int d3d8_lights_z_begin(struct ID3D11DeviceContext *ctx);
+void d3d8_lights_z_end(struct ID3D11DeviceContext *ctx);
+/* Fork: the inputs of a temporal AA / super-resolution (d3d8_temporal.h), with
+ * XBOX_TEMPORAL=1 only. The translator sets g_d3d8_temporal_mark around a
+ * draw of the 3D: 1 = a blended draw of the effects groups, mirrored into
+ * the reactive accumulation; 2 = a rider draw, mirrored into the object
+ * target with g_d3d8_temporal_delta = { its world displacement since the
+ * previous image, 1 (matched) or 0.5 (no history) }. */
+extern int   g_d3d8_temporal_mark;
+extern float g_d3d8_temporal_delta[4];
+int d3d8_temporal_wanted(void);
+int d3d8_temporal_active(void);
+int d3d8_temporal_moved(void);
+/* The bound 3D target (the scaled one while the render scale draws the 3D). */
+struct ID3D11RenderTargetView *d3d8_Get3DRTV(void);
 int d3d8_SoftShadowDraw(float shade, unsigned cmp, unsigned ref, unsigned rmask,
                         float fx0, float fy0, float fx1, float fy1);
+/* Fork: distance veil (d3d8_veil.h), one pass per image on the scene
+ * before the particles; 1 = applied. */
+int d3d8_VeilWanted(void);
+int d3d8_VeilOn(void);
+int d3d8_VeilAmbOn(void);
+int d3d8_VeilProbe(void);
+int d3d8_VeilSnapshot(void);
+int d3d8_VeilTerrainDepth(void);
+void d3d8_VeilPrepare(void);     /* first image: shaders on a thread, targets made */
+void d3d8_VeilSetCullFn(int (*fn)(float *out));
+int d3d8_VeilLimit(float *limit, float *cell);
+/* kw / eye_w: scene pixel -> world (the terrain's transform), NULL if none seen. */
+int d3d8_VeilDraw(const float k[16], const float eye[3], float clear_depth,
+                  float near_z, float far_z, const float fog_rgb[3], float fog_rho,
+                  const float *kw, const float eye_w[3]);
+int d3d8_SceneSize(unsigned *w, unsigned *h);
 /* The last presented frame as a texture, for titles that sample the previous
  * frame buffer; NULL until the first present after a request. */
 IDirect3DTexture8 *d3d8_PrevFrameTexture(void);
@@ -849,6 +901,7 @@ typedef struct D3D8HostUiHooks {
 } D3D8HostUiHooks;
 void d3d8_SetHostUiHooks(const D3D8HostUiHooks *hooks);
 
+
 /* Controls for the menu. The window ones must be called on its thread. */
 void d3d8_HostSetFullscreen(int on);
 int  d3d8_HostIsFullscreen(void);
@@ -856,6 +909,7 @@ int  d3d8_HostIsWidescreen(void);
 void d3d8_HostSetClientSize(unsigned w, unsigned h);
 void d3d8_HostToast(const wchar_t *text);
 void d3d8_HostExit(void);
+void d3d8_SetHostExitHook(void (*fn)(void));   /* run by d3d8_HostExit first (online: BYE) */
 /* Occlusion queries for the NV2A zpass counter (fork), pump thread only. */
 int   d3d8_OcclusionBegin(void);                         /* handle, -1 on failure */
 void  d3d8_OcclusionEnd(int h);
@@ -875,6 +929,7 @@ int  d3d8_GetSmaa(void);
 void d3d8_SetPostSplit(int on);         /* post on the 3D only (XBOX_POST_SPLIT) */
 int  d3d8_GetPostSplit(void);
 int  d3d8_post_split_wanted(void);      /* register d3d8_PassPhaseChanged? */
+int  d3d8_post_wanted(void);            /* any post effect: register it (d3d8_post.c) */
 /* Translator phase callback (pgraph_pass_phase_fn). */
 void d3d8_PassPhaseChanged(int old_phase, int new_phase, unsigned tag);
 /* The NV2A DAC palette (gamma ramp), applied to the shown image
@@ -882,6 +937,19 @@ void d3d8_PassPhaseChanged(int old_phase, int new_phase, unsigned tag);
 void d3d8_SetDacPalette(const unsigned char lut[256][3]);
 int  d3d8_GammaFixEnabled(void);
 void d3d8_RequestScreenshot(const wchar_t *path);   /* PNG, end of next frame */
+/* The image shown in the window (back buffer after the blit, the
+ * window's size), n consecutive presents from the next one, written in the
+ * background: path = the .png (n = 1) or an existing folder (000.png, ...);
+ * a description is appended to notes (or NULL) at the end. 0 = still busy. */
+int  d3d8_RequestShownShot(const wchar_t *path, unsigned n, const wchar_t *notes);
+int  d3d8_ShownShotBusy(void);
+unsigned d3d8_ShotBurstCount(void);                 /* XBOX_SHOT_BURST, 60 (2..999) */
+/* Called on the render thread for each captured image: a short note (the
+ * race tick) for its line in the description. */
+void d3d8_SetShotInfoHook(void (*fn)(char *buf, size_t n));
+/* The host's PNG encoder for those images: packed R,G,B rows in, a malloc'd
+ * PNG out (NULL = failed: the built-in writer is used). */
+void d3d8_SetPngEncoder(void *(*fn)(const unsigned char *rgb, unsigned w, unsigned h, size_t *len));
 /* NV2A-native draws (d3d8_nv2a.c): pixel shaders generated from the
  * register combiners, keyed by nv2a_psh_key(). */
 int d3d8_nv2a_has_ps(unsigned long long key);

@@ -1,0 +1,15 @@
+<!-- The controller hints of the footer, while a controller is the active
+     input: the page's own buttons, drawn in the Button style chosen. -->
+<template name="hints">
+<head></head>
+<body>
+            <div class="hints" data-if="pad_active">
+                <span class="hs" data-if="page == 'home' &amp;&amp; hint_style == 0"><span class="kb ka">A</span>Select<span class="kb kl kst">&#xA0;<span class="mb m1"></span><span class="mb m2"></span><span class="mb m3"></span></span>Play</span>
+                <span class="hs" data-if="page == 'home' &amp;&amp; hint_style == 1"><img class="pi pj" src="icons/jc/T_P4_Cross_Color_Retro.png"/>Select<span class="kb kl kt">OPTIONS</span>Play</span>
+                <span class="hs" data-if="page == 'home' &amp;&amp; hint_style == 2"><img class="pi" src="icons/ps2/ps2_cross.png"/>Select<img class="pi pw" src="icons/ps2/ps2_start.png"/>Play</span>
+                <span class="hs" data-if="page == 'settings' &amp;&amp; hint_style == 0"><span class="kb ka">A</span>Select<span class="kb kbk">B</span>Back<span class="kb kl">LB</span><span class="kb kl pn">RB</span>Tab<span class="kb kyy">Y</span>Save</span>
+                <span class="hs" data-if="page == 'settings' &amp;&amp; hint_style == 1"><img class="pi pj" src="icons/jc/T_P4_Cross_Color_Retro.png"/>Select<img class="pi pj" src="icons/jc/T_P4_Circle_Color_Retro.png"/>Back<img class="pi pj" src="icons/jc/T_P4_L1_Retro.png"/><img class="pi pj pn" src="icons/jc/T_P4_R1_Retro.png"/>Tab<img class="pi pj" src="icons/jc/T_P4_Triangle_Color_Retro.png"/>Save</span>
+                <span class="hs" data-if="page == 'settings' &amp;&amp; hint_style == 2"><img class="pi" src="icons/ps2/ps2_cross.png"/>Select<img class="pi" src="icons/ps2/ps2_circle.png"/>Back<img class="pi pl" src="icons/ps2/ps2_l1.png"/><img class="pi pl pn" src="icons/ps2/ps2_r1.png"/>Tab<img class="pi" src="icons/ps2/ps2_triangle.png"/>Save</span>
+            </div>
+</body>
+</template>

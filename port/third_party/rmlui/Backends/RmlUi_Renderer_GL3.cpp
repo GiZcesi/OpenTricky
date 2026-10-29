@@ -9,6 +9,7 @@
 #include <RmlUi/Core/SystemInterface.h>
 #include <algorithm>
 #include <string.h>
+#include <stdlib.h>
 
 #if defined RMLUI_PLATFORM_WIN32_NATIVE
 	// function call missing argument list
@@ -36,6 +37,31 @@
 #ifndef RMLUI_NUM_MSAA_SAMPLES
 	#define RMLUI_NUM_MSAA_SAMPLES 2
 #endif
+
+// Sample count actually used for the layer framebuffers: RMLUI_NUM_MSAA_SAMPLES, lowered to what the
+// card allows (GL_MAX_SAMPLES) so a smaller maximum never makes the framebuffer fail (black window).
+// OT_MSAA_MAX (test only) lowers the ceiling further. Computed once; the result is logged once.
+static int GetMsaaSamples()
+{
+	static int samples = -1;
+	if (samples >= 0)
+		return samples;
+	int wanted = RMLUI_NUM_MSAA_SAMPLES;
+	GLint max_samples = 0;
+	glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+	glGetError(); // forget a possible error on an odd driver; max_samples stays 0 then
+	if (max_samples > 0 && wanted > max_samples)
+		wanted = max_samples;
+	if (const char* env = getenv("OT_MSAA_MAX"))
+	{
+		int cap = atoi(env);
+		if (cap >= 0 && wanted > cap)
+			wanted = cap;
+	}
+	samples = wanted;
+	Rml::Log::Message(Rml::Log::LT_INFO, "MSAA: %d samples (asked %d, card maximum %d).", samples, (int)RMLUI_NUM_MSAA_SAMPLES, (int)max_samples);
+	return samples;
+}
 
 #define MAX_NUM_STOPS 16
 #define BLUR_SIZE 7
@@ -2050,7 +2076,7 @@ Rml::LayerHandle RenderInterface_GL3::RenderLayerStack::PushLayer()
 		GLuint shared_depth_stencil = (fb_layers.empty() ? 0 : fb_layers.front().depth_stencil_buffer);
 
 		fb_layers.push_back(Gfx::FramebufferData{});
-		Gfx::CreateFramebuffer(fb_layers.back(), width, height, RMLUI_NUM_MSAA_SAMPLES, Gfx::FramebufferAttachment::DepthStencil,
+		Gfx::CreateFramebuffer(fb_layers.back(), width, height, GetMsaaSamples(), Gfx::FramebufferAttachment::DepthStencil,
 			shared_depth_stencil);
 	}
 

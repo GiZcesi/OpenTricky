@@ -9,6 +9,8 @@
 #include <windows.h>
 #include "recomp/recomp_types.h"
 #include "pumplag.h"
+#include "../../xboxrecomp/src/kernel/xbox_logstats.h"
+#include "drawdist.h"
 
 void sub_000FFDC0(void);    /* MeshRenderer_DrawPartsList (thiscall: first part; ctx; ret 4) */
 void sub_000FFEE0(void);    /* Grid record draw (thiscall: record object; ctx; ret 4) */
@@ -178,7 +180,14 @@ static void grid_fence_wait(uint32_t r)
     for (;;) {
         if ((int32_t)((pgraph_d3d11_fork_fence << 8) - (stamp << 8)) >= 0) break;
         QueryPerformanceCounter(&t);
-        if ((double)(t.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart > 250.0) { s_fx.gtimeout++; break; }
+        if ((double)(t.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart > 250.0) {
+            /* an error, written when it happens (the first 20); the [CONSTWAIT]
+             * counters below are statistics (XBOX_LOG_STATS=1) */
+            if (s_fx.gtimeout++ < 20u)
+                fprintf(stderr, "[CONSTWAIT] grid fence wait gave up after 250 ms (block %u, image %u)\n",
+                        (unsigned)r, d3d8_PresentSeq());
+            break;
+        }
         if (++spins < 64u) SwitchToThread(); else Sleep(0);
     }
     QueryPerformanceCounter(&t);
@@ -201,7 +210,7 @@ void hook_plag_001013D0(void)
         uint32_t r = MEM32(ctx + CTX_SET4) * BLK_SET + MEM32(ctx + CTX_SLOT);
         if (r < 4u * BLK_SET && s_gstamp[r]) { s_fx.pcalls++; grid_fence_wait(r); }
     }
-    sub_001013D0();
+    drawdist_item();                    /* the title's function, behind the draw distance guard */
 }
 
 /* 0x1017E0, thiscall: queues a Grid record; takes block
@@ -250,7 +259,7 @@ void hook_plag_001017E0(void)
         {
             static unsigned last;
             unsigned f = d3d8_PresentSeq();
-            if (f - last >= 3000u) {
+            if (f - last >= 3000u && xbox_log_stats()) {
                 last = f;
                 fprintf(stderr, "[CONSTWAIT] f%u calls %llu waited > 0.05 ms %llu (total %.1f ms, max %.2f ms), "
                         "grid fence waits %llu (timeouts %llu; parts on a Grid block %llu, %.1f ms in fence waits), "

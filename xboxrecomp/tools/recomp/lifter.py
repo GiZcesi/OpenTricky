@@ -1199,7 +1199,9 @@ class Lifter:
         if len(ops) < 1:
             return ["/* neg: no operand */"]
         val = _fmt_operand_read(ops[0])
-        return [_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})")]
+        # Two's complement negation done unsigned: -(int32_t)x overflows (undefined
+        # in C) for 0x80000000; 0u - x gives the same bits x86 does, at every width.
+        return [_fmt_operand_write(ops[0], f"(uint32_t)(0u - (uint32_t){val})")]
 
     def _lift_not(self, insn, ops):
         if len(ops) < 1:
@@ -1313,16 +1315,20 @@ class Lifter:
                 f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
                 f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
             ]
+        # The 2- and 3-operand forms keep only the low bits of the product, which
+        # are the same signed or unsigned. Multiplying as uint32_t gives them
+        # without the signed overflow C leaves undefined (a uint16_t operand
+        # would promote to int, so every factor is cast to uint32_t).
         elif nops == 2:
             # Two operand: dst = dst * src
             dst = _fmt_operand_read(ops[0])
             src = _fmt_operand_read(ops[1])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} * (int32_t){src})")]
+            return [_fmt_operand_write(ops[0], f"(uint32_t){dst} * (uint32_t){src}")]
         elif nops == 3:
             # Three operand: dst = src1 * imm
             src = _fmt_operand_read(ops[1])
             imm = _fmt_operand_read(ops[2])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
+            return [_fmt_operand_write(ops[0], f"(uint32_t){src} * (uint32_t){imm}")]
         return ["/* imul: unexpected form */"]
 
     def _lift_muldiv(self, insn, ops, m):
@@ -1342,7 +1348,9 @@ class Lifter:
             ]
         elif m == "idiv":
             return [
-                f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
+                # edx:eax assembled unsigned: shifting a negative int64_t left
+                # is undefined in C; the conversion back keeps the same bits.
+                f"{{ int64_t _dividend = (int64_t)(((uint64_t)edx << 32) | eax);",
                 f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
                 f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t){src})); }}"
             ]
@@ -1352,14 +1360,20 @@ class Lifter:
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        cnt = _shift_count(ops[1])
+        # A byte or word operand promotes to int: shifted left by up to 31 it
+        # can overflow (undefined), so it is widened to uint32_t first; the
+        # write keeps the operand's own width.
+        bits = 8 * (_op_size(ops[0]) or 4)
+        if c_op == "<<" and bits < 32 and (ops[1].type != "imm" or bits + (ops[1].imm & 31) > 31):
+            dst = f"(uint32_t){dst}"
         return [_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}")]
 
     def _lift_sar(self, insn, ops):
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        cnt = _shift_count(ops[1])
         # An arithmetic shift copies the operand's own sign bit: bit 7 of a
         # byte, bit 15 of a word. (int32_t) of a byte read is never negative,
         # so `sar cl, 1` shifted in zeros.
@@ -2260,6 +2274,19 @@ _NO_DST_WRITE = frozenset({
 _STRING_OPS = frozenset({"movsb", "movsw", "movsd", "stosb", "stosw", "stosd",
                          "lodsb", "lodsw", "lodsd", "scasb", "scasw", "scasd",
                          "cmpsb", "cmpsw", "cmpsd"})
+
+
+def _shift_count(op):
+    """A shift count as x86 uses it: masked to 5 bits, at every operand width.
+
+    C leaves a shift by the operand width or more undefined; x86 masks the
+    count first (`shl eax, cl` with cl = 33 shifts by 1). An immediate is
+    masked here, a register count in the C expression (gcc drops the `& 31`,
+    the instruction masks the same way).
+    """
+    if op.type == "imm":
+        return _fmt_imm(op.imm & 31)
+    return f"({_fmt_operand_read(op)} & 31)"
 
 
 def _op_size(op):

@@ -25,12 +25,18 @@ typedef struct {
     uint32_t acc_dark;   /* PLAY's gradient, dark end */
     uint32_t acc_light;  /* PLAY's gradient, light end; small headings */
     uint32_t glow;       /* accent at 40 % alpha: PLAY's glow, the emblem's shadow */
-    uint32_t play_text;  /* PLAY's lettering: white, or a dark tone on light accents */
+    uint32_t play_text;  /* the lettering on the accent (PLAY, the active tab, Save): ot_theme_ink */
     uint32_t grad[5];    /* background gradient, left (very dark) to right (bright) */
     float    grad_pos[5];/* its stops, 0..1 (tracks: 0, .30, .62, .88, 1) */
     float    grad_angle; /* CSS-style degrees: 90 = to the right (tracks: 120) */
     bool     from_disc;  /* false: the default blue look (no disc image) */
 } OtTheme;
+
+/* The lettering on an accent fill (PLAY, the active tab, Save, the filled buttons):
+ * white or a dark tone of the accent's hue (7 % lightness, 60 % saturation),
+ * whichever has the higher contrast with the accent (WCAG 2 ratio), so that the
+ * small capitals of a tab read at 4.5:1 or more wherever the accent allows it. */
+uint32_t ot_theme_ink(uint32_t acc);
 
 /* The look of a track. The tuned palette (the colours shown and approved on
  * the launcher's mock-ups) when `tuned` is true, else measured from the
@@ -84,11 +90,9 @@ bool ot_badge_ot(int size, OtImage *out);
 int ot_hdpack_cards(const char *pack_dir, const OtDiscAssets *a, OtImage hd[OT_TRACK_COUNT],
                     float score[OT_TRACK_COUNT]);
 
-/* The ten HD cards shipped with the launcher (ui/cards/<track id>.png)
- * are such pack pictures already in the card's 16:5
- * shape at the badge's size, so a badge made from them at 1040 is the same
- * as one made from the pack. They are only shown once a verified disc image
- * is loaded. */
+/* The ten HD cards in ui/cards/<track id>.png: 1040 x 325, the card's 16:5
+ * shape at the badge's size (a file of another size is not used). They are
+ * only read once a verified disc image is loaded. */
 #define OT_CARD_HD_W 1040
 #define OT_CARD_HD_H 325
 

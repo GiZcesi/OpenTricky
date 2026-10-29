@@ -38,6 +38,7 @@ enum {
     SETTINGS_TAB_NONE = -1
 };
 
+
 /* Presets. Custom = none of them (settings_current_preset). */
 enum {
     SETTINGS_PRESET_ORIGINAL_XBOX, SETTINGS_PRESET_RECOMMENDED, SETTINGS_PRESET_STEAM_DECK,
@@ -93,11 +94,13 @@ typedef struct SettingDef {
 /* Setting ids: index into settings_registry() and Settings.v. */
 enum {
     /* DISPLAY */
-    S_MONITOR, S_RESOLUTION, S_DISPLAY_MODE, S_ASPECT, S_MENUS, S_FOV, S_RACE_HUD,
+    S_MONITOR, S_RESOLUTION, S_RENDER_SCALE, S_DISPLAY_MODE, S_ASPECT, S_MENUS, S_FOV, S_RACE_HUD,
     S_FPS_LIMIT, S_VSYNC,
     /* GRAPHICS */
-    S_HD_TEXTURES, S_HD_PACK_FOLDER, S_TEX_FILTER, S_SMAA, S_SOFT_SHADOWS, S_DRAW_DISTANCE,
-    S_LOOK_LIKE_XBOX,
+    S_HD_HUD, S_HD_TEXTURES, S_HD_PACK_FOLDER, S_TEX_FILTER, S_SMAA, S_SOFT_SHADOWS, S_SHADOW_SOFTNESS,
+    S_DRAW_DISTANCE,
+    S_SNOW_LOOK,
+    S_LIGHTMAP_SMOOTH, S_LOOK_LIKE_XBOX,
     /* AUDIO */
     S_SPEAKERS, S_AUDIO_DELAY, S_LAUNCHER_MUSIC, S_LAUNCHER_SOUNDS,
     /* CONTROLS */
@@ -106,12 +109,12 @@ enum {
     S_PAD_FIRST = S_KEY_FIRST + SETTINGS_KEY_CONTROLS,
     /* GAME */
     S_DISC_IMAGE = S_PAD_FIRST + SETTINGS_PAD_CONTROLS, S_SAVE_FOLDER, S_SAVE_PROFILE, S_SAVE_BACKUP,
-    S_PAUSE_IN_BACKGROUND, S_MUTE_IN_BACKGROUND,
+    S_PAUSE_IN_BACKGROUND, S_MUTE_IN_BACKGROUND, S_TC_GHOST,
     /* ADVANCED */
-    S_CHECK_UPDATES, S_UPDATE_CHANNEL, S_SKIP_LAUNCHER, S_SHOW_FPS, S_THEME, S_SMOOTH_LEGS, S_LOG_FILE,
+    S_CHECK_UPDATES, S_UPDATE_CHANNEL, S_SKIP_LAUNCHER, S_SHOW_FPS, S_THEME, S_SMOOTH_LEGS, S_SMOOTH_SEAMS, S_LOG_FILE,
     /* hidden */
     S_SMOOTH_MOTION, S_HD_TEXTURES_MENUS, S_FIX_CULL_WINDING, S_FIX_OCCLUSION,
-    S_FIX_TEX_PASSTHROUGH, S_FIX_GAMMA, S_FIX_KICKWAIT,
+    S_FIX_TEX_PASSTHROUGH, S_FIX_GAMMA, S_FIX_KICKWAIT, S_TC_GHOST_OPACITY,
     SETTINGS_COUNT
 };
 
@@ -135,7 +138,7 @@ const SettingDef *settings_def(int id);
 int settings_find(const char *section, const char *key);       /* id, or -1 */
 
 const char *settings_tab_name(int tab);         /* "DISPLAY", ...; "" for none */
-const char *settings_preset_name(int preset);   /* "Original Xbox", "Recommended", "Steam Deck", "Custom" */
+const char *settings_preset_name(int preset);   /* "Original Xbox", "Recommended", "Steam Deck", ("Modern",) "Custom" */
 /* Keyboard key names a SETTING_KEY accepts besides single letters, digits and
  * F1-F24 (the names controls.c knows). NULL-terminated. */
 const char *const *settings_key_names(void);
@@ -232,5 +235,9 @@ int  settings_install_root_of(const char *exe_dir, char *out, size_t out_sz);
 /* settings_install_root_of(this executable's folder). settings_locate's game
  * folder (game_dir NULL) is this one. */
 int  settings_install_root(char *out, size_t out_sz);
+/* The name of a kernel object that marks a running program of this install
+ * (Windows): "Local\OpenTricky-<what>-<hash of the install root>". The
+ * launcher and the game make the same name for the same install. 1 = made. */
+int  settings_instance_name(const char *what, char *out, size_t out_sz);
 
 #endif /* SSX_SETTINGS_H */

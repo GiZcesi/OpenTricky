@@ -226,9 +226,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
         if (vlog_on())
-            fprintf(stderr, "[VOICE] on %u fmt %08X list %u\n", (unsigned)selected_handle,
+            fprintf(stderr, "[VOICE] on %u fmt %08X list %u buffer %06X\n", (unsigned)selected_handle,
                     (unsigned)voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
-                    (unsigned)GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST));
+                    (unsigned)GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST),
+                    (unsigned)voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CUR_PSL_START,
+                                             NV_PAVS_VOICE_CUR_PSL_START_BA));
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -606,8 +608,15 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
     MCPXAPUState *d = (MCPXAPUState *)opaque;
     (void)size;
 
-    /* Dispatch known methods through fe_method */
+    /* Dispatch known methods through fe_method, between two APU frames: the
+     * frame thread holds d->lock for a whole se_frame and updates the same
+     * voice words (envelopes, voice_off, the voice lists), so a method run
+     * from the game thread in the middle of a frame could lose its writes or
+     * the frame's. The lock is recursive (voice_lock takes it again) and
+     * fe_method never waits on a condition under it. */
+    qemu_mutex_lock(&d->lock);
     fe_method(d, (uint32_t)addr, (uint32_t)val);
+    qemu_mutex_unlock(&d->lock);
 }
 
 /* ============================================================
@@ -1303,6 +1312,35 @@ static void voice_process(MCPXAPUState *d,
         }
         g_vl[v].ea = ea_value;
         g_vl[v].rate = dbg->rate;
+    }
+
+    {   /* XBOX_APU_VOICE_WAV=<dir> (diagnostic): each voice's samples
+         * before its volumes, appended to <dir>\voice_NNN.raw (48 kHz, 16-bit
+         * stereo, no header): the sounds of one voice heard apart */
+        static int on = -1;
+        static char dir[512];
+        static FILE *vf[MCPX_HW_MAX_VOICES];
+        if (on < 0) {
+            const char *e = NULL;                       /* no file written */
+            on = e && *e;
+            if (on) snprintf(dir, sizeof dir, "%s", e);
+        }
+        if (on && v < MCPX_HW_MAX_VOICES) {
+            int16_t pcm[NUM_SAMPLES_PER_FRAME * 2];
+            if (!vf[v]) {
+                char path[600];
+                snprintf(path, sizeof path, "%s/voice_%03u.raw", dir, (unsigned)v);
+                vf[v] = fopen(path, "wb");
+            }
+            if (vf[v]) {
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                    float a = clampf(samples[i][0], -1.0f, 1.0f), b = clampf(samples[i][1], -1.0f, 1.0f);
+                    pcm[2 * i] = (int16_t)(a * 32767.0f);
+                    pcm[2 * i + 1] = (int16_t)(b * 32767.0f);
+                }
+                fwrite(pcm, 2, NUM_SAMPLES_PER_FRAME * 2, vf[v]);
+            }
+        }
     }
 
     if (voice_should_mute(v)) return;

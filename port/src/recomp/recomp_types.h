@@ -876,7 +876,7 @@ static inline uint64_t mm_pmaddwd(uint64_t d, uint64_t s) {
                   * (int32_t)(int16_t)(uint16_t)mm_lane_w(s, i * 2 + 0);
         int32_t b = (int32_t)(int16_t)(uint16_t)mm_lane_w(d, i * 2 + 1)
                   * (int32_t)(int16_t)(uint16_t)mm_lane_w(s, i * 2 + 1);
-        r |= (uint64_t)(uint32_t)(a + b) << (i * 32);
+        r |= (uint64_t)((uint32_t)a + (uint32_t)b) << (i * 32); /* wraps like x86 */
     }
     return r;
 }
@@ -972,14 +972,16 @@ static inline uint32_t SUB32_CF(uint32_t a, uint32_t b, int *cf) {
  * Rotation / shift helpers
  * ================================================================ */
 
+/* `val >> (32 - 0)` is undefined in C; masking the second count too gives
+ * the x86 result for a rotate by 0 (val | val) and is still one rol/ror. */
 static inline uint32_t ROL32(uint32_t val, int n) {
     n &= 31;
-    return (val << n) | (val >> (32 - n));
+    return (val << n) | (val >> ((32 - n) & 31));
 }
 
 static inline uint32_t ROR32(uint32_t val, int n) {
     n &= 31;
-    return (val >> n) | (val << (32 - n));
+    return (val >> n) | (val << ((32 - n) & 31));
 }
 
 /* ================================================================

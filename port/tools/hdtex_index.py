@@ -16,13 +16,27 @@ texture of the Xbox disc is matched to a pack file by its picture:
   4. the colour factors (RGB x1 or x2, alpha x1 or x2) that bring the pack file
      back to the Xbox colours are chosen per texture; a pair still more than 25
      levels off after them is the same drawing in other colours: rejected.
+     The race HUD atlases (HUD_ATLASES) have their own measured factors
+     (HUD_FACTORS: the pack's HUD is darker than its 3D, RGB x1.28 alpha x2).
 
 Output, one line per key (sorted, no picture data, only hashes and file names):
-  <fnv64 of the Xbox level-0 bytes> <w>x<h> <rgb factor><alpha factor> <3d|menu> <pack file>
+  <fnv64 of the Xbox level-0 bytes> <w>x<h> <factors> <3d|menu|hud|font> <pack file>
+<factors> = <rgb><alpha> for whole factors ("22", "12"), else <rgb>:<alpha>
+("1.28:2"; a font always "1:<alpha>").
+
+Fonts (FONTS): the game's bitmap fonts (FNTF .ffn) become 4444 textures in
+memory (white, alpha = coverage, padded to a square power of two). The pack
+has the same letters in HD but laid out in another order, so each glyph is
+looked for in the pack's HD atlas (its coverage brought to the Xbox scale)
+and its place written down, in texels, as numbers only:
+  glyph <font key> <x> <y> <w> <h> <hd x> <hd y>
+The game then rebuilds the HD atlas in the Xbox layout; a glyph the pack does
+not have, or not with the same drawing (GLYPH_MAX), keeps the game's own.
 The key is FNV-1a 64 over 8-byte words of the level-0 bytes as the game holds
 them in memory (uncompressed textures in linear and in swizzled order, the
 game swizzles some at load). "menu" = a picture of textures/ (menus,
-interface, loading cards); the game leaves those off unless asked.
+interface, loading cards); the game leaves those off unless asked. "hud" =
+a race HUD atlas (HUD_ATLASES); the game replaces those with the pack.
 
 usage:
   python port/tools/hdtex_index.py --pack <pack folder> --disc <iso or extracted folder>
@@ -40,6 +54,29 @@ THUMB = 16
 MATCH = 0.06          # 1 - correlation under which a pair is the same picture
 COLOUR_MAX = 25.0     # mean error (levels) left after the colour factors
 VERSION = 1
+
+# The race HUD atlases map1 and map4 (bank, texture number; the same pictures
+# in both banks): the pack has them at x4, same drawing, but darker than its
+# other pictures; least squares over their opaque texels gives RGB x1.28-1.30
+# and alpha x1.98, 6 levels off after x1.28 / x2 (x1 or x2 leave them 28-32
+# off). Not hud1 (other buttons and layout on the PS2).
+HUD_ATLASES = {('textures/hudgame.xsh', 0), ('textures/hudgame.xsh', 1),
+               ('textures/hudtrick.xsh', 0), ('textures/hudtrick.xsh', 1)}
+HUD_FACTORS = (1.28, 2)
+
+# Fonts rebuilt from the pack: title.ffn (the race HUD's numbers and words)
+# and menu.ffn (the trick names under the rider, the pause menu). Both serve
+# the menus too: the game shows them in HD during the race only (font gate).
+FONTS = ('fonts/title.ffn', 'fonts/menu.ffn')
+# Edge softening per font, in passes of a [1 2 1] blur at the x2 level (a
+# "fontsoft" line). None: the trick names and prompts (menu.ffn) are drawn as
+# sharp as the rest of the race display (title.ffn). One pass on menu.ffn made
+# them as soft as the game's own 4-bit font at the screen's scale, no sharper
+# than without HD.
+FONT_SOFT = {}
+GLYPH_MAX = 10.0      # mean coverage error (levels) of a glyph at the Xbox scale
+GLYPH_SMALL = (16.0, 0.98)   # small glyphs ('.', '='): error up to 16 if the correlation is >= 0.98
+GLYPH_MARGIN = 2      # transparent texels around a glyph while looking for it
 
 
 # ── disc ─────────────────────────────────────────────────────────────────────
@@ -281,8 +318,11 @@ def thumb(a):
     return np.asarray(im.resize((THUMB, THUMB), Image.BOX), np.uint8)
 
 
-def category(bank):
-    """'menu' for the pictures of textures/, 'skip' for Xbox-only maps, else '3d'."""
+def category(bank, i):
+    """'hud' for the race HUD atlases, 'menu' for the other pictures of textures/,
+    'skip' for Xbox-only maps, else '3d'."""
+    if (bank.lower(), i) in HUD_ATLASES:
+        return 'hud'
     if bank.lower().startswith('textures/'):
         return 'menu'
     m = re.search(r'/(\w+)\.xsh$', bank)
@@ -307,7 +347,7 @@ def disc_textures(disc):
             if a is None or w < 4 or h < 4:
                 continue
             md5 = hashlib.md5(a.tobytes()).hexdigest()
-            c = category(b)
+            c = category(b, i)
             g = groups.get(md5)
             if g is None:                                 # the group's category is its first one's
                 g = groups[md5] = {'thumb': thumb(a), 'names': [], 'keys': [], 'cat': c, 'w': w, 'h': h}
@@ -347,19 +387,177 @@ def feat(t):
     return f / (np.linalg.norm(f, axis=1, keepdims=True) + 1e-3)
 
 
-def colour_factors(xt, pt):
-    """(error, rgb factor, alpha factor) bringing the pack thumbnail closest to the Xbox one."""
-    best = None
+def colour_error(xt, pt, kr, ka):
+    """Mean error (levels, RGB + alpha) of the pack thumbnail scaled by kr / ka against the Xbox one."""
+    q = pt.astype(float)
+    q[..., :3] = np.minimum(q[..., :3] * kr, 255)
+    q[..., 3] = np.minimum(q[..., 3] * ka, 255)
     xt = xt.astype(float)
+    return np.abs(xt[..., :3] - q[..., :3]).mean() + np.abs(xt[..., 3] - q[..., 3]).mean()
+
+
+def colour_factors(xt, pt, cat='3d'):
+    """(error, rgb factor, alpha factor) bringing the pack thumbnail closest to the Xbox one."""
+    if cat == 'hud':
+        return (colour_error(xt, pt, *HUD_FACTORS),) + HUD_FACTORS
+    best = None
     for kr in (1, 2):
         for ka in (1, 2):
-            q = pt.astype(float)
-            q[..., :3] = np.minimum(q[..., :3] * kr, 255)
-            q[..., 3] = np.minimum(q[..., 3] * ka, 255)
-            e = np.abs(xt[..., :3] - q[..., :3]).mean() + np.abs(xt[..., 3] - q[..., 3]).mean()
+            e = colour_error(xt, pt, kr, ka)
             if best is None or e < best[0]:
                 best = (e, kr, ka)
     return best
+
+
+def factors_field(kr, ka):
+    """'22' / '12' for whole factors 1 or 2 (the first index format), else '1.28:2'."""
+    if kr in (1, 2) and ka in (1, 2):
+        return '%d%d' % (kr, ka)
+    return '%s:%s' % tuple(('%.2f' % k).rstrip('0').rstrip('.') for k in (kr, ka))
+
+
+# ── fonts ────────────────────────────────────────────────────────────────────
+
+def ffn_read(d):
+    """(coverage 0..255 (h, w) float32, [(code, gw, gh, gx, gy)]) of an FNTF font."""
+    if d[:4] != b'FNTF':
+        raise ValueError('not FNTF')
+    n, = struct.unpack_from('<H', d, 10)
+    gt, = struct.unpack_from('<I', d, 0x14)
+    at, = struct.unpack_from('<I', d, 0x1c)
+    w, h = struct.unpack_from('<HH', d, at + 4)
+    raw = np.frombuffer(d, np.uint8, w * h // 2, at + 16)
+    a = np.empty(w * h, np.uint8)
+    a[0::2] = raw >> 4                                    # high nibble first
+    a[1::2] = raw & 15
+    glyphs = [struct.unpack_from('<HBBHH', d, gt + i * 12) for i in range(n)]
+    return a.reshape(h, w), glyphs
+
+
+def ffn_key(cov4):
+    """Key of the font as the game holds it: A4R4G4B4, white, alpha = coverage,
+    zero-padded to a square power of two, swizzled."""
+    h, w = cov4.shape
+    t = 1
+    while t < max(w, h):
+        t *= 2
+    T = np.zeros((t, t), np.uint16)
+    T[:h, :w] = (cov4.astype(np.uint16) << 12) | 0x0FFF
+    lin = T.reshape(-1, 1)
+    swz = np.empty_like(lin)
+    swz[morton(t, t).reshape(-1)] = lin
+    return fnv64(swz.astype('<u2').tobytes()), t
+
+
+def ssd_map(img, tpl):
+    """Sum of squared differences of tpl at every place inside img (FFT)."""
+    H, W = img.shape
+    h, w = tpl.shape
+    fs = (H + h, W + w)
+    corr = np.fft.irfft2(np.fft.rfft2(img, fs) * np.fft.rfft2(tpl[::-1, ::-1], fs), fs)[h - 1:H, w - 1:W]
+    c = np.pad(np.cumsum(np.cumsum(img ** 2, 0), 1), ((1, 0), (1, 0)))
+    e = c[h:, w:] - c[:-h, w:] - c[h:, :-w] + c[:-h, :-w]
+    return e - 2 * corr + (tpl ** 2).sum()
+
+
+def font_glyphs(cov, glyphs, alpha, s):
+    """Each glyph of the Xbox atlas `cov` (0..255) in the HD coverage `alpha`
+    (0..255, s times larger): [(gx, gy, gw, gh, hx, hy, err)] of those found.
+    The largest glyphs are placed first and a place of the pack serves one
+    glyph only (a '.' is not taken from the dot of a ':')."""
+    H, W = alpha.shape
+    small = alpha[:H - H % s, :W - W % s].reshape(H // s, s, W // s, s).mean((1, 3))
+    m = GLYPH_MARGIN
+    padded = np.pad(small, m)
+    xp = np.pad(cov, m)
+    taken = np.zeros(small.shape, np.float32)
+    out = []
+    for code, gw, gh, gx, gy in sorted(glyphs, key=lambda g: -g[1] * g[2]):
+        if gw * gh < 4 or gx + gw > cov.shape[1] or gy + gh > cov.shape[0]:
+            continue
+        tpl = xp[gy:gy + gh + 2 * m, gx:gx + gw + 2 * m]
+        if gh + 2 * m > padded.shape[0] or gw + 2 * m > padded.shape[1]:
+            continue
+        ssd = ssd_map(padded, tpl)
+        c = np.pad(np.cumsum(np.cumsum(taken, 0), 1), ((1, 0), (1, 0)))
+        busy = c[gh:, gw:] - c[:-gh, gw:] - c[gh:, :-gw] + c[:-gh, :-gw]      # taken texels under the glyph
+        ssd[:busy.shape[0], :busy.shape[1]][busy > 0] = np.inf
+        y, x = divmod(int(np.argmin(ssd)), ssd.shape[1])
+        g = cov[gy:gy + gh, gx:gx + gw]
+        best = None
+        for dy in range(-s + 1, s):                       # the place at the HD scale
+            for dx in range(-s + 1, s):
+                Y, X = s * y + dy, s * x + dx
+                if Y < 0 or X < 0 or Y + gh * s > H or X + gw * s > W:
+                    continue
+                e = np.abs(alpha[Y:Y + gh * s, X:X + gw * s].reshape(gh, s, gw, s).mean((1, 3)) - g).mean()
+                if best is None or e < best[0]:
+                    best = (e, X, Y)
+        if not best:
+            continue
+        h = alpha[best[2]:best[2] + gh * s, best[1]:best[1] + gw * s].reshape(gh, s, gw, s).mean((1, 3))
+        corr = np.corrcoef(g.ravel(), h.ravel())[0, 1] if g.std() > 0 and h.std() > 0 else 0
+        if best[0] < GLYPH_MAX or (best[0] < GLYPH_SMALL[0] and corr >= GLYPH_SMALL[1]):
+            out.append((gx, gy, gw, gh, best[1], best[2], round(float(best[0]), 1)))
+            taken[best[2] // s:best[2] // s + gh, best[1] // s:best[1] // s + gw] = 1
+    return sorted(out)
+
+
+def pack_header(path):
+    """(w, h) of a DDS file, or None."""
+    try:
+        with open(path, 'rb') as f:
+            d = f.read(32)
+        return struct.unpack_from('<II', d, 12)[::-1] if d[:4] == b'DDS ' else None
+    except OSError:
+        return None
+
+
+def fonts(disc, top, files, pt, ok):
+    """Font lines and glyph lines (see the module's text), and a report."""
+    lines, glines, rep = {}, [], []
+    want = {f: None for f in FONTS}
+    for p, rd in disc_files(disc):
+        if p.lower() in want:
+            want[p.lower()] = rd()
+    t = pt.astype(np.float32)
+    wsum = t[..., 3].sum((1, 2)) + 1e-3
+    mean = (t[..., :3] * t[..., 3:]).sum((1, 2)) / wsum[:, None]
+    cover = (t[..., 3] > 8).mean((1, 2))
+    neutral = (mean.max(1) - mean.min(1) < 8) & (mean.min(1) > 80) & (cover > 0.05) & (cover < 0.7) & ok
+    for name, d in want.items():
+        if d is None:
+            rep.append([name, 'not on the disc']); continue
+        cov4, glyphs = ffn_read(d)
+        cov = cov4.astype(np.float32) * 17
+        key, size = ffn_key(cov4)
+        best = None
+        for i in np.nonzero(neutral)[0]:
+            path = os.path.join(top, files[i])
+            wh = pack_header(path)
+            if not wh or wh[0] != wh[1] or wh[0] % size or wh[0] // size < 2:
+                continue
+            try:
+                a = np.asarray(Image.open(path).convert('RGBA'))[..., 3].astype(np.float32)
+            except Exception:
+                continue
+            if a.max() < 16:
+                continue
+            ka = 255.0 / a.max()
+            found = font_glyphs(cov, glyphs, a * ka, wh[0] // size)
+            if best is None or len(found) > len(best[0]):
+                best = (found, files[i], ka, wh[0])
+        n = sum(1 for g in glyphs if g[1] * g[2] >= 4)
+        if not best or len(best[0]) < n // 2:
+            rep.append([name, 'no HD atlas with its glyphs']); continue
+        found, f, ka, hw = best
+        lines[key] = '%016x %dx%d 1:%s font %s' % (key, size, size, ('%.2f' % ka).rstrip('0').rstrip('.'), f)
+        glines += ['glyph %016x %d %d %d %d %d %d' % ((key,) + g[:6]) for g in found]
+        if FONT_SOFT.get(name):
+            glines.append('fontsoft %016x %d' % (key, FONT_SOFT[name]))
+        rep.append([name, f, '%d / %d glyphs' % (len(found), n), [g for g in glyphs if g[1] * g[2] >= 4 and
+                    not any(g[3] == h[0] and g[4] == h[1] for h in found)]])
+    return lines, sorted(glines), rep
 
 
 def main():
@@ -417,25 +615,35 @@ def main():
         others = [int(k) for k in cand if k != b and 1 - P[k] @ P[b] > MATCH]
         if others:
             report['ambiguous'].append([g['names'][0], files[b], files[others[0]]])
-        err, kr, ka = colour_factors(xt[j], pt[b])
+        err, kr, ka = colour_factors(xt[j], pt[b], cat)
         if err > COLOUR_MAX:
             stats['rejected (colours) ' + cat] += 1
             report['rejected'].append([round(float(err), 1), g['names'][0], files[b]]); continue
         stats['matched ' + cat] += 1
         report['matched'].append([g['names'], files[b], kr, ka, round(float(D[b, j]), 4), round(float(err), 1)])
         for key, w, h, c in g['keys']:
-            line = '%016x %dx%d %d%d %s %s' % (key, w, h, kr, ka, c, files[b])
+            line = '%016x %dx%d %s %s %s' % (key, w, h, factors_field(kr, ka), c, files[b])
             if key in lines and lines[key] != line:
                 report['key_conflicts'].append([lines[key], line]); continue
             lines[key] = line
+
+    flines, glines, frep = fonts(a.disc, top, files, pt, ok)
+    for k, l in flines.items():
+        stats['font'] += 1
+        lines[k] = l
+    report['fonts'] = frep
+    for r in frep:
+        print('  font %s: %s' % (r[0], ' '.join(str(x) for x in r[1:3])))
 
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, 'w', newline='\n') as f:
         f.write('# SSX Tricky HD texture index v%d (port/tools/hdtex_index.py) -- hashes and file names only, no picture\n' % VERSION)
         f.write('# pack: %d .dds files; disc: %d textures in %d banks\n' % (len(files), ntex, nbanks))
-        f.write('# <fnv64 of the Xbox level-0 bytes> <w>x<h> <rgb factor><alpha factor> <3d|menu> <pack file>\n')
+        f.write('# <fnv64 of the Xbox level-0 bytes> <w>x<h> <factors> <3d|menu|hud|font> <pack file>\n')
         for k in sorted(lines):
             f.write(lines[k] + '\n')
+        for l in glines:
+            f.write(l + '\n')
     used = len({l.rsplit(' ', 1)[1] for l in lines.values()})
     print('index: %s -- %d keys, %d pack files used, %d ambiguous, %d key conflicts (%.0f s)' %
           (a.out, len(lines), used, len(report['ambiguous']), len(report['key_conflicts']), time.time() - t0))

@@ -102,4 +102,4 @@ ls "$OUT"
 echo
 echo "Done. Start \"$OUT/OpenTricky.exe\" (the launcher), choose the same disc image"
 echo "(or drop it on its window), then PLAY. \"SSX Tricky.exe\" then starts the game directly."
-echo "This build contains code translated from your copy of the game: please don't share it."
+echo "Please don't share your build: point people to the releases instead."

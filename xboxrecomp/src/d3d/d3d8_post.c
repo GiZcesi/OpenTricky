@@ -13,6 +13,10 @@
 #include <string.h>
 #include "d3d8_post.h"
 #include "d3d8_gpuprof.h"
+#include "d3d8_speedfx.h"
+#include "d3d8_rscale.h"
+#include "d3d8_bloom.h"
+#include "d3d8_temporal.h"
 #include "smaa/AreaTex.h"
 #include "smaa/SearchTex.h"
 
@@ -47,17 +51,23 @@ static void config_read(void)
         const char *e = getenv("XBOX_POST_SPLIT");
         const char *c = getenv("XBOX_POST_CYCLE");
         s_cycle = (c && atoi(c) > 0) ? atoi(c) : 0;
-        /* SMAA implies the split (HUD kept sharp);
+        /* SMAA or the speed effect implies the split (HUD kept sharp);
          * an explicit XBOX_POST_SPLIT=0 turns it off. */
-        InterlockedCompareExchange(&s_split, (e && e[0]) ? (e[0] == '1') : (s_smaa > 0), -1);
+        InterlockedCompareExchange(&s_split, (e && e[0]) ? (e[0] == '1')
+                                   : (s_smaa > 0 || d3d8_speedfx_wanted()), -1);
     }
 }
 
 int d3d8_post_enabled(void)
 {
     config_read();
-    return s_post_on == 1 || s_smaa > 0;
+    return s_post_on == 1 || s_smaa > 0 || d3d8_speedfx_active();
 }
+
+/* Set by the device around the run at the FRAME_END marker: the speed effect
+ * runs there only (the 3D alone), never in the fallback at the present. */
+static int s_in_split;
+void d3d8_post_split_call(int on) { s_in_split = on; }
 
 void d3d8_SetPostProcess(int on) { config_read(); InterlockedExchange(&s_post_on, on ? 1 : 0); }
 int  d3d8_GetPostProcess(void)   { config_read(); return s_post_on == 1; }
@@ -76,6 +86,17 @@ int d3d8_post_split_wanted(void)
 {
     config_read();
     return s_split == 1 || s_cycle > 0;
+}
+
+/* The pass phase callback (d3d8_PassPhaseChanged) is wanted by the post on
+ * the 3D only or its diagnostic cycle, a render scale other than 100 %, the
+ * bloom, the temporal inputs. 0 = every post effect off: the callback is not
+ * registered and the translator draws as the game does. The one place for
+ * this condition: another phase callback chains on it, never copies it. */
+int d3d8_post_wanted(void)
+{
+    return d3d8_post_split_wanted() || d3d8_rscale_wanted() != 100 || d3d8_bloom_wanted() ||
+           d3d8_temporal_wanted();
 }
 
 /* XBOX_POST_CYCLE=N (diagnostic): every N presents the next of three
@@ -299,6 +320,7 @@ static void pass_shaders_release(int src)
 void d3d8_post_release(void)
 {
     targets_release();
+    d3d8_speedfx_release();
     pass_shaders_release(SRC_BASIC);
     pass_shaders_release(SRC_SMAA);
     P.smaa_preset = 0;
@@ -320,8 +342,8 @@ static ID3D10Blob *compile(const char *src, size_t len, const char *name, const 
                            const char *target, const D3D_SHADER_MACRO *defs)
 {
     ID3D10Blob *code = NULL, *err = NULL;
-    if (FAILED(D3DCompile(src, len, name, defs, NULL, entry, target,
-                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
+    if (FAILED(d3d8_shader_compile_logged(src, len, name, defs, entry, target,
+                                          D3DCOMPILE_OPTIMIZATION_LEVEL3, &code, &err))) {
         fprintf(stderr, "[POST] shader %s/%s: %s\n", name, entry,
                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "compile failed");
         if (err) ID3D10Blob_Release(err);
@@ -997,6 +1019,14 @@ int d3d8_post_run(ID3D11Device *dev, ID3D11DeviceContext *ctx,
         ID3D11DeviceContext_Draw(ctx, 3, 0);
         timing_mark(ctx, tq, i);
         if (p->out == OUT_COLOR) {
+            cur = dst;
+            color = P.srv[dst];
+        }
+    }
+    /* The speed blur and the vignette (d3d8_speedfx.h): last, on the 3D only. */
+    if (s_in_split && d3d8_speedfx_active()) {
+        int dst = cur == 0 ? 1 : 0;
+        if (d3d8_speedfx_run(dev, ctx, color, w, h, P.rtv[dst])) {
             cur = dst;
             color = P.srv[dst];
         }

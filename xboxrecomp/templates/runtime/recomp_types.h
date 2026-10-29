@@ -251,14 +251,16 @@ static inline uint32_t SUB32_CF(uint32_t a, uint32_t b, int *cf) {
  * Rotation / shift helpers
  * ================================================================ */
 
+/* `val >> (32 - 0)` is undefined in C; masking the second count too gives
+ * the x86 result for a rotate by 0 (val | val) and is still one rol/ror. */
 static inline uint32_t ROL32(uint32_t val, int n) {
     n &= 31;
-    return (val << n) | (val >> (32 - n));
+    return (val << n) | (val >> ((32 - n) & 31));
 }
 
 static inline uint32_t ROR32(uint32_t val, int n) {
     n &= 31;
-    return (val >> n) | (val << (32 - n));
+    return (val >> n) | (val << ((32 - n) & 31));
 }
 
 /* ================================================================

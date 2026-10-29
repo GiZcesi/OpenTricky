@@ -16,7 +16,7 @@
 
 namespace {
 
-const long long k_cache_max_age_s = 24 * 3600;     /* one check a day at most */
+const long long k_cache_max_age_s = 6 * 3600;      /* one check every 6 hours at most (a click: at once) */
 const char k_cache_magic[] = "OpenTricky update cache 1";
 
 double now_ms() { return (double)SDL_GetTicksNS() / 1e6; }
@@ -171,7 +171,7 @@ bool cache_write(const std::string &file, const Cache &c)
     if (file.empty()) return false;
     std::string t = std::string(k_cache_magic) + "\n";
     t += "# The launcher's last look at the list of OpenTricky releases on GitHub\n";
-    t += "# (one a day at most). Deleting this file is harmless.\n";
+    t += "# (every 6 hours at most, or when Check now is clicked). Deleting this file is harmless.\n";
     t += "time: " + std::to_string(c.time) + "\n";
     if (!c.etag.empty()) t += "etag: " + c.etag + "\n";
     if (!c.skip.empty()) t += "skip: " + c.skip + "\n";
@@ -498,8 +498,15 @@ OtUpdateResult ot_update_check(const OtUpdateRequest &req)
     Cache c;
     bool have = cache_read(req.cache_file, c);
     res.skip = c.skip;
+    /* A cached list that cannot be read (a hand edit, a damaged disk) is as
+     * none: no answer from it, and no ETag that would bring back a 304 for it. */
+    std::vector<OtRelease> cached;
+    if (have && !c.json.empty() && !ot_releases_parse(c.json, cached)) {
+        c.json.clear();
+        c.etag.clear();
+    }
     long long now = (long long)time(nullptr);
-    if (have && !c.json.empty() && c.time <= now && now - c.time < k_cache_max_age_s)
+    if (!req.force && have && !c.json.empty() && c.time <= now && now - c.time < k_cache_max_age_s)
         return done(true, "cache", c.json);
     Http h = https_get(req.url, have ? c.etag : "", req.user_agent, req.timeout_ms, req.allow_loopback_http);
     if (h.status == 304 && have && !c.json.empty()) {

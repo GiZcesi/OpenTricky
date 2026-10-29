@@ -37,6 +37,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Werror=implicit-function-declaration)
 endif()
 
+# The optimisation level comes from the build type (Release: the consuming
+# project's CMAKE_C_FLAGS_RELEASE, -O3 for the game): the libraries below do
+# not force their own, so the runtime and the PFIFO pump are built like the game.
+
 # Option to build examples
 
 # ── Runtime Libraries ─────────────────────────────────────────

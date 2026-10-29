@@ -3,7 +3,8 @@
  *  - textures: files (PNG, through SDL) and pictures made at run time,
  *    named "ot:<name>" in the markup (disc pictures, theme, icons);
  *  - files: read through SDL (UTF-8 paths); style sheets and documents get
- *    the theme's tokens ($acc$, $track$, ...) replaced as they are read;
+ *    the theme's tokens ($acc$, $track$, ...) replaced as they are read, and
+ *    launcher.rcss comes with tokens.rcss (the design tokens) in front;
  *  - icons drawn in code (no picture file needed).
  */
 #ifndef OT_RENDER_H
@@ -43,7 +44,9 @@ public:
 
 class OtFileInterface : public Rml::FileInterface {
 public:
-    /* "$name$" -> value, applied to *.rcss and *.rml files. */
+    /* "$name$" -> value, applied to *.rcss and *.rml files. launcher.rcss
+     * is read with tokens.rcss (beside it) in front: every page that links
+     * the style sheet gets the tokens, with no second link to keep. */
     std::map<std::string, std::string> tokens;
 
     Rml::FileHandle Open(const Rml::String &path) override;
@@ -57,5 +60,7 @@ public:
 /* Sidebar icons, white on transparent, `size` pixels square:
  * "home", "settings", "update", "online", "bug". */
 bool ot_draw_icon(const std::string &name, int size, OtPixels &out);
+/* The panels' chamfer mask (launcher.rcss, @spritesheet chamfer). */
+bool ot_draw_chamfer(OtPixels &out);
 
 #endif /* OT_RENDER_H */

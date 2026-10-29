@@ -56,6 +56,13 @@ void crashreport_private_folder(const char *utf8);
  * the same way. */
 void crashreport_private_file_acp(const char *path);
 
+/* settings.ini text, or one XBOX_* variable (ansi: in the ANSI code page),
+ * with the player's paths and user name hidden as in the reports: a path
+ * value becomes what it is ("<absolute path: folder found>"), other paths
+ * "<path>", the user name '*'. For the screenshots' .txt (hostui.c). Returns
+ * the length written (dst is NUL-terminated). */
+size_t crashreport_private_text(const char *src, size_t n, int ansi, char *dst, size_t cap);
+
 /* From the unhandled exception filter, on the faulting thread. details is a
  * short text block (guest registers...) added to report.txt. Returns 1 and
  * the folder (for the message) when a report was written. */
@@ -73,5 +80,10 @@ void crashreport_crash_dialog(DWORD code, const wchar_t *dir);
 
 /* Opens a report folder in Explorer. */
 void crashreport_open_folder(const wchar_t *dir);
+
+/* The game thread waits on purpose (for instance for other players at a start): nothing new on screen for
+ * that long is not a freeze. The watchdog counts nothing for the next ms milliseconds (bounded: it goes on by
+ * itself past them); 0 = the wait is over, the count starts again from now. Any thread. Unused offline. */
+void crashreport_hold(unsigned ms);
 
 #endif

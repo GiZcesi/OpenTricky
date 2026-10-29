@@ -34,6 +34,11 @@ ID3D11Device        *d3d8_GetD3D11Device(void);
 ID3D11DeviceContext *d3d8_GetD3D11Context(void);
 IDXGISwapChain      *d3d8_GetSwapChain(void);
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
+ID3D11DepthStencilView *d3d8_GetDefaultDSV(void);   /* the scene depth (same size as the RTV) */
+/* An overlay over the presented image, called at each present (pump thread;
+ * NULL: none; d3d8_device.c). */
+void d3d8_SetPresentImageOverlay(int (*fn)(ID3D11Texture2D *img, ID3D11Texture2D **out,
+                                           ID3D11ShaderResourceView **out_srv));
 HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 UINT                 d3d8_GetBackbufferHeight(void);
@@ -131,6 +136,21 @@ void    d3d8_shaders_shutdown(void);
 
 /* Bind shaders + input layout for the given FVF, upload transform CBs */
 void    d3d8_shaders_prepare_draw(DWORD fvf);
+
+/* D3DCompile through the shader disk cache (d3d8_shcompile.c,
+ * XBOX_SHADER_CACHE): same arguments as D3DCompile (no include handler,
+ * second flags 0). *hit (may be NULL) = 1 when the bytecode came from the
+ * cache. The _logged form also writes one [SHC] line per call: for the
+ * layer's own shaders, not for the pump's (counted in the [FPS] lines). */
+HRESULT d3d8_shader_compile(const char *src, SIZE_T len, const char *name,
+                            const D3D_SHADER_MACRO *defs, const char *entry, const char *profile,
+                            UINT flags, ID3DBlob **code, ID3DBlob **err, int *hit);
+HRESULT d3d8_shader_compile_logged(const char *src, SIZE_T len, const char *name,
+                                   const D3D_SHADER_MACRO *defs, const char *entry,
+                                   const char *profile, UINT flags,
+                                   ID3DBlob **code, ID3DBlob **err);
+/* Milliseconds since the process was created (log time stamps). */
+double  d3d8_ms_since_start(void);
 
 /* ================================================================
  * NV2A Register Combiner pixel shaders (d3d8_combiners.c)

@@ -87,6 +87,11 @@
  * in a race. How the panel is found: hud_anchor.c, "Panels edge to edge".
  *   XBOX_FIX_PANEL_EDGES=0  as before (the panels at the 4:3 columns in a
  *                       race, stretched before it) ;
+ *   XBOX_FIX_PANEL_BACKING=0  as before (tests): a panel's quad is read from
+ *                       the first 2D buffer (not from the one its record
+ *                       draws from), and a backing drawn a little inside
+ *                       one end of its panel (the replay's) keeps that side
+ *                       where the title draws it ;
  *   XBOX_PANEL_LOG=1    prints, per list, the panel ends found (tests) ;
  *   XBOX_PANEL_LOG=2    and every record of the lists (the vertices of the
  *                       wide ones), every 300th frame ; 3: and each tag call.
@@ -118,6 +123,11 @@ enum { HUD_SIZE_COUNT = 5 };                /* 100, 90, 85, 80, 70 % */
 #define HUD_TAG_MAGIC_PANEL_R   0x4859u
 #define HUD_PANEL_WIDE_ONLY     0x8000u     /* first tag: wide images only (a race) */
 #define HUD_PANEL_SCALE_ONLY    0x4000u     /* first tag: 4:3 proportions, no edge */
+/* The HD HUD's gate of an image, PGRAPH_HDGATE_TAG_MAGIC there: low bits =
+ * HDTEX_GATE_* of nv2a_hdtex.h (fonts HD, HUD atlases HD). */
+#define HUD_TAG_MAGIC_HDGATE    0x485Au
+#define HUD_HDGATE_FONT         0x1u
+#define HUD_HDGATE_HUD          0x2u
 
 extern int g_hud_anchor_on;
 extern int g_box_on;                        /* wider than 16:9: menus framed */
@@ -139,6 +149,14 @@ void hud_anchor_set(double shape, int mode, int size);
 uint32_t hud_anchor_tag(uint32_t obj, uint32_t view, uint32_t *tag_y);
 /* At each H1: the frame tag to write after FRAME_BEGIN (0 = none). */
 uint32_t hud_anchor_frame(void);
+/* At each H1, with the HD HUD: the image's HD gate bits (HUD_HDGATE_*). */
+uint32_t hud_anchor_hd_gate(void);
+/* The block of 0xC44E0 that draws the Tricky gauge starts (1) / ends (0):
+ * called by the generated code (port/tools/fork/fix_hudgauge.py). */
+void hud_anchor_gauge(int begin);
+/* The riders' last answer from the game's gameplay gate 0xAB170: the last
+ * tick left the race frozen (pause, blocking overlay). Game thread. */
+int hud_anchor_tick_frozen(void);
 void (*hud_anchor_lookup(unsigned int xbox_va))(void);
 
 #endif

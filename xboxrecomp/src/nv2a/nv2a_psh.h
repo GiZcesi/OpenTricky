@@ -33,6 +33,28 @@ typedef struct {
     uint8_t  window_clip;            /* 0 off, 1 inclusive, 2 exclusive (SET_WINDOW_CLIP_*) */
     uint8_t  flat;                   /* 1: return c0[8] (overlay of a substituted draw, debug views) */
     uint8_t  alpha_t0z;              /* 1: alpha = oT0.z (blend overlay of a substituted draw) */
+    uint8_t  relief_off;             /* 0..100: how much of the dot3 normal-map relief is removed (XBOX_SNOW_RELIEF) */
+    uint8_t  relief_show;            /* XBOX_SNOW_RELIEF_SHOW (diagnostic): 1 colour, 2 colour x lightmap, 3 normal map, 4 lightmap,
+                                      * 5 relief weight, 6 view depth, 7 lit colour before its clamp (halved) */
+    /* XBOX_SNOW_LOOK (the terrain's dot3 program only; all 0 = the original
+     * shader, unchanged): 1 mixed, 2 PS2-like. */
+    uint8_t  snow_look;
+    uint8_t  snow_relief;            /* relief kept near the camera, percent (0 in PS2-like) */
+    uint8_t  snow_expo;              /* exposure: slope above the pivot, percent */
+    uint8_t  snow_pivot;             /* below it (percent of white) the lit snow is left as it was */
+    uint8_t  snow_knee;              /* tone shoulder start, percent of white */
+    uint16_t snow_fade[2];           /* view depth (w) where the relief starts to fade / is gone */
+    /* XBOX_LIGHTMAP_FILTER (the terrain program only, and only when its t1 is
+     * a bilinear 128 x 128 atlas): 0 the title's bilinear read, 1 bounded
+     * Catmull-Rom, 2 cubic B-spline, 5 B-spline from texel loads (diagnostic).
+     * Placed in the struct's tail padding, so
+     * 0 hashes as before (same shader keys). */
+    uint8_t  lm_filter;
+    /* The Time Challenge ghost (d3d8_ghost_ps; 0 otherwise, in the struct's
+     * tail padding: other shaders keep their key). Bits 0-1 the mode, 2-7
+     * the opacity o in 63rds: 1 alpha x o, 2 alpha = 1 - o x (1 - alpha),
+     * 3 as 1 and what is behind its depth pre-pass (t12) dropped. */
+    uint8_t  ghost;
 } Nv2aPshState;
 
 /* Pixel-shader constant buffer; matches the cbuffer the generator emits. */

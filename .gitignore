@@ -64,3 +64,9 @@ Thumbs.db
 # never a private key in git
 *.pem
 *.key
+
+# The HD HUD files the release ships beside the game: never in git.
+hd-hud/
+*.dds
+# The launcher pictures of the HD HUD line show its art: shipped from outside git too.
+port/launcher/app/ui/previews/HdHud-*.png

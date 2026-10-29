@@ -1,12 +1,15 @@
 /*
  * ot_update.h -- "is there a newer OpenTricky?": the launcher reads the list
  * of releases of the project on GitHub (HTTPS, the system's WinHTTP), at
- * most once a day, in a thread of its own, and never installs anything.
+ * most every 6 hours or when the player clicks Check now, in a thread of its
+ * own, and never installs anything.
  *
  *  - ot_update_check() runs in a worker thread: it reads the cache file
  *    (beside settings.ini), asks api.github.com only when the cache is older
- *    than a day (If-None-Match with the cached ETag), and gives back the
- *    releases. Nothing about the player is sent: one GET, a User-Agent with
+ *    than 6 hours or the player asked (If-None-Match with the cached ETag),
+ *    and gives back the releases. The cache file's format is the one of
+ *    0.1.3 (a launcher of 0.1.3 reads it, with its own day). Nothing
+ *    about the player is sent: one GET, a User-Agent with
  *    the launcher's version, no cookie.
  *  - ot_update_pick() chooses the release a channel follows:
  *      Stable   = the newest release that is not a pre-release; when there is
@@ -73,6 +76,7 @@ struct OtUpdateRequest {
     std::string user_agent;
     int timeout_ms = 3000;
     bool allow_loopback_http = false;   /* tests: a local fake GitHub */
+    bool force = false;                 /* the player's Check now: the cache's age is not looked at (its ETag still is) */
 };
 struct OtUpdateResult {
     bool ok = false;            /* a list of releases was read */

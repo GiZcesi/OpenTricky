@@ -31,10 +31,8 @@
  * anything touching guest state has to say g_esp explicitly. */
 #include "recomp/recomp_types.h"
 #include "pass_tags.h"
-#include "netplay/np_cmdlog.h"
-#include "netplay/np_ghost.h"
 #include "netplay/np_net.h"
-#include "netplay/np_racebench.h"
+#include "pumplag.h"
 #include "fps_cap.h"
 #include "aspect.h"
 #include "drawdist.h"
@@ -42,12 +40,13 @@
 #include "fullfade.h"
 #include "ps2legend.h"
 #include "ctlscheme.h"
-#include "pumplag.h"
 #include "strmwalk.h"
 #include "chantfix.h"
-#include "ticktrace.h"
+#include "riderlod.h"
+#include "shadowvb.h"
 #include "../../xboxrecomp/src/kernel/xbox_perf.h"
 extern void (*perf_lookup(unsigned int xbox_va))(void);
+extern void (*frame_clock_lookup(unsigned int xbox_va))(void);
 
 /* Per-thread SSE / MMX register files (see recomp_types.h). */
 __thread recomp_xmm_t g_xmm[8];
@@ -199,7 +198,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 
     /* Display shapes wider than 16:9 -- only then is the hook on
      * Renderer_SetScreenMode handed out (see aspect.h). */
-    if (g_aspect_hook_on) {
+    if (g_aspect_hook_on || aspect_cam_hooks()) {     /* fork: also the camera's own FOV / distance */
         recomp_func_t fn = aspect_lookup(xbox_va);
         if (fn) return fn;
     }
@@ -260,28 +259,37 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
         if (fn) return fn;
     }
 
-    /* Rider command log, only when XBOX_NETLOG=1 -- off, the
-     * original path is untouched (see netplay/np_cmdlog.h). */
-    if (g_np_cmdlog_on || g_np_ghost_on || g_np_net_on || g_np_rb_on || g_np_stuck_on) {
-        recomp_func_t fn = np_cmdlog_lookup(xbox_va);
+    /* Riders always drawn with their most detailed model set
+     * (XBOX_RIDER_LOD_MAX, default 1; see riderlod.h). */
+    {
+        recomp_func_t fn = riderlod_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
+    /* Rider parts: a part whose vertex buffers the full game arena refuses
+     * is not drawn, instead of sharing a slot and writing past it
+     * (XBOX_FIX_SHADOWVB, default 1; see shadowvb.h). */
+    {
+        recomp_func_t fn = shadowvb_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
+
+    /* The title's frame timer callback on an exact 60 Hz grid
+     * (frame_clock.h). Off (XBOX_FRAME_CLOCK=0): none is handed out. */
+    {
+        recomp_func_t fn = frame_clock_lookup(xbox_va);
         if (fn) return fn;
     }
 
     /* Frame profile by zones (XBOX_PERF=1) -- first: its hooks
-     * time the call and chain to ticktrace / fps_cap themselves. Off, none
-     * is handed out. */
+     * time the call and chain to the next hooks themselves. Off, none is
+     * handed out. */
     if (g_perf_on) {
         recomp_func_t fn = perf_lookup(xbox_va);
         if (fn) return fn;
     }
 
-    /* Per-tick trace (XBOX_TICKTRACE=1) -- before fps_cap: its
-     * tick hook does not overlap the cap's hooks. Off, none is handed out
-     * (the RNG hook routed from direct calls by pass 13 is a pass-through). */
-    if (g_ticktrace_on) {
-        recomp_func_t fn = ticktrace_lookup(xbox_va);
-        if (fn) return fn;
-    }
 
     /* Host frame cap (XBOX_FPS_CAP != 60) -- renders without a
      * tick while the main loop waits for its frame event. At the default
@@ -383,6 +391,14 @@ static uint32_t g_icall_miss_hits[ICALL_MISS_LOG_CAP];
 static uint32_t g_icall_miss_prev[ICALL_MISS_LOG_CAP];
 static int g_icall_miss_count = 0;
 
+/* The miss and debug-break tables are filled by every guest thread: a test
+ * then an append without a lock could write one entry past a full table.
+ * One small lock for all of them (misses are a slow path already); nothing
+ * is printed while it is held. */
+static volatile LONG g_log_spin;
+static void log_lock(void)   { while (InterlockedCompareExchange(&g_log_spin, 1, 0) != 0) Sleep(0); }
+static void log_unlock(void) { InterlockedExchange(&g_log_spin, 0); }
+
 /*
  * Report unresolved targets by hit rate since the previous report.
  *
@@ -454,7 +470,7 @@ static void icall_site_report(void)
         fprintf(stderr, "[ICALL-MISS]   (no sites recorded)\n");
 }
 
-void recomp_icall_miss_report(void)
+static void icall_miss_report_locked(void)
 {
     int i;
     unsigned long long total = 0;
@@ -474,19 +490,14 @@ void recomp_icall_miss_report(void)
     fflush(stderr);
 }
 
-
-/*
- * Copy the deduped unresolved-target list, in first-seen order. Used by the
- * live diagnostics server (xbox_diag) so the list can be read while the title
- * is still running, instead of having to scrape stderr afterwards.
- */
-int recomp_icall_miss_list(uint32_t *out, int max)
+void recomp_icall_miss_report(void)
 {
-    int n = g_icall_miss_count;
-    if (n > max) n = max;
-    for (int i = 0; i < n; i++) out[i] = g_icall_miss_seen[i];
-    return n;
+    log_lock();
+    icall_miss_report_locked();
+    log_unlock();
 }
+
+
 
 /* Kept so anything still calling the old name compiles; the site-aware
  * form below is what the RECOMP_ICALL macros now use. */
@@ -497,6 +508,8 @@ void recomp_icall_miss_log_once(uint32_t va)
 
 void recomp_icall_miss_log_at(uint32_t va, const char *file, int line)
 {
+    int count;
+    log_lock();
     icall_site_count(va, file, line);
     for (int i = 0; i < g_icall_miss_count; i++) {
         if (g_icall_miss_seen[i] == va) {
@@ -505,8 +518,9 @@ void recomp_icall_miss_log_at(uint32_t va, const char *file, int line)
                 static DWORD last = 0;
                 DWORD now = GetTickCount();
                 if (last == 0) last = now;
-                if (now - last >= 3000) { last = now; recomp_icall_miss_report(); }
+                if (now - last >= 3000) { last = now; icall_miss_report_locked(); }
             }
+            log_unlock();
             return;                      /* already logged */
         }
     }
@@ -514,6 +528,8 @@ void recomp_icall_miss_log_at(uint32_t va, const char *file, int line)
         g_icall_miss_hits[g_icall_miss_count] = 1;
         g_icall_miss_seen[g_icall_miss_count++] = va;
     }
+    count = g_icall_miss_count;
+    log_unlock();
     {
         /* Only the basename is useful -- the generated files all sit in one
          * directory, and the full build path swamps the line. */
@@ -521,7 +537,7 @@ void recomp_icall_miss_log_at(uint32_t va, const char *file, int line)
         if (base) { const char *p;
             for (p = file; *p; p++) if (*p == 47 || *p == 92) base = p + 1; }
         fprintf(stderr, "[ICALL-MISS] unresolved target 0x%08X (new, #%d) from %s:%d\n",
-                va, g_icall_miss_count, base ? base : "?", line);
+                va, count, base ? base : "?", line);
     }
 #ifdef _WIN32
     /*
@@ -578,12 +594,16 @@ static int g_debugbreak_count = 0;
 
 void recomp_debugbreak_log_once(const char *site)
 {
+    int count;
+    log_lock();
     for (int i = 0; i < g_debugbreak_count; i++) {
-        if (g_debugbreak_seen[i] == site) return; /* already logged (same __FILE__:__LINE__ literal) */
+        if (g_debugbreak_seen[i] == site) { log_unlock(); return; } /* already logged (same __FILE__:__LINE__ literal) */
     }
     if (g_debugbreak_count < DEBUGBREAK_LOG_CAP) {
         g_debugbreak_seen[g_debugbreak_count++] = site;
     }
-    fprintf(stderr, "[INT3] hit original debug-break at %s (new, #%d) -- continuing\n", site, g_debugbreak_count);
+    count = g_debugbreak_count;
+    log_unlock();
+    fprintf(stderr, "[INT3] hit original debug-break at %s (new, #%d) -- continuing\n", site, count);
     fflush(stderr);
 }

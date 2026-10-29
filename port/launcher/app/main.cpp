@@ -13,7 +13,7 @@
  * the launcher hides while the game runs and comes back when it ends, with
  * the crash screen if the game left a report (CrashReports\).
  * "Skip launcher next time" starts the game at once; holding Shift (or
- * Select on a controller) while the launcher starts shows it anyway.
+ * Back / Select on a controller) while the launcher starts shows it anyway.
  *
  * Command line (all optional; the test options are for the project's tools):
  *   --iso <path>        disc image (else the one in settings.ini)
@@ -24,18 +24,28 @@
  *   --no-skip           ignore "Skip launcher next time"
  *   --crash-test <dir>  show the crash screen for this report folder at start
  *   --report-dir <dir>  bug report zips there instead of the Desktop (with a trailing slash)
+ *   --find-root <dir>   Find my disc image also looks there, as beside the launcher (tests)
  *   --script <steps>    test steps, comma separated, one every few frames:
  *                       k:<key> (up down left right enter esc tab q e backspace
  *                       space f10 f11 f12 or a letter / digit), p:<button> (a b x y lb rb up down
  *                       left right start back; pushed as SDL controller events),
  *                       click:<id> (an element of the page or dialog),
  *                       mclick:<x>:<y> (the mouse at window pixels, logged;
- *                       mhover:<x>:<y> the same without the click),
- *                       shot:<file.png> (the window's picture), wait:<frames>,
- *                       disc:<path> (as if chosen; empty: none),
+ *                       mhover:<x>:<y> the same without the click, mdown:<x>:<y>
+ *                       the button held down: the pressed look),
+ *                       shot:<file.png> (the window's picture), boxes:<file> (with the
+ *                       next shot, the layout: save_boxes), wait:<frames>,
+ *                       size:<w>x<h> (the window resized, as by a drag),
+ *                       disc:<path> (as if chosen; empty: none), drop:<path> (as if
+ *                       dropped on the window), focus (the window's focus back
+ *                       from another program), find (the list
+ *                       of Find my disc image, without the file dialog),
  *                       waitgame (until the game has ended), quit
  *   --log <file>        messages and timings to a file
  *   --quit-after <ms>   close after this long (idle measurements)
+ *
+ * One launcher per install folder: a second one brings the first to the
+ * front and ends at once with exit code 3 (instance_lock).
  */
 #include <RmlUi/Core.h>
 #include <SDL3/SDL.h>
@@ -47,6 +57,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -63,6 +74,8 @@
 #include "RmlUi_Platform_SDL.h"
 #include "RmlUi_Renderer_GL3.h"
 #include "ot_render.h"
+/* The default font engine's handle (its glyphs: the capitals' height, layout_tokens). */
+#include "../../third_party/rmlui/Source/Core/FontEngineDefault/FontFaceHandleDefault.h"
 #include "ot_util.h"
 #include "ot_update.h"
 #include "ot_install.h"
@@ -119,6 +132,30 @@ double ms_since_process_start()
 /* The last lines, for a bug report (the launcher has no console). */
 std::deque<std::string> g_log_ring;
 
+/* A page a build adds to the launcher besides Home and Settings (none in this tree): every hook is optional,
+ * nullptr = nothing. The page's own file fills the table before main() runs. */
+struct OtPages {
+    bool (*owns)(const std::string &page);                 /* the page is its own */
+    Rml::ElementDocument *(*doc)();                        /* its document, nullptr when not loaded */
+    void (*load_documents)();
+    bool (*show_page)(const std::string &page);            /* true: shown by it (the others hidden) */
+    bool (*nav)(int n);                                    /* a move on its page; true: taken */
+    void (*primary)();                                     /* START on its page */
+    bool (*typing)();                                      /* a text field of its page has the keys */
+    void (*play_env)(SDL_Environment *env);                /* the game's environment when it starts it */
+    void (*game_ended)(int code);
+    void (*poll)();                                        /* each frame */
+    void (*tick_hidden)();                                 /* each loop while the game runs */
+    bool (*arg)(const std::string &a, const std::function<std::string()> &next);   /* a command-line option */
+    int  (*texture)(const std::string &name, OtPixels &out);   /* -1: not its picture, else 0 / 1 */
+    bool (*script_hold)();                                 /* test scripts: the next step waits */
+    bool (*script_step)(const std::string &a, const std::string &b);   /* a test step of its own */
+    void (*bind)(Rml::DataModelConstructor &c);            /* its variables in the data model */
+    void (*log_line)(const char *line);                    /* each log line */
+    void (*shutdown)();
+};
+OtPages g_pages;
+
 void otlog(const char *fmt, ...)
 {
     char buf[2048];
@@ -130,12 +167,22 @@ void otlog(const char *fmt, ...)
     fflush(stderr);
     g_log_ring.push_back(buf);
     if (g_log_ring.size() > 400) g_log_ring.pop_front();
+    if (g_pages.log_line) g_pages.log_line(buf);
 }
 
 std::string hex_rgb(uint32_t argb)
 {
     char b[16];
     snprintf(b, sizeof b, "#%06x", argb & 0xFFFFFFu);
+    return b;
+}
+
+/* A colour pressed: its channels at 0.82 (the launcher's pressed fill). */
+std::string pressed_rgb(uint32_t argb)
+{
+    auto k = [&](int sh) { return (unsigned)std::lround(((argb >> sh) & 255) * 0.82f); };
+    char b[16];
+    snprintf(b, sizeof b, "#%02x%02x%02x", k(16), k(8), k(0));
     return b;
 }
 
@@ -171,14 +218,15 @@ bool ends_with_ci(const std::string &s, const char *suf)
 
 /* Launcher actions shown as rows of the settings page (not settings). */
 enum {
-    A_OPEN_LOGS = 1000, A_BUG_REPORT, A_ABOUT, A_RESTORE,
+    A_OPEN_LOGS = 1000, A_BUG_REPORT, A_ABOUT, A_RESTORE, A_CHECK_UPDATES,
 };
 
 struct Row {
     int id = -1;
     bool is_group = false;
     Rml::String label, value, button;
-    bool pc = false, changed = false, pending = false;
+    bool changed = false, pending = false;
+    bool idle = false;                /* its button has nothing to do for now (dimmed, inert) */
     bool arrows = false, toggle = false, on = false, plain = false;
     Rml::String note;                 /* a short line under the row (empty: none) */
 };
@@ -194,6 +242,12 @@ struct CtlRow {
 struct NoteSec {
     Rml::String name;
     std::vector<Rml::String> items;
+};
+
+/* A disc image found on this computer (Find my disc image). */
+struct DiscFound {
+    Rml::String name, dir, path;
+    bool cur = false;                 /* the one chosen now */
 };
 
 struct App {
@@ -230,13 +284,20 @@ struct App {
      * the Button style, or with Auto the type of the controller in use. */
     int hint_style = 0;
     bool pad_is_ps = false;           /* the last controller pressed is a PlayStation one */
-    Rml::String help_title, help_text, help_default, help_extra, saved_note;
+    Rml::String help_title, help_text, help_extra, saved_note;
+    Rml::String prev_src;             /* the help panel's picture of the value ("ot:prev/..."; empty: none) */
+    Rml::String prev_old;             /* the picture it replaces, under it while it fades in (empty: none) */
+    Rml::String prev_label;           /* the value the picture shows, written on it */
     Rml::String ini_note;             /* above the rows: settings.ini was not read as written (empty: it was) */
     bool deck_note = false;           /* ini_note says "Steam Deck detected": until the settings page is left or saved */
-    bool help_pc = false, help_pending = false, pad_active = false, have_disc = false;
+    bool help_pending = false, pad_active = false, have_disc = false;
     Rml::String disc_state, disc_title, disc_note, track_name, version_text;
+    Rml::String ver_num, ver_note;    /* the version label: "v0.1.4" and its state word (Latest, Available, ...) */
     /* the home page's disc panel (no good disc image) */
     Rml::String disc_kicker, disc_head, disc_text, disc_path, disc_drop1, disc_drop2;
+    std::vector<DiscFound> disc_found;   /* the list of the "discs" dialog */
+    bool disc_auto = false;           /* chosen at start: the only one beside the launcher */
+    std::string find_root;            /* --find-root (tests): searched as if beside the launcher */
 
     /* What's new */
     Rml::String notes_version, notes_title;
@@ -247,16 +308,26 @@ struct App {
     Rml::String upd_state;            /* "" = the version alone, "latest", "update" */
     bool upd_view = false;            /* the panel shows the newer version's notes */
     bool upd_have = false;            /* a list of releases was read in time */
-    bool upd_started = false;         /* one check per start at most */
+    bool upd_started = false;         /* one automatic check per start at most */
+    bool upd_manual = false;          /* the player clicked Check now: its answer shows, even with Never */
+    bool upd_error = false;           /* the player's last Check now got no answer */
+    double upd_fail_until = 0;        /* now_ms(): until then the pill says "Couldn't check" (a Check now with no answer) */
+    double upd_last_click = -1e9;     /* now_ms() of the last Check now */
     std::vector<OtRelease> upd_releases;
     std::string upd_skip, upd_url, upd_tag, upd_cache;
+    std::string theme_order;       /* theme-order.txt, beside settings.ini (theme_next_track) */
     std::string upd_test_json, upd_test_url;
     /* the "update" dialog (install / restore) */
     Rml::String inst_kick, inst_head, inst_text, inst_phase, inst_s1, inst_s2, inst_s3, inst_l1, inst_l3, inst_foot;
     Rml::String inst_bar = "0%";
-    std::string inst_test_fail_at;
+    bool inst_cancel = false;         /* the dialog shows Cancel: an update not at its step 3 yet */
+    bool inst_busy = false;           /* an update or a restore runs: the version label shows its step and bar */
+    Rml::String inst_word;            /* that step, in a word */
+    std::string inst_test_fail_at, inst_test_kill_at;
     std::string started_after;        /* "--updated <v>" / "--restored <v>": a notice once shown */
     bool started_restored = false;
+    bool recovered = false;
+    bool save_warned = false;         /* PLAY said once that settings.ini could not be written */           /* an interrupted install was found at start: the notice is ready */
     double upd_t0 = 0;
 
     /* dialogs */
@@ -279,7 +350,9 @@ struct App {
     std::string page = "home";
     bool focus_first_row = false;
     bool kbd_nav = false;          /* the last input was the keyboard (pad_active: a controller) */
+    bool mouse_click = false;      /* the click being handled comes from the mouse (not Enter / A / a test's click:) */
     float stage_w = 1280;
+    bool rescaled = false;         /* the window's scale changed: texts are sized again (fit_window) */
 
     /* game process */
     SDL_Process *game = nullptr;
@@ -291,7 +364,9 @@ struct App {
     std::vector<std::string> script;
     size_t script_pos = 0;
     int script_wait = 0;
+    int games_started = 0;                       /* test step waitrace */
     std::string shot_pending;
+    std::string boxes_pending;   /* test: the layout written with the next shot (save_boxes) */
     bool quit = false;
 };
 
@@ -299,6 +374,8 @@ App g;
 
 void rebuild_rows();
 void update_help(int id);
+void update_preview(int id);
+Rml::ElementDocument *page_doc();
 void show_modal(const char *name);
 void close_modal();
 void load_disc();
@@ -422,16 +499,25 @@ SDL_EnumerationResult SDLCALL list_folders(void *out, const char *dirname, const
     return v->size() < 32 ? SDL_ENUM_CONTINUE : SDL_ENUM_SUCCESS;
 }
 
+/* The last answer of hd_pack_found, for its folder. What the folder holds can
+ * change while the launcher is open (the pack unzipped into it after it was
+ * chosen, in another program): the answer is forgotten whenever the window
+ * gets the focus back (hd_pack_forget), and looked for again. */
+struct {
+    std::string folder;
+    bool found = false, known = false;
+} g_hd_pack;
+
+void hd_pack_forget() { g_hd_pack.known = false; }
+
 /* Whether the HD pack folder holds a pack: .dds files in it, or in a
  * "replacements" folder in it or up to two folders below it -- where the
  * pack's archive puts them and the game looks (nv2a_hdtex.c, find_pack_dir;
  * the game then also checks the names). A relative path is relative to the
- * game's folder. Kept for the same folder. */
+ * game's folder. Kept for the same folder until hd_pack_forget. */
 bool hd_pack_found(const std::string &folder)
 {
-    static std::string s_folder;
-    static bool s_found = false;
-    if (folder == s_folder) return s_found;
+    if (g_hd_pack.known && folder == g_hd_pack.folder) return g_hd_pack.found;
     std::string d = folder;
     bool absolute = d.size() > 1 && (d[1] == ':' || d[0] == '/' || d[0] == '\\');
     if (!absolute) d = g.base + d;
@@ -447,8 +533,9 @@ bool hd_pack_found(const std::string &folder)
             for (const std::string &f : level) SDL_EnumerateDirectory(f.c_str(), list_folders, &next);
         level.swap(next);
     }
-    s_folder = folder;
-    s_found = found;
+    g_hd_pack.folder = folder;
+    g_hd_pack.found = found;
+    g_hd_pack.known = true;
     return found;
 }
 
@@ -470,11 +557,13 @@ std::string row_note(int id)
         if (std::fabs(picture_aspect() - (double)mw / mh) < 0.1) return "";
         return "Your screen is " + screen_size_text() + ": black bars around the picture.";
     }
+    case S_SHADOW_SOFTNESS:
+        return settings_get_bool(g.set, S_SOFT_SHADOWS) ? "" : "No effect with Soft shadows off.";
     case S_MENUS: {
         double a = picture_aspect();
         if (a <= 4.0 / 3.0 + 0.005) return "No effect at 4:3.";
         if (settings_choice_index(g.set, S_MENUS) == 1 && a < 16.0 / 9.0 - 0.005)
-            return "Xbox 16:9 menus need a 16:9 or wider screen: here they are squeezed.";
+            return "Squeezed on this screen.";
         return "";
     }
     case S_FOV:
@@ -495,15 +584,23 @@ std::string row_note(int id)
         if (settings_get_bool(g.set, S_SHOW_FPS) && fullscreen_mode())
             return "Not seen in fullscreen: the title bar shows only in a window.";
         return "";
+    case S_HD_HUD:
+        /* the files the game ships (nv2a_hdtex.c, "The shipped HD HUD"); the game
+         * also checks each one and keeps the original HUD for a damaged one */
+        if (!settings_get_bool(g.set, S_HD_HUD)) return "";
+        for (const char *f : { "map1.dds", "map4.dds", "title.dds", "menu.dds" })
+            if (!SDL_GetPathInfo((g.prog + "hd-hud/" + f).c_str(), nullptr))
+                return "The HD HUD files are missing: the original display is shown.";
+        return "";
     case S_HD_TEXTURES: {
-        if (!settings_get_bool(g.set, S_HD_TEXTURES)) return "";
+        if (settings_choice_index(g.set, S_HD_TEXTURES) <= 0) return "";
         const char *dir = settings_get(g.set, S_HD_PACK_FOLDER);
-        if (!*dir) return "No HD pack folder chosen: HD textures stay off.";
-        if (!hd_pack_found(dir)) return "No HD pack found in this folder: HD textures stay off.";
+        if (!*dir) return "Choose an HD pack folder.";
+        if (!hd_pack_found(dir)) return "No HD pack in this folder.";
         return "";
     }
     case S_UPDATE_CHANNEL:
-        return SDL_strcasecmp(settings_get(g.set, S_CHECK_UPDATES), "never") == 0 ? "No effect while updates are off." : "";
+        return SDL_strcasecmp(settings_get(g.set, S_CHECK_UPDATES), "never") == 0 ? "Applies to Check now only." : "";
     default: return "";
     }
 }
@@ -514,15 +611,14 @@ std::string ini_note_text(int status, int bad)
 {
     switch (status) {
     case SETTINGS_LOAD_NOT_V1:
-        return "settings.ini has no [Meta] Version line: it was not read, and the next save replaces it.";
+        return "Your settings file couldn't be read. Defaults are used until you save.";
     case SETTINGS_LOAD_NEWER:
-        return "settings.ini comes from a newer version: the settings this one doesn't know are kept as they are.";
+        return "Settings from a newer OpenTricky: unknown ones are kept.";
     case SETTINGS_LOAD_ERROR:
-        return "settings.ini could not be read: the defaults are used.";
+        return "Your settings file couldn't be read. Defaults are used.";
     case SETTINGS_LOAD_OK:
         if (bad <= 0) return "";
-        return std::to_string(bad) + (bad == 1 ? " line of settings.ini was" : " lines of settings.ini were") +
-               " not understood and " + (bad == 1 ? "is" : "are") + " not used: " + g.set->ignored + ".";
+        return "Some settings couldn't be read and use their default.";
     default: return "";
     }
 }
@@ -541,7 +637,7 @@ void first_start_preset()
     }
     settings_apply_preset(g.set, SETTINGS_PRESET_STEAM_DECK);
     otlog("settings: first start on a Steam Deck (%s): Steam Deck preset", why);
-    g.ini_note = "Steam Deck detected: Steam Deck preset.";
+    g.ini_note = "Steam Deck preset applied.";
     g.deck_note = true;
 }
 
@@ -620,8 +716,14 @@ std::string value_label(int id)
 
 void update_settings_changed();
 void update_action(const std::string &a);
+void update_start(bool manual = false);
+std::string update_row_value();
+std::string update_row_button(bool *idle);
+bool update_just_checked();
+void update_row_refresh();
 void install_start(bool restore);
 bool install_running();
+bool install_cancel();
 
 void settings_changed(int id)
 {
@@ -701,15 +803,75 @@ void deck_note_seen()
     if (g.model) g.model.DirtyVariable("ini_note");
 }
 
+/* The theme's track. Plain chance came back to the same colours (three
+ * tracks are orange), so the ten tracks are dealt like a shuffled playlist:
+ * all ten before any comes back, never the same one twice in a row, nor two
+ * close colours one after the other (the oranges: Alaska, Mesablanca,
+ * Untracked; the blues: Garibaldi, Merqury City). theme-order.txt, beside
+ * settings.ini, holds the last one shown, then what is left of the deal
+ * ("3;7,1,..."); an unreadable file is a new deal. A folder that can't be
+ * written: a plain draw at each start. */
+int theme_group(int t)
+{
+    if (t == OT_TRACK_ALAS || t == OT_TRACK_MESA || t == OT_TRACK_UNTR) return 1;
+    if (t == OT_TRACK_GARI || t == OT_TRACK_MERQ) return 2;
+    return 0;
+}
+
+bool theme_close(int a, int b) { return a == b || (theme_group(a) && theme_group(a) == theme_group(b)); }
+
+int theme_next_track()
+{
+    std::mt19937 rng(std::random_device{}());
+    std::vector<int> nums;
+    std::string order;          /* through SDL's file calls: the path is UTF-8, any folder name works */
+    if (!g.theme_order.empty() && ot_read_file(g.theme_order, order, 4096)) {
+        int v = -1;
+        for (size_t i = 0; i < order.size() && nums.size() < 2 * OT_TRACK_COUNT; i++) {
+            char c = order[i];
+            if (c >= '0' && c <= '9') v = std::min((v < 0 ? 0 : v * 10) + (c - '0'), 1000);
+            else if (v >= 0) { nums.push_back(v); v = -1; }
+        }
+        if (v >= 0 && nums.size() < 2 * OT_TRACK_COUNT) nums.push_back(v);
+    }
+    int last = nums.empty() || nums[0] >= OT_TRACK_COUNT ? -1 : nums[0];
+    std::vector<int> bag(nums.size() > 1 ? nums.begin() + 1 : nums.end(), nums.end());
+    bool seen[OT_TRACK_COUNT] = {};
+    for (int t : bag) {
+        if (t >= OT_TRACK_COUNT || seen[t] || t == last) { bag.clear(); break; }
+        seen[t] = true;
+    }
+    if (bag.empty()) {
+        for (int t = 0; t < OT_TRACK_COUNT; t++) bag.push_back(t);
+        for (int tries = 0; tries < 500; tries++) {   /* about one deal in four fits: never 500 misses */
+            std::shuffle(bag.begin(), bag.end(), rng);
+            bool ok = last < 0 || !theme_close(bag[0], last);
+            for (size_t i = 1; ok && i < bag.size(); i++) ok = !theme_close(bag[i - 1], bag[i]);
+            if (ok) break;
+        }
+    }
+    int t = bag.front();
+    bag.erase(bag.begin());
+    std::string line = std::to_string(t) + ";";
+    for (size_t i = 0; i < bag.size(); i++) line += (i ? "," : "") + std::to_string(bag[i]);
+    line += '\n';
+    bool kept = !g.theme_order.empty() && SDL_SaveFile(g.theme_order.c_str(), line.data(), line.size());
+    if (!kept) t = (int)(rng() % OT_TRACK_COUNT);   /* nothing remembered: a plain draw */
+    otlog("theme: track %d (%s)", t, kept ? "theme-order.txt" : "a plain draw");
+    return t;
+}
+
 void set_disc(const std::string &path)
 {
+    g.disc_auto = false;
     settings_set(g.set, S_DISC_IMAGE, path.c_str());
     g.iso = path;
     load_disc();
     /* No verified disc any more: drop every picture made from the previous
      * one (cards, emblems) from the texture cache too, not only from view. */
     if (!g.have_assets) Rml::ReleaseTextures();
-    if (g.have_assets) g.track = (int)(std::random_device{}() % OT_TRACK_COUNT);
+    if (g.have_assets) g.track = theme_next_track();
+    update_preview(g.focus_id);       /* a setting's picture only with a verified disc */
     pick_theme();
     save_settings_file();             /* the launcher remembers the disc at once */
     rebuild_rows();
@@ -764,6 +926,151 @@ void choose_path(int id)
     } else if (settings_def(id)->type == SETTING_PATH) {
         SDL_ShowOpenFolderDialog(done, nullptr, g.window, nullptr, false);
     }
+}
+
+/* ── Find my disc image ──────────────────────────────────────────── */
+
+OtDiscCheck disc_check(const std::string &iso, bool *other_build, bool *bad_path);
+
+/* The .iso / .xiso files under `dir` (with its trailing separator), `depth`
+ * folder levels deep (0: that folder only), dot folders skipped; `seen`
+ * caps the entries looked at. */
+void find_iso_files(const std::string &dir, int depth, int &seen, std::vector<std::string> &out)
+{
+    struct Ctx {
+        int depth, *seen;
+        std::vector<std::string> *out, sub;
+    } c{ depth, &seen, &out, {} };
+    SDL_EnumerateDirectory(dir.c_str(), [](void *u, const char *d, const char *name) -> SDL_EnumerationResult {
+        Ctx *c = (Ctx *)u;
+        if (++*c->seen > 20000 || c->out->size() >= 64) return SDL_ENUM_SUCCESS;
+        if (name[0] == '.' || name[0] == '$') return SDL_ENUM_CONTINUE;
+        std::string p = std::string(d) + name;
+        SDL_PathInfo pi;
+        if (!SDL_GetPathInfo(p.c_str(), &pi)) return SDL_ENUM_CONTINUE;
+        if (pi.type == SDL_PATHTYPE_DIRECTORY && c->depth > 0) c->sub.push_back(p + "\\");
+        else if (pi.type == SDL_PATHTYPE_FILE && (ends_with_ci(p, ".iso") || ends_with_ci(p, ".xiso"))) c->out->push_back(p);
+        return SDL_ENUM_CONTINUE;
+    }, &c);
+    for (const std::string &sd : c.sub) find_iso_files(sd, depth - 1, seen, out);
+}
+
+/* Under Wine (Proton, a Steam Deck), the Linux side through Z:\: each home
+ * folder, and the SD cards and USB drives under /run/media. */
+void wine_roots(std::vector<std::pair<std::string, int>> &roots)
+{
+    SettingsPlatform p;
+    settings_platform_probe(&p, nullptr);
+    if (!p.wine) return;
+    for (const char *top : { "Z:\\home\\", "Z:\\run\\media\\" }) {
+        struct Ctx {
+            int depth;
+            std::vector<std::pair<std::string, int>> *roots;
+        } c{ top[3] == 'h' ? 2 : 3, &roots };   /* /home/deck/...; /run/media/deck/<card>/... or /run/media/<card>/... */
+        SDL_EnumerateDirectory(top, [](void *u, const char *d, const char *name) -> SDL_EnumerationResult {
+            Ctx *c = (Ctx *)u;
+            if (name[0] != '.') c->roots->push_back({ std::string(d) + name + "\\", c->depth });
+            return SDL_ENUM_CONTINUE;
+        }, &c);
+    }
+}
+
+/* The SSX Tricky (USA) disc images on this computer that the game can open,
+ * checked as a chosen one is (disc_check): beside the launcher (and one
+ * folder down), in Downloads, Desktop and Documents (two folders down), and
+ * under Wine in the Linux home folders and on the SD card. `beside_only`:
+ * beside the launcher only (the choice at start). */
+std::vector<DiscFound> find_discs(bool beside_only)
+{
+    double t0 = now_ms();
+    std::vector<std::pair<std::string, int>> roots = { { g.base, 1 } };
+    if (!g.find_root.empty()) roots.push_back({ g.find_root, 1 });    /* tests */
+    if (!beside_only) {
+        for (SDL_Folder f : { SDL_FOLDER_DOWNLOADS, SDL_FOLDER_DESKTOP, SDL_FOLDER_DOCUMENTS })
+            if (const char *p = SDL_GetUserFolder(f)) roots.push_back({ p, 2 });
+        wine_roots(roots);
+    }
+    std::vector<std::string> files, keys;
+    int seen = 0, wrong = 0;
+    for (const auto &r : roots) find_iso_files(r.first, r.second, seen, files);
+    std::vector<DiscFound> out;
+    auto path_key = [](std::string k) {          /* one spelling of a path: lower case, backslashes */
+        for (char &ch : k) ch = ch == '/' ? '\\' : (char)tolower((unsigned char)ch);
+        return k;
+    };
+    const std::string cur = path_key(g.iso);
+    for (const std::string &f : files) {
+        std::string key = path_key(f);
+        if (std::find(keys.begin(), keys.end(), key) != keys.end()) continue;   /* a folder reached twice */
+        keys.push_back(key);
+        if (out.size() >= 8) break;                /* what the dialog shows */
+        if (disc_check(f, nullptr, nullptr).status != OT_DISC_OK) { wrong++; continue; }
+        DiscFound d;
+        d.path = f;
+        d.name = ot_file_name(f);
+        d.dir = ot_dir_of(f);
+        d.cur = key == cur;
+        out.push_back(d);
+    }
+    otlog("find discs: %d folder(s), %d entries, %d .iso, %d SSX Tricky (USA), %d other (%.1f ms)", (int)roots.size(), seen,
+          (int)keys.size(), (int)out.size(), wrong, now_ms() - t0);
+    return out;
+}
+
+/* The disc pill and the disc panel: the disc images found, as buttons (a
+ * controller is enough), or the file dialog at once when none is found.
+ * Browse... in the list opens the file dialog. */
+void choose_disc()
+{
+    g.disc_found = find_discs(false);
+    if (g.disc_found.empty()) {
+        choose_path(S_DISC_IMAGE);
+        return;
+    }
+    g.model.DirtyVariable("disc_found");
+    show_modal("discs");
+}
+
+/* No disc image chosen yet, and one only beside the launcher (a player who
+ * put it next to OpenTricky): that one, remembered as a chosen one. */
+void auto_pick_disc()
+{
+    std::vector<DiscFound> d = find_discs(true);
+    if (d.size() != 1) return;
+    g.iso = d[0].path;
+    settings_set(g.set, S_DISC_IMAGE, g.iso.c_str());
+    g.disc_auto = true;
+    otlog("disc: none chosen yet, the only one beside the launcher is taken: %s", d[0].name.c_str());
+}
+
+/* A file dropped on the window: a disc image is taken as if chosen. Another
+ * file (often the archive the disc image came in) is said, over the page or
+ * the Find my disc image list (which invites the drop), never over another
+ * dialog; the disc image chosen before stays. */
+void file_dropped(const std::string &path)
+{
+    if (ends_with_ci(path, ".iso") || ends_with_ci(path, ".xiso")) {
+        otlog("disc image dropped");
+        set_disc(path);
+        return;
+    }
+    otlog("dropped: %s is not a disc image (.iso, .xiso)", ot_file_name(path).c_str());
+    if (!g.modal.empty() && g.modal != "discs") return;
+    g.notice_kick = "DISC IMAGE";
+    g.notice_head = "THIS ISN'T A DISC IMAGE";
+    g.notice_text = "OpenTricky needs the disc image file itself (.iso or .xiso). If it is inside an archive "
+                    "(.zip, .7z, .rar), extract it first, then drop the file you get.";
+    g.notice_file = "";
+    show_modal("notice");
+}
+
+/* The window has the focus again, back from another program (where the HD
+ * pack may have been unzipped meanwhile): the rows' notes that read the disk
+ * are worked out again. */
+void focus_back()
+{
+    hd_pack_forget();
+    if (g.page == "settings") rebuild_rows();
 }
 
 /* ── Controls ────────────────────────────────────────────────────── */
@@ -908,6 +1215,11 @@ void ctl_changed()
     settings_changed(g.focus_id);
 }
 
+/* A controller binding being captured: every button of the controller is a
+ * binding, so none of them can cancel; after this long the capture cancels
+ * itself (Esc and the dialog's buttons cancel at once). */
+const int k_pad_capture_s = 8;
+
 void capture_start(int k, int col)
 {
     if (k < 0 || k >= SETTINGS_KEY_CONTROLS || (col == 1 && k >= SETTINGS_PAD_CONTROLS)) return;
@@ -916,8 +1228,11 @@ void capture_start(int k, int col)
     g.cap_kind = col == 0 ? "CONTROLS \xC2\xB7 KEYBOARD" : "CONTROLS \xC2\xB7 CONTROLLER";
     g.cap_for = settings_def(S_KEY_FIRST + k)->label;
     g.cap_now = col == 0 ? settings_get(g.set, ctl_id(k, 0)) : pad_label(settings_get(g.set, ctl_id(k, 1)));
-    g.cap_hint = col == 0 ? "Press the new key" : "Press the new button or trigger";
-    g.cap_until = col == 1 ? now_ms() + 8000 : 0;   /* every button is a binding: a timeout cancels */
+    /* A keyboard key: the title says it, a refusal goes here. A controller
+     * button: how to cancel, since no button of the controller can. */
+    g.cap_hint = col == 1 ? "Any controller button you press is taken. To cancel, press Esc or wait " + std::to_string(k_pad_capture_s) + " s."
+                          : "";
+    g.cap_until = col == 1 ? now_ms() + k_pad_capture_s * 1000.0 : 0;
     show_modal("capture");
 }
 
@@ -931,7 +1246,7 @@ std::string capture_refusal(int k, int col, const std::string &value)
     if (col != 0) return "";
     /* the game window's own keys: they would do both things at once */
     if (value == "F10" || value == "F11" || value == "F12")
-        return "F10, F11 and F12 are kept by the game window (F11: full screen, F12: screenshot): press another key.";
+        return "F10 to F12 are used by the game. Press another key.";
     auto essential = [](int c) { return c == k_ctl_cross || c == k_ctl_start; };
     if (SDL_strcasecmp(value.c_str(), "None") == 0)
         return essential(k) ? std::string(settings_def(S_KEY_FIRST + k)->label) + " needs a key: press one, or Esc to keep it."
@@ -1031,7 +1346,6 @@ void rebuild_rows()
         Row r;
         r.id = id;
         r.label = d->label;
-        r.pc = (d->flags & SETTING_PC) != 0;
         r.pending = (d->flags & SETTING_PENDING) != 0;
         r.changed = !settings_is_default(g.set, id);
         if (d->type == SETTING_BOOL) {
@@ -1047,12 +1361,13 @@ void rebuild_rows()
         r.note = row_note(id);
         g.rows.push_back(r);
         if (id == S_UPDATE_CHANNEL) {
+            { bool idle; add_action_row(A_CHECK_UPDATES, "Updates", update_row_value().c_str(), update_row_button(&idle).c_str()); g.rows.back().idle = idle; }
             std::string v;
             if (ot_install_has_backup(g.base, v)) add_action_row(A_RESTORE, "Previous version", ("v" + v).c_str(), "Restore");
         }
         if (id == S_LOG_FILE) {
-            add_action_row(A_OPEN_LOGS, "Logs", nullptr, "Open logs");
-            add_action_row(A_BUG_REPORT, "Bug report", nullptr, "Prepare a bug report\xE2\x80\xA6");
+            add_action_row(A_OPEN_LOGS, "Logs", nullptr, "Open");
+            add_action_row(A_BUG_REPORT, "Bug report", nullptr, "Prepare\xE2\x80\xA6");
             Row h;
             h.is_group = true;
             h.label = "ABOUT";
@@ -1067,86 +1382,167 @@ void rebuild_rows()
     }
 }
 
-void set_help(const char *title, const std::string &text, const std::string &def, const std::string &extra)
+void set_help(const char *title, const std::string &text, const std::string &extra)
 {
     g.help_title = title;
     g.help_text = text;
-    g.help_default = def;
     g.help_extra = extra;
-    g.help_pc = false;
     g.help_pending = false;
 }
 
 void dirty_help()
 {
     if (!g.model) return;
-    for (const char *v : { "help_title", "help_text", "help_default", "help_pc", "help_extra", "help_pending" })
+    for (const char *v : { "help_title", "help_text", "help_extra", "help_pending", "prev_src",
+                           "prev_old", "prev_label" })
         g.model.DirtyVariable(v);
+}
+
+/* ── Setting previews ──
+ * A picture at the top of the help panel that shows the chosen value of a
+ * graphics setting: ui/previews/<Key>-<value>.png (PNG, 688 x 388). Same
+ * rule as the HD cards: only with a verified disc image, read when shown;
+ * without it there is no picture and no empty place. A value without its
+ * own picture shows the nearest value's, and none at all shows nothing. */
+const int k_preview_ids[] = { S_RENDER_SCALE, S_TEX_FILTER, S_SMAA, S_SOFT_SHADOWS, S_SHADOW_SOFTNESS, S_DRAW_DISTANCE,
+                              S_LIGHTMAP_SMOOTH, S_SNOW_LOOK, S_HD_HUD };
+
+bool previews_allowed() { return g.have_assets && g.disc.status == OT_DISC_OK; }
+
+std::string preview_path(const std::string &name)
+{
+    return g.prog + "ui/previews/" + name + ".png";
+}
+
+/* "<Key>-<value>" for setting id at its current value, or "" (no picture);
+ * label: the shown value's name, as the row writes it. */
+std::string preview_name(int id, std::string *label = nullptr)
+{
+    if (!previews_allowed() || std::find(std::begin(k_preview_ids), std::end(k_preview_ids), id) == std::end(k_preview_ids))
+        return "";
+    const SettingDef *d = settings_def(id);
+    std::vector<std::string> tokens, labels;
+    int cur = -1;
+    if (d->type == SETTING_BOOL) {
+        tokens = { "0", "1" };
+        labels = { "Off", "On" };
+        cur = settings_get_bool(g.set, id) ? 1 : 0;
+    } else if (d->type == SETTING_CHOICE) {
+        for (int i = 0; i < d->nchoices; i++) {
+            tokens.push_back(d->choices[i].token);
+            labels.push_back(d->choices[i].label);
+        }
+        cur = settings_choice_index(g.set, id);
+    }
+    if (cur < 0) return "";
+    int n = (int)tokens.size();
+    for (int dist = 0; dist < n; dist++)
+        for (int side : { 1, -1 }) {
+            int j = cur + side * dist;
+            if (j < 0 || j >= n || (dist == 0 && side < 0)) continue;
+            std::string name = std::string(d->key) + "-" + tokens[j];
+            if (SDL_GetPathInfo(preview_path(name).c_str(), nullptr)) {
+                if (label) *label = labels[j];
+                return name;
+            }
+        }
+    return "";
+}
+
+/* A preview's pixels, for make_texture ("prev/<Key>-<value>"). */
+bool load_preview(const std::string &name, int w, int h, OtPixels &out)
+{
+    if (!previews_allowed() || name.empty() ||
+        name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-.") != std::string::npos ||
+        name.find("..") != std::string::npos)
+        return false;
+    SDL_Surface *s = SDL_LoadPNG(preview_path(name).c_str());
+    if (!s) return false;
+    SDL_Surface *c = SDL_ConvertSurface(s, SDL_PIXELFORMAT_ARGB8888);   /* = OtImage's 0xAARRGGBB */
+    SDL_DestroySurface(s);
+    if (!c) return false;
+    OtImage im{}, at{};
+    bool ok = ot_image_alloc(&im, c->w, c->h);
+    for (int y = 0; ok && y < c->h; y++)
+        memcpy(&im.px[(size_t)y * c->w], (unsigned char *)c->pixels + (size_t)y * c->pitch, (size_t)c->w * 4);
+    SDL_DestroySurface(c);
+    if (!ok) return false;
+    /* at the size it is drawn (a Lanczos filter), else as it is */
+    if (w > 0 && h > 0 && (w != im.w || h != im.h) && ot_image_resize(&im, w, h, &at)) {
+        ot_image_free(&im);
+        im = at;
+    }
+    image_to_pixels(im, out);
+    ot_image_free(&im);
+    return true;
+}
+
+/* A new picture fades in over the one it replaces (a short cross-fade, as
+ * soon as the value changes); one appearing on its own is shown at once. */
+void update_preview(int id)
+{
+    std::string label, name = preview_name(id, &label);
+    Rml::String src = name.empty() ? "" : "ot:prev/" + name;
+    if (src == g.prev_src) return;
+    g.prev_old = (!src.empty() && !g.prev_src.empty()) ? g.prev_src : "";
+    g.prev_src = src;
+    g.prev_label = label;
+    Rml::ElementDocument *d = page_doc();
+    Rml::Element *e = d ? d->GetElementById("prevnew") : nullptr;
+    if (e && !g.prev_old.empty()) {
+        const Rml::Property from(0.0f, Rml::Unit::NUMBER);
+        e->Animate("opacity", Rml::Property(1.0f, Rml::Unit::NUMBER), 0.18f,
+                   Rml::Tween{Rml::Tween::Quadratic, Rml::Tween::Out}, 1, false, 0.0f, &from);
+    }
 }
 
 void update_help(int id)
 {
     g.focus_id = id;
+    update_preview(id);
     if (id >= 2000 && id < 2000 + 2 * SETTINGS_KEY_CONTROLS) {     /* a cell of the remapping table */
         int k = (id - 2000) / 2, col = (id - 2000) % 2;
-        const SettingDef *d = settings_def(ctl_id(k, col));
-        std::string now = col == 0 ? settings_get(g.set, ctl_id(k, 0)) : pad_label(settings_get(g.set, ctl_id(k, 1)));
-        std::string def = col == 0 ? d->def : pad_label(d->def);
         set_help(settings_def(S_KEY_FIRST + k)->label,
-                 std::string(col == 0 ? "Keyboard: " : "Controller: ") + now +
-                     ". Select it (Enter or A), then press the new " + (col == 0 ? "key" : "button") +
-                     ". Esc cancels; Backspace clears.",
-                 def, k >= 12 && k <= 19 && col == 0 ? "The D-pad and the left stick may share a key." : "");
+                 std::string("Select it, then press the new ") + (col == 0 ? "key" : "button") + ". Esc cancels, Backspace clears.",
+                 k >= 12 && k <= 19 && col == 0 ? "The D-pad and the left stick may share a key." : "");
         dirty_help();
         return;
     }
     switch (id) {
     case A_OPEN_LOGS:
-        set_help("Logs", "Opens the folder of SSX Tricky.log, the game's log file (when Log file is on), and the launcher's settings.ini.", "", "");
+        set_help("Logs", "Opens the folder with the game's log and your settings file.", "");
         dirty_help();
         return;
     case A_BUG_REPORT:
-        set_help("Bug report", "Makes a zip on your Desktop with the logs, your settings and the last crash report, never your disc image or your saves. Nothing is sent automatically: attach it to a GitHub issue if you want.", "", "");
+        set_help("Bug report", "Saves a zip on your Desktop with the logs, your settings and the last crash report. Nothing is sent. Attach it to a GitHub issue.", "");
+        dirty_help();
+        return;
+    case A_CHECK_UPDATES:
+        set_help("Updates", "Looks for a new version now (Check now), even when automatic checks are off.", "");
         dirty_help();
         return;
     case A_RESTORE:
-        set_help("Restore previous version", "Puts back the version that was installed before the last update (kept in the old folder). Your settings and saves stay.", "", "");
+        set_help("Restore previous version", "Puts back the version you had before the last update. Your settings and saves stay.", "");
         dirty_help();
         return;
     case A_ABOUT:
-        set_help("About OpenTricky", "Credits, version and the licences of the libraries and fonts the launcher uses.", "", "");
+        set_help("About OpenTricky", "The version and credits, and the licences of OpenTricky and of the third-party code in the launcher and the game.", "");
         dirty_help();
         return;
     default: break;
     }
-    if (id < 0 || id >= SETTINGS_COUNT) return;
+    if (id < 0 || id >= SETTINGS_COUNT) { dirty_help(); return; }
     const SettingDef *d = settings_def(id);
     g.help_title = d->label;
     g.help_text = d->help ? d->help : "";
-    std::string def;
-    if (d->type == SETTING_CHOICE) {
-        for (int i = 0; i < d->nchoices; i++)
-            if (SDL_strcasecmp(d->choices[i].token, d->def) == 0) def = d->choices[i].label;
-    } else if (d->type == SETTING_BOOL) {
-        def = strcmp(d->def, "1") == 0 ? "On" : "Off";
-    } else if (d->type == SETTING_RESOLUTION) {
-        def = SDL_strcasecmp(d->def, "auto") == 0 ? "Auto" : d->def;
-    } else if (id == S_MONITOR) {
-        def = "1 (the main screen)";
-    } else {
-        def = *d->def ? d->def : (id == S_SAVE_FOLDER ? "automatic" : "empty");
-    }
-    g.help_default = def;
-    g.help_pc = (d->flags & SETTING_PC) != 0;
     g.help_pending = (d->flags & SETTING_PENDING) != 0;
     g.help_extra = "";
     if (id == S_HD_TEXTURES || id == S_HD_PACK_FOLDER) g.help_extra = "HD textures by Bl4ckH4nd (not included).";
     if (id == S_CHECK_UPDATES || id == S_UPDATE_CHANNEL)
-        g.help_extra = "The launcher contacts GitHub (api.github.com) at most once a day for the list of OpenTricky releases. "
-                       "Nothing about you or your game is sent, and nothing is installed without your click.";
+        g.help_extra = "Nothing about you is sent.";
     if (id == S_SAVE_PROFILE)
-        g.help_extra = "Back on My save, your own progress is there as you left it. Nothing is copied between the two saves.";
-    if (id == S_SKIP_LAUNCHER) g.help_extra = "To see the launcher again, hold Shift (or Select on a controller) while it starts.";
+        g.help_extra = "Your own save is never changed.";
+    if (id == S_SKIP_LAUNCHER) g.help_extra = "To see the launcher again, hold Shift (or the Back / Select button on a controller) while it starts.";
     if (id == S_DISC_IMAGE || id == S_HD_PACK_FOLDER || id == S_SAVE_FOLDER) {
         const char *v = settings_get(g.set, id);
         if (*v) g.help_extra = (g.help_extra.empty() ? "" : g.help_extra + " ") + "Now: " + v;
@@ -1171,6 +1567,9 @@ void apply_theme_tokens()
     g.files.tokens["$acc$"] = hex_rgb(t.acc);
     g.files.tokens["$acc_dark$"] = hex_rgb(t.acc_dark);
     g.files.tokens["$acc_light$"] = hex_rgb(t.acc_light);
+    g.files.tokens["$acc_press$"] = pressed_rgb(t.acc);
+    g.files.tokens["$acc_dark_press$"] = pressed_rgb(t.acc_dark);
+    g.files.tokens["$acc_light_press$"] = pressed_rgb(t.acc_light);
     g.files.tokens["$acc_soft$"] = rgba(t.acc, 0.16f);
     g.files.tokens["$acc_line$"] = rgba(t.acc, 0.55f);
     g.files.tokens["$glow$"] = rgba(t.acc, 0.40f);
@@ -1191,6 +1590,56 @@ void pick_theme()
     apply_theme_tokens();
 }
 
+/* The size in pixels an "ot:" picture is drawn at: the box of a picture element
+ * that shows it, in the pages loaded. False when none shows it, or before its
+ * first layout (RmlUi asks for a picture's size while laying it out: it is then
+ * made at its own size, and again at the drawn size by fit_sized_pictures). */
+bool drawn_size(const std::string &src, int &w, int &h)
+{
+    Rml::ElementDocument *docs[] = { g.home, g.settings, g.dialog, g_pages.doc ? g_pages.doc() : nullptr };
+    for (Rml::ElementDocument *d : docs) {
+        if (!d) continue;
+        Rml::ElementList list;
+        d->GetElementsByTagName(list, "img");
+        for (Rml::Element *e : list) {
+            if (e->GetAttribute<Rml::String>("src", "") != src) continue;
+            Rml::Vector2f z = e->GetBox().GetSize(Rml::BoxArea::Content);
+            w = (int)std::lround(z.x);
+            h = (int)std::lround(z.y);
+            if (w > 0 && h > 0) return true;
+        }
+    }
+    return false;
+}
+
+/* The pictures made at the size they are drawn (make_texture): made again at a new scale. */
+bool sized_picture(const std::string &name)
+{
+    return !name.compare(0, 5, "icon/") || !name.compare(0, 7, "emblem/") || !name.compare(0, 6, "badge/") ||
+           name == "otbadge" || !name.compare(0, 5, "prev/");
+}
+
+/* After each layout: a picture made at its drawn size whose box is not that
+ * size (its first layout, a new scale) is let go, and made again at the next
+ * draw, at the box's size (within a pixel: the card's height follows its width). */
+void fit_sized_pictures()
+{
+    Rml::ElementDocument *docs[] = { g.home, g.settings, g.dialog, g_pages.doc ? g_pages.doc() : nullptr };
+    for (Rml::ElementDocument *d : docs) {
+        if (!d || !d->IsVisible()) continue;
+        Rml::ElementList list;
+        d->GetElementsByTagName(list, "img");
+        for (Rml::Element *e : list) {
+            Rml::String src = e->GetAttribute<Rml::String>("src", "");
+            if (src.compare(0, 3, "ot:") != 0 || !sized_picture(src.substr(3))) continue;
+            Rml::Vector2f z = e->GetBox().GetSize(Rml::BoxArea::Content), t;
+            float ratio = 0;
+            if (z.x < 1 || z.y < 1 || !e->GetIntrinsicDimensions(t, ratio) || t.x < 1) continue;
+            if (std::fabs(t.x - std::round(z.x)) > 1 || std::fabs(t.y - std::round(z.y)) > 1) Rml::ReleaseTexture(src);
+        }
+    }
+}
+
 bool make_texture(const std::string &name, OtPixels &out)
 {
     /* Names carry the track ("emblem/7") so a new track never reuses a picture. */
@@ -1198,21 +1647,43 @@ bool make_texture(const std::string &name, OtPixels &out)
     int track = name.find('/') != std::string::npos ? atoi(name.c_str() + name.find('/') + 1) : g.track;
     OtImage im{};
     bool ok = false;
-    if (kind == "icon") return ot_draw_icon(name.substr(5), 48, out);
+    if (g_pages.texture) {                      /* a picture of an extra page */
+        int r = g_pages.texture(name, out);
+        if (r >= 0) return r > 0;
+    }
+    /* The emblem, the What's new card, the badge without a disc, the line icons and
+     * a setting's picture are made at the size they are drawn, in pixels: never
+     * scaled down by the graphics card (stair-stepped round edges, soft strokes). */
+    int dw = 0, dh = 0;
+    bool sized = sized_picture(name) && drawn_size("ot:" + name, dw, dh);
+    if (kind == "icon") return ot_draw_icon(name.substr(5), sized ? dw : 48, out);
+    if (kind == "chamfer") return ot_draw_chamfer(out);
+    if (kind == "prev") return load_preview(name.substr(5), sized ? dw : 0, sized ? dh : 0, out);
     if (kind == "bg") {
         OtTheme t;
         if (g.have_assets) ot_theme_for_track(&g.assets, track, true, &t);
         else ot_theme_default(&t);
         ok = ot_theme_background(&t, 640, 400, &im);
     } else if (kind == "otbadge") {
-        ok = ot_badge_ot(96, &im);
+        ok = ot_badge_ot(sized ? dw : 96, &im);
     } else if (g.have_assets && track >= 0 && track < OT_TRACK_COUNT) {
         /* The shipped HD card when it was read (verified disc only, see
          * load_hd_cards), else the disc's own card, smoothed and scaled up. */
         const OtImage *hd = g.hd_card[track].px ? &g.hd_card[track] : nullptr;
-        if (kind == "emblem") ok = hd ? ot_card_emblem(hd, &im) : ot_image_copy(&g.assets.emblem[track], &im);
-        else if (kind == "badge") ok = hd ? ot_badge_make(hd, 0, OT_CARD_HD_W, &im) : ot_badge_from_disc(&g.assets, track, 1040, &im);
-        else if (kind == "carpet") ok = hd ? ot_badge_make(hd, 0, 400, &im) : ot_badge_from_disc(&g.assets, track, 400, &im);
+        if (kind == "emblem") {
+            ok = hd ? ot_card_emblem(hd, &im) : ot_image_copy(&g.assets.emblem[track], &im);
+            OtImage at{};
+            if (ok && sized && (dw != im.w || dh != im.h) && ot_image_resize(&im, dw, dh, &at)) {
+                ot_image_free(&im);
+                im = at;
+            }
+        } else if (kind == "badge") {
+            int w = sized ? dw : OT_CARD_HD_W;
+            ok = hd ? ot_badge_make(hd, 0, w, &im) : ot_badge_from_disc(&g.assets, track, w, &im);
+        } else if (kind == "carpet") {
+            /* the background's cards: turned, blurred and half seen, at one size (mipmaps) */
+            ok = hd ? ot_badge_make(hd, 0, 400, &im) : ot_badge_from_disc(&g.assets, track, 400, &im);
+        }
     }
     if (!ok) return false;
     image_to_pixels(im, out);
@@ -1259,26 +1730,54 @@ void load_hd_cards()
  * XBE's entry point must also be the one SSX Tricky.exe was recompiled from,
  * so a disc image the game would refuse is never shown as verified, and
  * Skip launcher never starts the game with it. `other_build`: the title and
- * region are right, the executable on the disc is not that one. */
-OtDiscCheck disc_check(const std::string &iso, bool *other_build = nullptr)
+ * region are right, the executable on the disc is not that one. `bad_path`:
+ * the right disc, at a path the game cannot open (game_can_open). */
+bool game_can_open(const std::string &u8);
+OtDiscCheck disc_check(const std::string &iso, bool *other_build = nullptr, bool *bad_path = nullptr)
 {
     OtDiscCheck d = iso.empty() ? OtDiscCheck{ OT_DISC_NO_PATH } : ot_disc_check(iso.c_str());
     bool other = d.status == OT_DISC_OK &&
                  ot_disc_check_entry(iso.c_str(), OT_SSX_TRICKY_USA_ENTRY).status != OT_DISC_OK;
     if (other) d.status = OT_DISC_WRONG;
     if (other_build) *other_build = other;
+    bool path = d.status == OT_DISC_OK && !game_can_open(iso);
+    if (path) d.status = OT_DISC_WRONG;
+    if (bad_path) *bad_path = path;
     return d;
+}
+
+/* The game opens the disc image through the ANSI API (port/src/launcher.c,
+ * u8_to_path / to_path): a path outside the system's code page needs its
+ * short 8.3 form (often missing on other drives), and the whole path must fit
+ * in MAX_PATH. The same test here, so the launcher never calls verified a
+ * disc image the game will refuse. A UTF-8 system code page is not judged. */
+bool game_can_open(const std::string &u8)
+{
+#ifdef _WIN32
+    if (u8.empty() || GetACP() == CP_UTF8) return true;
+    wchar_t w[MAX_PATH], sh[MAX_PATH];
+    char out[MAX_PATH];
+    BOOL lossy = FALSE;
+    if (!MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, w, MAX_PATH)) return false;
+    if (WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w, -1, out, MAX_PATH, nullptr, &lossy) && !lossy) return true;
+    lossy = FALSE;
+    return GetShortPathNameW(w, sh, MAX_PATH) &&
+           WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, sh, -1, out, MAX_PATH, nullptr, &lossy) && !lossy;
+#else
+    (void)u8;
+    return true;
+#endif
 }
 
 void load_disc()
 {
-    bool other_build = false;
+    bool other_build = false, bad_path = false;
     free_hd_cards();
     if (g.have_assets) {
         ot_disc_free(&g.assets);
         g.have_assets = false;
     }
-    g.disc = disc_check(g.iso, &other_build);
+    g.disc = disc_check(g.iso, &other_build, &bad_path);
     if (g.disc.status == OT_DISC_OK) {
         double t0 = now_ms();
         g.have_assets = ot_disc_load(g.iso.c_str(), &g.assets);
@@ -1289,45 +1788,311 @@ void load_disc()
     g.disc_path = g.iso;
     switch (g.disc.status) {
     case OT_DISC_OK:
-        g.disc_state = "ok"; g.disc_title = "SSX Tricky (USA)"; g.disc_note = "disc verified";
+        g.disc_state = "ok"; g.disc_title = "SSX Tricky (USA)";
+        g.disc_note = "disc verified";
         break;
     case OT_DISC_NO_PATH:
         g.disc_state = "warn"; g.disc_title = "No disc image yet"; g.disc_note = "Choose\xE2\x80\xA6";
-        g.disc_kicker = "WELCOME";
+        g.disc_kicker = "DISC IMAGE";
         g.disc_head = "POINT TO YOUR DISC IMAGE";
-        g.disc_text = "OpenTricky plays the Xbox version of SSX Tricky from your own disc image. The game itself is not included.";
+        g.disc_text = "OpenTricky plays the Xbox version of SSX Tricky from your own disc image: you need your own copy of the game.";
         g.disc_drop1 = "Drop your SSX Tricky (USA) Xbox disc image here";
-        g.disc_drop2 = "or click to browse \xC2\xB7 checked right away";
+        g.disc_drop2 = "or click to find or browse";
         break;
     case OT_DISC_NOT_FOUND:
-        g.disc_state = "bad"; g.disc_title = "Disc image not found"; g.disc_note = "Locate\xE2\x80\xA6";
-        g.disc_kicker = "DISC IMAGE NOT FOUND";
+        g.disc_state = "bad"; g.disc_title = "Not found"; g.disc_note = "Locate\xE2\x80\xA6";
+        g.disc_kicker = "DISC IMAGE";
         g.disc_head = "WE CAN'T FIND YOUR DISC IMAGE";
         g.disc_text = "It was moved, renamed, or the drive is not connected.";
         g.disc_drop1 = "Locate it again";
         g.disc_path.clear();                    /* the old path tells the player nothing new: not shown */
         g.disc_drop2 = "or drop the disc image here";
         break;
+    case OT_DISC_INCOMPLETE:
+        g.disc_state = "bad"; g.disc_title = "Incomplete"; g.disc_note = "Choose another\xE2\x80\xA6";
+        g.disc_kicker = "DISC IMAGE";
+        g.disc_head = "THIS DISC IMAGE IS INCOMPLETE";
+        g.disc_text = "The file is shorter than the disc, probably an interrupted copy. Copy or make the disc image again.";
+        g.disc_drop1 = "Choose another file";
+        g.disc_drop2 = "or drop the complete disc image here";
+        break;
     default:
-        g.disc_state = "bad"; g.disc_title = "Not SSX Tricky (USA) for Xbox"; g.disc_note = "Choose another\xE2\x80\xA6";
-        g.disc_kicker = "WRONG DISC IMAGE";
+        g.disc_state = "bad"; g.disc_title = "Wrong disc image"; g.disc_note = "Choose another\xE2\x80\xA6";
+        g.disc_kicker = "DISC IMAGE";
         g.disc_head = "THIS ISN'T SSX TRICKY (USA) FOR XBOX";
         if (other_build)
-            g.disc_text = "This SSX Tricky (USA) disc image has a changed game program (default.xbe). OpenTricky runs only the original one.";
+            g.disc_text = "This SSX Tricky (USA) disc image has been modified. OpenTricky needs an unmodified copy.";
         else if (!g.disc.xbox)
-            g.disc_text = "This file is not an Xbox disc image (a PlayStation 2 or GameCube image, or another kind of file). OpenTricky needs the Xbox version, USA release.";
+            g.disc_text = "This file isn't an Xbox disc image. OpenTricky needs the Xbox version of SSX Tricky (USA).";
         else if (g.disc.title[0])
             g.disc_text = std::string("This Xbox disc image is \xE2\x80\x9C") + g.disc.title + "\xE2\x80\x9D. OpenTricky needs SSX Tricky, USA release.";
         else
             g.disc_text = "This Xbox disc image is another game or another region. OpenTricky needs SSX Tricky, USA release.";
         g.disc_drop1 = "Choose another file";
         g.disc_drop2 = "or drop the right disc image here";
+        if (bad_path) {
+            g.disc_title = "Folder not readable";
+            g.disc_kicker = "DISC IMAGE";
+            g.disc_head = "THE GAME CAN'T OPEN THIS FOLDER";
+            g.disc_text = "This is the right disc image, but its folder's name has letters the game can't read on this computer, "
+                          "or the path is too long. Move it to a folder whose name uses only plain letters, then choose it again.";
+            g.disc_drop1 = "Choose the moved file";
+            g.disc_drop2 = "or drop it here";
+        }
         break;
     }
-    otlog("disc: state=%s xbox=%d title_id=%08X", g.disc_state.c_str(), (int)g.disc.xbox, g.disc.title_id);
+    otlog("disc: state=%s xbox=%d title_id=%08X%s", g.disc_state.c_str(), (int)g.disc.xbox, g.disc.title_id,
+          bad_path ? " (a path the game cannot open)" : "");
 }
 
 void show_page(const std::string &p);
+
+/* ── Type and controls in whole pixels ─────────────────────────────────────
+ * RmlUi draws a text at its baseline rounded to a pixel and a box between its
+ * edges rounded each on its own, takes a font size and a letter-spacing in
+ * whole pixels by cutting off the fraction, and rounds a 1 dp outline to whole
+ * pixels while a line-height in dp keeps its fraction. In dp, a label's
+ * capitals sat up to 1.5 px off the middle of its frame, a 14 dp row and a
+ * 13.5 dp paragraph were both 18 px at 1920 x 1080, and the small capitals'
+ * spacing went from 1 px to 2 px by the window's size.
+ *
+ * So at each layout (apply_layout) the sizes are set in whole pixels, as tokens
+ * of tokens.rcss: every font size and spacing rounded to the nearest pixel (no
+ * text under 10 px); every control's height, the line inside it and the margin
+ * that centres it in its parent, from the real metrics of its font, so that its
+ * text's baseline falls on a whole pixel and its capitals in its middle (the
+ * capitals of Inter are centred in its line box: ascent - descent = their
+ * height, to half a pixel after hinting). A line that mixes the small capitals
+ * (9 dp) with a larger text (a dialog's key / value line) has one baseline: the
+ * small capitals are centred in it, the text beside them on their baseline; a
+ * small button in it is centred on them. The two status labels at the top and
+ * the lines of Find my disc image centre each of their parts instead. */
+struct OtFm { int a, d, c, o; };   /* ascent, descent, capitals' height, overhang (whole pixels, as drawn) */
+
+static Rml::FontFaceHandle font_handle(const char *family, int weight, int size)
+{
+    Rml::FontEngineInterface *fe = Rml::GetFontEngineInterface();
+    /* The family as the style sheets hold it: in lower case. */
+    return fe ? fe->GetFontFaceHandle(Rml::StringUtilities::ToLower(family), Rml::Style::FontStyle::Normal,
+                                      (Rml::Style::FontWeight)weight, size) : 0;
+}
+
+static OtFm font_metrics(const char *family, int weight, int size)
+{
+    Rml::FontEngineInterface *fe = Rml::GetFontEngineInterface();
+    Rml::FontFaceHandle h = font_handle(family, weight, size);
+    if (!h) {
+        otlog("layout: no font %s %d %dpx", family, weight, size);
+        return { (int)std::lround(size * 0.97f), (int)std::lround(size * 0.25f), (int)std::lround(size * 0.73f), 0 };
+    }
+    const Rml::FontMetrics &m = fe->GetFontMetrics(h);
+    /* The capitals' height as drawn: the top of the H above the baseline, hinted; its overhang: how far
+     * its ink goes past its advance on the right less its left bearing (a slanted face's ink leans right
+     * of its advance). The default font engine's handle, whose glyphs of ASCII are made when it is. */
+    const Rml::FontGlyphMap &glyphs = reinterpret_cast<Rml::FontFaceHandleDefault *>(h)->GetGlyphs();
+    auto it = glyphs.find(Rml::Character('H'));
+    if (it == glyphs.end()) return { (int)std::lround(m.ascent), (int)std::lround(m.descent), (int)std::lround(m.ascent - m.descent), 0 };
+    const Rml::FontGlyph &H = it->second;
+    const int rsb = H.advance - H.bearing.x - H.bitmap_dimensions.x;
+    return { (int)std::lround(m.ascent), (int)std::lround(m.descent), H.bearing.y, H.bearing.x - rsb };
+}
+
+/* The ink of a text (ASCII) as drawn in a face: how many pixel rows it reaches above its baseline and
+ * below it, counting the rows of its glyphs that are half covered or more (a faint row of a hinted
+ * curve is not seen as its edge). False when the face or its glyphs' pixels are not there. */
+static bool ink_rows(const char *family, int weight, int size, const char *text, int *above, int *below)
+{
+    Rml::FontFaceHandle h = font_handle(family, weight, size);
+    if (!h) return false;
+    const Rml::FontGlyphMap &glyphs = reinterpret_cast<Rml::FontFaceHandleDefault *>(h)->GetGlyphs();
+    int up = 0, down = 0;
+    bool any = false;
+    for (const char *t = text; *t; t++) {
+        auto it = glyphs.find(Rml::Character((unsigned char)*t));
+        if (it == glyphs.end()) continue;
+        const Rml::FontGlyph &gl = it->second;
+        if (gl.bitmap_dimensions.x <= 0 || gl.bitmap_dimensions.y <= 0) continue;   /* a space: no ink */
+        if (!gl.bitmap_data || gl.color_format != Rml::ColorFormat::A8) return false;
+        int first = -1, last = -1;
+        for (int y = 0; y < gl.bitmap_dimensions.y; y++) {
+            const Rml::byte *row = gl.bitmap_data + (size_t)y * gl.bitmap_dimensions.x;
+            for (int x = 0; x < gl.bitmap_dimensions.x; x++)
+                if (row[x] >= 128) {
+                    if (first < 0) first = y;
+                    last = y;
+                    break;
+                }
+        }
+        if (first < 0) continue;
+        up = std::max(up, gl.bearing.y - first);
+        down = std::max(down, last + 1 - gl.bearing.y);
+        any = true;
+    }
+    *above = up;
+    *below = down;
+    return any;
+}
+
+/* The line box inside `in` pixels that centres the capitals: the inside, moved by
+ * the capitals' offset in the font's line box (ascent - descent - their height: 0
+ * or a pixel for Inter, a few for the display face); one pixel more when the
+ * half-leading would be half a pixel (the baseline on a whole pixel). `base`: the
+ * baseline from the top of the inside. */
+static int line_in(int in, OtFm f, int *base = nullptr)
+{
+    int l = in + f.c - (f.a - f.d);
+    l += (l - f.a - f.d) & 1;
+    if (base) *base = (l - f.a - f.d) / 2 + f.a;
+    return l;
+}
+
+/* The line box inside `in` pixels that centres the ink of `text` in the face of `f` (ink_rows: its
+ * capitals or figures, its ascenders, its descenders as drawn), half a pixel low when it cannot be
+ * exact, as line_in; the capitals' height when the glyphs cannot be read. */
+static int line_ink(int in, const char *family, int weight, int size, OtFm f, const char *text)
+{
+    int above = f.c, below = 0;
+    if (!ink_rows(family, weight, size, text, &above, &below)) { above = f.c; below = 0; }
+    const int base = (in - above - below + 1) / 2 + above;
+    return 2 * base - f.a + f.d;
+}
+
+static void layout_tokens(float dp, std::vector<std::pair<std::string, std::string>> &tk)
+{
+    auto px = [dp](float v) { return (int)std::lround(v * dp); };
+    auto put = [&tk](const char *name, int v) { tk.emplace_back(name, std::to_string(v) + "px"); };
+    /* A size of `v` dp with the parity of `in`: a box centred in another, on whole pixels. */
+    auto fit = [&px](float v, int in) { int h = px(v); return h + ((in - h) & 1); };
+
+    /* Type: sizes and spacings. */
+    static const struct { const char *name; float dp; } fs[] = {
+        { "--fs-xs", 9 }, { "--fs-s", 11 }, { "--fs-m", 12 }, { "--fs-body", 13.5f }, { "--fs-l", 14 }, { "--fs-h", 19 },
+        { "--fs-d1", 26 }, { "--fs-d2", 40 }, { "--fs-d3", 30 }, { "--fs-d4", 44 }, { "--fs-d5", 82 }, { "--fs-btn-d", 20 } };
+    int size[12];
+    for (int i = 0; i < 12; i++) {
+        size[i] = std::max(10, px(fs[i].dp));
+        put(fs[i].name, size[i]);
+    }
+    const int s_xs = size[0], s_s = size[1], s_m = size[2], s_body = size[3], s_l = size[4], s_d4 = size[9], s_btn = size[11];
+    static const struct { const char *name, *back; float dp; } ls[] = {
+        { "--ls-xs", "--ls-xs-back", 1.4f }, { "--ls-grp", "--ls-grp-back", 1.8f }, { "--ls-s", "--ls-s-back", 1.6f },
+        { "--ls-m", "--ls-m-back", 2 }, { "--ls-pri", "--ls-pri-back", 1.5f }, { "--ls-play", "--ls-play-back", 3 } };
+    for (auto &l : ls) {   /* and its negative: the space after the last letter given back (centred labels) */
+        put(l.name, px(l.dp));
+        put(l.back, -px(l.dp));
+    }
+
+    const char *disp = g.bullet ? "Bullet SmallCaps" : "Exo 2";
+    const int dw = g.bullet ? 400 : 900;
+    const OtFm xs7 = font_metrics("Inter", 700, s_xs), xs8 = font_metrics("Inter", 800, s_xs), s7 = font_metrics("Inter", 700, s_s),
+               m4 = font_metrics("Inter", 400, s_m), m6 = font_metrics("Inter", 600, s_m), b4 = font_metrics("Inter", 400, s_body),
+               b6 = font_metrics("Inter", 600, s_body), b7 = font_metrics("Inter", 700, s_body), l4 = font_metrics("Inter", 400, s_l),
+               btn = font_metrics(disp, dw, s_btn), d4 = font_metrics(disp, dw, s_d4);
+    const int b = std::max(1, px(1));   /* a 1 dp outline as RmlUi draws it */
+    int o;
+
+    /* The status labels (32 dp) and their small button (22 dp), the button centred. The two labels of the
+     * pages (the disc image, the version) put each of their parts in the middle of their inside, on its
+     * own ink, whatever their state: the disc's name on its capitals, the version on its figures (as
+     * drawn), the small-capitals word on its capitals, the dot, the button and its label in it. Two texts
+     * of a line may then sit on two baselines: on a single baseline, the name's capitals or the version's
+     * figures sat up to 2 px high, or the small capitals up to 2 px low. A label without its own line (no
+     * id) keeps one baseline, the button's (--lh-pill). */
+    const int pill = px(32), pill_in = pill - 2 * b, pb = fit(22, pill_in), m_pb = (pill_in - pb) / 2;
+    put("--h-pill", pill); put("--h-pb", pb); put("--m-pb", m_pb);
+    put("--lh-pb", line_in(pb - 2 * b, xs7, &o));
+    put("--lh-pill", 2 * (m_pb + b + o) - m6.a + m6.d);
+    put("--lh-disc", line_in(pill_in, m6));
+    put("--lh-ver", line_ink(pill_in, "Inter", 600, s_m, m6, "0123456789"));
+    put("--lh-sw", line_in(pill_in, xs7));
+    const int dot = std::max(2, px(8));
+    put("--h-dot", dot); put("--m-dot", (pill_in - dot + 1) / 2);
+    put("--h-prog", std::max(1, px(2))); put("--m-prog", px(4));   /* the bar of an update running */
+    char rdot[32];
+    snprintf(rdot, sizeof rdot, "%.1fpx", dot / 2.0f);
+    tk.emplace_back("--r-dot", rdot);
+    put("--pr-pill", px(12)); put("--mr-pb", m_pb - px(12));   /* the button's right gap = its top and bottom ones */
+    /* The side paddings of the centred labels in whole pixels (their text centred to the pixel); for the
+     * labels without an inner span (small buttons, chips, links) the right one less the small capitals'
+     * spacing (given back). */
+    for (int n : { 5, 6, 7, 9, 12, 15, 16, 18 }) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "--p%d", n);
+        put(nm, px((float)n));
+        snprintf(nm, sizeof nm, "--p%d-r", n);
+        put(nm, px((float)n) - px(1.4f));
+    }
+
+    /* OFFLINE / ONLINE (34 dp) and SOON (15 dp) in it. */
+    const int mode = px(34), mode_in = mode - 2 * b, soon = fit(15, mode_in);
+    put("--h-mode", mode); put("--lh-mode", line_in(mode_in, s7));
+    put("--h-soon", soon); put("--lh-soon", line_in(soon - 2 * b, xs7)); put("--m-soon", (mode_in - soon) / 2);
+    /* The presets (30 dp) and the tabs (32 dp). */
+    const int seg = px(30);
+    put("--h-seg", seg); put("--lh-seg", line_in(seg - 2 * b, xs7)); put("--lh-seg-out", line_in(seg, xs7));
+    const int tab = px(32);
+    put("--h-tab", tab); put("--lh-tab", line_in(tab - 2 * b, s7));
+
+    /* A settings line (40 dp, its rule under it) and what sits in it: a button, SOON, the switch,
+     * the mark of a changed value, a remapping cell, a PS2 button. */
+    const int row = px(40);
+    put("--h-row", row); put("--lh-row", line_in(row, l4));
+    const int ab = fit(22, row), soonb = fit(15, row), tog = fit(18, row), mod = fit(4, row), cell = fit(28, row);
+    put("--h-ab", ab); put("--lh-ab", line_in(ab - 2 * b, xs7)); put("--m-ab", (row - ab) / 2);
+    put("--h-soonb", soonb); put("--lh-soonb", line_in(soonb - 2 * b, xs7)); put("--m-soonb", (row - soonb) / 2);
+    put("--h-tog", tog); put("--m-tog", (row - tog) / 2);
+    put("--h-mod", mod); put("--m-mod", (row - mod) / 2);
+    put("--h-cell", cell); put("--lh-cell", line_in(cell - 2 * b, b7)); put("--m-cell", (row - cell) / 2);
+
+    /* The help: a picture's tag (20 dp). */
+    const int tag = px(20);
+    put("--h-tag", tag); put("--lh-tag", line_in(tag - 2 * b, xs7));
+
+    /* A dialog's key / value line (30 dp): the key's small capitals centred, the value on their baseline. */
+    const int kv = px(30);
+    put("--h-kv", kv); put("--lh-kv-k", line_in(kv, xs7, &o)); put("--lh-kv", 2 * o - b4.a + b4.d);
+    /* Find my disc image: a name line (18 dp in whole pixels, --h-dl, with or without IN USE) and IN USE
+     * (15 dp) on it, each in the middle of the line, as in the top labels: the name on its capitals (its
+     * own line from the top, its margin box the line's height: --mb-dn), IN USE's box (centred by its
+     * margin), its label in it. The folder's line under it keeps the height the name's line had
+     * (--lh-dname). */
+    const int dl = px(18), chip = fit(15, dl), m_chip = (dl - chip) / 2, lh_dn = line_in(dl, b7);
+    put("--h-chip", chip); put("--m-chip", m_chip);
+    put("--lh-chip", line_in(chip - 2 * b, xs7, &o));
+    put("--lh-dname", 2 * (m_chip + b + o) - b6.a + b6.d);
+    put("--h-dl", dl); put("--lh-dn", lh_dn); put("--mb-dn", dl - lh_dn);
+    /* An install's steps (22 dp, the update dialog) and their number in a square (20 dp): the square in
+     * the middle of the line, its figure in the middle of the square. */
+    const int step = px(22), sic = fit(20, step);
+    const OtFm s8 = font_metrics("Inter", 800, s_s);
+    put("--h-step", step); put("--lh-step", line_in(step, b4));
+    put("--h-sic", sic); put("--lh-sic", line_in(sic - 2 * b, s8)); put("--m-sic", (step - sic) / 2);
+    /* A dialog's buttons (34 dp) and the update buttons of What's new (36 dp, no outline). */
+    const int mb = px(34);
+    put("--h-mbtn", mb); put("--lh-mbtn", line_in(mb - 2 * b, s7)); put("--lh-mbtn-pri", line_in(mb - 2 * b, btn));
+    const int ub = px(36);
+    put("--h-ubtn", ub); put("--lh-ubtn", line_in(ub, s7));
+
+    /* The footer (54 dp): its links (22 dp, a rule of 12 dp between), the controller hints (their keys
+     * 18 dp), Reset tab and Save (36 dp), the Saved note. */
+    const int foot = px(54), fl = fit(22, foot), sep = fit(12, fl), fb = fit(36, foot), kb = fit(18, fl);
+    put("--h-foot", foot); put("--h-fl", fl); put("--m-fl", (foot - fl) / 2); put("--lh-fl", line_in(fl, xs7));
+    put("--h-sep", sep); put("--m-sep", (fl - sep) / 2);
+    put("--lh-hint", line_in(fl, m4)); put("--h-kb", kb); put("--m-kb", (fl - kb) / 2); put("--lh-kb", line_in(kb, xs8));
+    put("--h-fbtn", fb); put("--m-fbtn", (foot - fb) / 2); put("--lh-fbtn", line_in(fb - 2 * b, s7));
+    put("--lh-save", line_in(fb - 2 * b, btn)); put("--lh-note", line_in(foot, m4));
+
+    /* PLAY (82 dp), with its outline inside when it is off. */
+    const int play = px(82);
+    put("--h-play", play); put("--lh-play", line_in(play, d4)); put("--lh-play-off", line_in(play - 2 * b, d4));
+
+    /* The display face leans: its ink sits right of its advance by half its overhang (the H's: the same
+     * for every capital of a slanted face). The main buttons' labels move back by that much (half
+     * pixels: RmlUi rounds the result). PLAY's own letter-spacing already makes up for it. */
+    char dx[32];
+    snprintf(dx, sizeof dx, "%.1fpx", -btn.o / 2.0f);
+    tk.emplace_back("--dx-pri", dx);
+}
 
 /* The stage is 1280 x 800 dp at 16:10; wider windows (16:9, 21:9) widen it up
  * to 1600 dp: the left column keeps its place and the right panels follow
@@ -1344,8 +2109,53 @@ void apply_layout()
     snprintf(wbuf, sizeof wbuf, "%.1fdp", w);
     snprintf(mbuf, sizeof mbuf, "%.1fdp", -w / 2);
     snprintf(fbuf, sizeof fbuf, "%.1fdp", left - 76);
+    /* Type and controls in whole pixels (layout_tokens); no text under 10 real pixels, whatever the
+     * scale (at 960 x 600, 1 dp = 0.75 px, so 9 dp would be 6.75 px). The window's minimum stays as it is. */
+    std::vector<std::pair<std::string, std::string>> tk;
+    layout_tokens(dp > 0 ? dp : 1, tk);
+    {
+        static std::string last;
+        std::string all;
+        for (auto &t : tk) all += t.first + "=" + t.second + " ";
+        /* New values: every element computes its properties again (refit_texts; a font-size or a
+         * line-height written with a variable too: the local fix of RmlUi, third_party/VERSIONS.txt). */
+        if (all != last) {
+            otlog("layout dp=%.3f %s", dp, all.c_str());
+            g.rescaled = true;
+        }
+        last = all;
+    }
+    /* The focus ring in whole pixels (2 dp rounded, at least 2 px): a ring of 2.5 px
+     * (1600 x 1000) or 2.7 px (1920 x 1080) is drawn with a half-lit row of pixels,
+     * a soft edge. PLAY's ring is written with its shadows, the ring first so the
+     * dark offset shadow never covers it. */
+    const int ring = std::max(2, (int)std::lround(2.0f * dp));
+    char ringbuf[48], ringin[56], iconbuf[32], edgebuf[48];
+    snprintf(ringbuf, sizeof ringbuf, "#ffffff 0 0 0 %dpx", ring);
+    snprintf(ringin, sizeof ringin, "#ffffff 0 0 0 %dpx inset", ring);    /* the lines of the scrolled list */
+    snprintf(edgebuf, sizeof edgebuf, "#ffffff 0 0 0 %dpx", std::max(1, (int)std::lround(dp)));   /* PLAY hovered: 1 dp */
+    /* The line icons (22 dp) on whole pixels: they are drawn at that size (make_texture). */
+    snprintf(iconbuf, sizeof iconbuf, "%dpx", (int)std::lround(22.0f * dp));
     for (Rml::ElementDocument *d : { g.home, g.settings, g.dialog }) {
         if (!d) continue;
+        d->SetProperty("--focus-ring", ringbuf);
+        d->SetProperty("--focus-ring-in", ringin);
+        d->SetProperty("--play-ring", ringbuf);
+        d->SetProperty("--hover-edge", edgebuf);
+        d->SetProperty("--icon", iconbuf);
+        for (auto &t : tk) d->SetProperty(t.first, t.second);
+        if (Rml::Element *s = d->GetElementById("stage")) {
+            s->SetProperty("width", wbuf);
+            s->SetProperty("margin-left", mbuf);
+        }
+        if (Rml::Element *f = d->GetElementById("fin")) {
+            f->SetProperty("width", wbuf);
+            f->SetProperty("left", fbuf);
+        }
+    }
+    if (Rml::ElementDocument *d = g_pages.doc ? g_pages.doc() : nullptr) {   /* an extra page: the same stage */
+        d->SetProperty("--icon", iconbuf);
+        for (auto &t : tk) d->SetProperty(t.first, t.second);
         if (Rml::Element *s = d->GetElementById("stage")) {
             s->SetProperty("width", wbuf);
             s->SetProperty("margin-left", mbuf);
@@ -1369,6 +2179,7 @@ void load_documents()
     g.settings = g.ctx->LoadDocument(g.prog + "ui/settings.rml");
     g.dialog = g.ctx->LoadDocument(g.prog + "ui/dialog.rml");
     if (!g.home || !g.settings || !g.dialog) otlog("error: cannot load the interface documents");
+    if (g_pages.load_documents) g_pages.load_documents();
     /* The help panel follows the focused (or hovered) setting. */
     struct Follow : Rml::EventListener {
         void ProcessEvent(Rml::Event &ev) override
@@ -1394,6 +2205,7 @@ void load_documents()
 
 Rml::ElementDocument *page_doc()
 {
+    if (g_pages.owns && g_pages.owns(g.page) && g_pages.doc && g_pages.doc()) return g_pages.doc();
     return g.page == "settings" ? g.settings : g.home;
 }
 
@@ -1404,8 +2216,10 @@ bool focus_shown() { return g.pad_active || g.kbd_nav; }
 
 void show_page(const std::string &p)
 {
+    if (g.model) g.model.DirtyVariable("page");   /* set below; read at the next update */
     if (g.page == "settings" && p != "settings") deck_note_seen();
     g.page = p;
+    if (g_pages.show_page && g_pages.show_page(p)) return;
     Rml::ElementDocument *on = p == "settings" ? g.settings : g.home;
     Rml::ElementDocument *off = p == "settings" ? g.home : g.settings;
     if (off) off->Hide();
@@ -1455,11 +2269,8 @@ void set_crash(const OtCrashReport &r, int code)
     g.crash_head = freeze ? "THE GAME FROZE" : "THE GAME CLOSED UNEXPECTEDLY";
     SDL_Time t = r.found ? r.time : 0;
     if (!t) SDL_GetCurrentTime(&t);
-    char code_txt[48] = "";
-    if (code) snprintf(code_txt, sizeof code_txt, " \xC2\xB7 error 0x%08X", (unsigned)code);
-    g.crash_when = "When: " + ot_when(t) + (freeze ? " \xC2\xB7 freeze" : " \xC2\xB7 crash") + code_txt;
-    g.crash_version = "Version: v" + std::string(OT_VERSION) + (g.gl_renderer.empty() ? "" : " \xC2\xB7 " + g.gl_renderer) +
-                      (r.found ? "" : " \xC2\xB7 no crash report was written");
+    g.crash_when = "When: " + ot_when(t);
+    g.crash_version = "Version: v" + std::string(OT_VERSION);      /* the code and the graphics card: in the bug report */
     for (const char *v : { "crash_head", "crash_when", "crash_version" }) g.model.DirtyVariable(v);
 }
 
@@ -1479,9 +2290,42 @@ bool play()
         show_modal("notice");
         return false;
     }
-    save_settings_file();                       /* the game reads settings.ini at start */
+#ifdef _WIN32
+    {
+        /* A player's game of this folder already running (started by a
+         * double-click, or left by an earlier launcher): never a second one. */
+        char name[128];
+        HANDLE m = settings_instance_name("Game", name, sizeof name) ? OpenMutexA(SYNCHRONIZE, FALSE, name) : nullptr;
+        if (m) {
+            CloseHandle(m);
+            otlog("play: SSX Tricky of this folder is already running");
+            g.notice_kick = "PLAY";
+            g.notice_head = "SSX TRICKY IS ALREADY RUNNING";
+            g.notice_text = "Switch to its window (Alt+Tab), or close it before pressing PLAY again.";
+            g.notice_file = "";
+            for (const char *v : { "notice_kick", "notice_head", "notice_text" }) g.model.DirtyVariable(v);
+            show_modal("notice");
+            return false;
+        }
+    }
+#endif
+    /* The game reads settings.ini at start: when it cannot be written, the
+     * player is told once and PLAY again starts with the settings saved before. */
+    if (!save_settings_file() && !g.skip_mode && !g.save_warned) {
+        g.save_warned = true;
+        otlog("play: settings.ini could not be written: the player is told first");
+        g.notice_kick = "PLAY";
+        g.notice_head = "YOUR SETTINGS COULDN'T BE SAVED";
+        g.notice_text = "Your settings file can't be written (read-only or blocked by an antivirus). "
+                        "Press PLAY again to start with your previous settings.";
+        g.notice_file = "";
+        for (const char *v : { "notice_kick", "notice_head", "notice_text" }) g.model.DirtyVariable(v);
+        show_modal("notice");
+        return false;
+    }
     SDL_Environment *env = SDL_CreateEnvironment(true);
     SDL_SetEnvironmentVariable(env, "OPENTRICKY_LAUNCHER", "1", true);   /* the crash screen is the launcher's */
+    if (g_pages.play_env) g_pages.play_env(env);
     const char *args[] = { exe.c_str(), "--play", nullptr };
     SDL_PropertiesID p = SDL_CreateProperties();
     SDL_SetPointerProperty(p, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, (void *)args);
@@ -1489,10 +2333,20 @@ bool play()
     SDL_SetStringProperty(p, SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, g.base.c_str());   /* the install root */
     SDL_GetCurrentTime(&g.launch_time);
     g.game = SDL_CreateProcessWithProperties(p);
+    if (g.game) g.games_started++;
     SDL_DestroyProperties(p);
     SDL_DestroyEnvironment(env);
     if (!g.game) {
+        /* The file is there (checked above) but Windows would not start it:
+         * an antivirus that blocks it, a damaged copy. Said, never a PLAY
+         * that does nothing. */
         otlog("play: cannot start the game: %s", SDL_GetError());
+        g.notice_kick = "PLAY";
+        g.notice_head = "THE GAME COULDN'T START";
+        g.notice_text = std::string("Windows couldn't start \xE2\x80\x9C") + k_game_exe +
+                        "\xE2\x80\x9D in the bin folder. An antivirus may have blocked it: allow it, or unzip the release again.";
+        g.notice_file = "";
+        show_modal("notice");
         return false;
     }
     otlog("game started (pid %lld)", (long long)SDL_GetNumberProperty(SDL_GetProcessProperties(g.game), SDL_PROP_PROCESS_PID_NUMBER, 0));
@@ -1500,9 +2354,93 @@ bool play()
     return true;
 }
 
+/* XBOX_NO_ACTIVATE=1 (test tools only): the launcher never takes the focus
+ * from the program in front, like the game it starts (which inherits the
+ * variable). Its window is shown without activation and put behind the
+ * others; it is never raised. Unset or 0: shown and raised as always. */
+bool no_activate()
+{
+    static int on = -1;
+    if (on < 0) { const char *e = SDL_getenv("XBOX_NO_ACTIVATE"); on = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return on == 1;
+}
+
+void show_launcher_window(bool raise)
+{
+    if (no_activate()) {
+#ifdef _WIN32
+        /* Shown behind the others in one step (shown first, it would cover
+         * the window in front for a moment); SDL then only records it. */
+        HWND w = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(g.window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+        const UINT f = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        /* Never the active window, not even when the one in front is
+         * minimised or closed (WS_EX_APPWINDOW keeps the task bar button). */
+        if (w) SetWindowLongPtrW(w, GWL_EXSTYLE, GetWindowLongPtrW(w, GWL_EXSTYLE) | WS_EX_NOACTIVATE | WS_EX_APPWINDOW);
+        if (w) SetWindowPos(w, HWND_BOTTOM, 0, 0, 0, 0, f | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+        SDL_ShowWindow(g.window);
+        if (w) SetWindowPos(w, HWND_BOTTOM, 0, 0, 0, 0, f);
+#else
+        SDL_ShowWindow(g.window);
+#endif
+        return;
+    }
+    SDL_ShowWindow(g.window);
+    if (raise) SDL_RaiseWindow(g.window);
+}
+
+#ifdef _WIN32
+/* XBOX_NO_ACTIVATE, each frame: when the window in front closes, Windows
+ * activates the next window even with WS_EX_NOACTIVATE. The foreground is
+ * then given back to the last window seen in front if it is still there,
+ * else to the next visible window of another program in the z-order, else
+ * to the desktop, and the launcher goes to the bottom (as the game does). */
+bool na_candidate(HWND w)
+{
+    DWORD pid = 0;
+    RECT r;
+    if (!w || !IsWindow(w) || !IsWindowVisible(w) || IsIconic(w)) return false;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid == GetCurrentProcessId()) return false;
+    if (GetWindowLongPtrW(w, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return false;
+    if (!GetWindowRect(w, &r) || r.right <= r.left || r.bottom <= r.top) return false;
+    typedef HRESULT (WINAPI *DwmAttrFn)(HWND, DWORD, PVOID, DWORD);
+    static DwmAttrFn dwm_attr = [] {
+        HMODULE m = LoadLibraryW(L"dwmapi.dll");
+        return m ? (DwmAttrFn)(void *)GetProcAddress(m, "DwmGetWindowAttribute") : (DwmAttrFn) nullptr;
+    }();
+    DWORD cloaked = 0;
+    return !(dwm_attr && SUCCEEDED(dwm_attr(w, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof cloaked)) && cloaked);
+}
+
+void keep_out_of_front()
+{
+    static HWND last_front;
+    static int logged;
+    HWND self = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(g.window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    HWND f = GetForegroundWindow();
+    if (!self) return;
+    if (f != self) {
+        if (f && na_candidate(f)) last_front = f;
+        return;
+    }
+    HWND to = nullptr;
+    const char *how = "the desktop";
+    if (na_candidate(last_front)) { to = last_front; how = "the last window in front"; }
+    else {
+        for (HWND w = GetTopWindow(nullptr); w; w = GetWindow(w, GW_HWNDNEXT))
+            if (na_candidate(w)) { to = w; how = "the next window in the z-order"; break; }
+    }
+    if (!to) to = GetShellWindow();
+    bool ok = to && SetForegroundWindow(to);
+    SetWindowPos(self, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    if (logged++ < 20) otlog("window: XBOX_NO_ACTIVATE: activated by the system, handed back to %s%s", how, ok ? "" : " (refused)");
+}
+#endif
+
 void game_ended(int code)
 {
     otlog("game ended (exit code %d, 0x%08X)", code, (unsigned)code);
+    if (g_pages.game_ended) g_pages.game_ended(code);
     if (code == OT_EXIT_DISC_REFUSED) {         /* the game could not use the disc image: say so, never loop */
         otlog("the game refused the disc image: the launcher shows");
         if (!g.shown) {
@@ -1510,15 +2448,14 @@ void game_ended(int code)
             g.skip_mode = false;
         }
         g.notice_kick = "DISC IMAGE";
-        g.notice_head = "THE GAME COULD NOT USE THIS DISC IMAGE";
-        g.notice_text = "SSX Tricky could not open it, or it is not the exact SSX Tricky (USA) disc it was made for. "
+        g.notice_head = "THE GAME COULDN'T USE THIS DISC IMAGE";
+        g.notice_text = "SSX Tricky couldn't open it, or it isn't the exact SSX Tricky (USA) disc OpenTricky was made for. "
                         "Choose your disc image again. With Log file on (Advanced), the game's log says why.";
         g.notice_file = "";
         g.model.DirtyVariable("notice_kick");
         g.model.DirtyVariable("notice_head");
         g.model.DirtyVariable("notice_text");
-        SDL_ShowWindow(g.window);
-        SDL_RaiseWindow(g.window);
+        show_launcher_window(true);
         show_modal("notice");
         return;
     }
@@ -1532,8 +2469,7 @@ void game_ended(int code)
             g.shown = true;
             g.skip_mode = false;
         }
-        SDL_ShowWindow(g.window);
-        SDL_RaiseWindow(g.window);
+        show_launcher_window(true);
         show_modal("crash");
         return;
     }
@@ -1541,8 +2477,7 @@ void game_ended(int code)
         g.quit = true;
         return;
     }
-    SDL_ShowWindow(g.window);
-    SDL_RaiseWindow(g.window);
+    show_launcher_window(true);
 }
 
 /* ── Bug report ──────────────────────────────────────────────────── */
@@ -1631,12 +2566,13 @@ void prepare_bug_report()
 
     std::string file = desktop_dir() + "OpenTricky-bug-report-" + stamp + ".zip";
     bool ok = ot_zip_write(file, z);
-    otlog("bug report: %s (%s, %d files)", ot_file_name(file).c_str(), ok ? "written" : "NOT written", (int)z.size());
+    otlog("bug report: %s (%s, %d files)%s%s", ot_file_name(file).c_str(), ok ? "written" : "NOT written", (int)z.size(),
+          ok ? "" : ": ", ok ? "" : SDL_GetError());
     g.notice_kick = "TROUBLESHOOTING";
-    g.notice_head = ok ? "BUG REPORT READY" : "COULD NOT WRITE THE BUG REPORT";
+    g.notice_head = ok ? "BUG REPORT READY" : "COULDN'T SAVE THE BUG REPORT";
     g.notice_text = ok ? "Saved on your Desktop: " + ot_file_name(file) +
-                             ". Nothing was sent: attach it to a GitHub issue if you want."
-                       : "The zip could not be written on the Desktop (" + std::string(SDL_GetError()) + ").";
+                             ". Nothing is sent. Attach it to a GitHub issue."
+                       : "The Desktop can't be written to.";
     g.notice_file = ok ? file : "";
     g.model.DirtyVariable("notice_kick");
     g.model.DirtyVariable("notice_head");
@@ -1650,10 +2586,10 @@ void prepare_bug_report()
 void save_settings()
 {
     if (!save_settings_file()) {
-        g.saved_note = "Could not save";
+        g.saved_note = "Couldn't save";
     } else {
         deck_note_seen();
-        g.saved_note = g.ini_in_docs ? "Saved in Documents\\My Games\\SSX Tricky" : "Saved";
+        g.saved_note = "Saved";
         for (Row &r : g.rows)
             if (!r.is_group && r.id < SETTINGS_COUNT) r.changed = !settings_is_default(g.set, r.id);
         g.model.DirtyVariable("rows");
@@ -1666,6 +2602,10 @@ void row_action(int id)
     switch (id) {
     case A_OPEN_LOGS: open_folder(ini_dir()); break;
     case A_BUG_REPORT: show_modal("report_ask"); break;
+    case A_CHECK_UPDATES:
+        if (g.upd_state == "update") update_action("pill");                  /* Update: the new version's notes */
+        else if (g.upd_state != "checking" && !update_just_checked()) update_start(true);
+        break;
     case A_ABOUT: show_modal("about"); break;
     case A_RESTORE: {
         std::string v;
@@ -1687,6 +2627,7 @@ void dialog_action(const std::string &a)
     if (a == "report") { close_modal(); prepare_bug_report(); return; }
     if (a == "restore") { close_modal(); install_start(true); return; }
     if (a == "inst_retry") { bool r = g.inst_kick == "RESTORE"; close_modal(); install_start(r); return; }
+    if (a == "inst_cancel") { install_cancel(); return; }
     if (a == "inst_page") { if (!g.upd_url.empty()) SDL_OpenURL(g.upd_url.c_str()); close_modal(); return; }
     if (a == "logs") { open_folder(ini_dir()); return; }
     if (a == "licences") {
@@ -1697,6 +2638,7 @@ void dialog_action(const std::string &a)
         return;
     }
     if (a == "github") { SDL_OpenURL(k_url_github); return; }
+    if (a == "disc_browse") { close_modal(); choose_path(S_DISC_IMAGE); return; }
     if (a == "show_file") { if (!g.notice_file.empty()) open_folder(ot_dir_of(g.notice_file)); close_modal(); return; }
     close_modal();
 }
@@ -1704,7 +2646,10 @@ void dialog_action(const std::string &a)
 /* The dialog's "Esc / B". */
 void dialog_back()
 {
-    if (g.modal == "update" && install_running()) return;     /* no way out half-way */
+    if (g.modal == "update" && install_running()) {           /* no way out half-way: Cancel while it can */
+        install_cancel();
+        return;
+    }
     if (g.modal == "capture") close_modal();
     else if (g.modal == "conflict") conflict_answer(false);
     else close_modal();
@@ -1713,6 +2658,16 @@ void dialog_back()
 Rml::Element *focused()
 {
     return g.ctx->GetFocusElement();
+}
+
+/* e or one of its parents up to the row (the element with a rid) has this class. */
+bool has_class_up(Rml::Element *e, const char *cls)
+{
+    for (; e; e = e->GetParentNode()) {
+        if (e->IsClassSet(cls)) return true;
+        if (e->HasAttribute("rid")) return false;
+    }
+    return false;
 }
 
 int focused_row()
@@ -1739,6 +2694,8 @@ void nav(Nav n)
         if (n == N_PREV || n == N_NEXT) { set_tab(g.tab + (n == N_NEXT ? 1 : -1)); return; }
         int id = focused_row();
         if (id >= 0 && id < SETTINGS_COUNT && (n == N_LEFT || n == N_RIGHT)) { step_value(id, n == N_RIGHT ? 1 : -1); return; }
+    } else if (g_pages.owns && g_pages.owns(g.page)) {
+        if (g_pages.nav && g_pages.nav(n)) return;
     } else {
         if (n == N_PREV || n == N_NEXT) return;   /* the theme is random, no track to choose */
         if (n == N_BACK) return;
@@ -1770,6 +2727,10 @@ bool pad_button(int b)
         if (const char *t = pad_token(b)) capture_assign(t);
         return true;
     }
+    if (b == SDL_GAMEPAD_BUTTON_START && g_pages.owns && g_pages.owns(g.page)) {
+        if (g.modal.empty() && g_pages.primary) g_pages.primary();
+        return true;
+    }
     switch (b) {
     case SDL_GAMEPAD_BUTTON_DPAD_UP: nav(N_UP); return true;
     case SDL_GAMEPAD_BUTTON_DPAD_DOWN: nav(N_DOWN); return true;
@@ -1799,6 +2760,10 @@ bool key_down(SDL_Keycode k, SDL_Scancode sc)
         }
         return true;
     }
+    /* A text field of an extra page: its keys go to it (but Esc, Enter and
+     * the up / down arrows, which move between the fields). */
+    if (g_pages.typing && g_pages.typing() && k != SDLK_ESCAPE && k != SDLK_UP && k != SDLK_DOWN && k != SDLK_RETURN &&
+        k != SDLK_KP_ENTER) return false;
     switch (k) {
     case SDLK_UP: nav(N_UP); return true;
     case SDLK_DOWN: nav(N_DOWN); return true;
@@ -1892,8 +2857,82 @@ void save_shot(const std::string &file)
     SDL_DestroySurface(s);
 }
 
+/* Test: every visible element of the page (or of the dialog shown) with its boxes, fill, outline and
+ * font, and every text with its baseline, in window pixels: one JSON object a line. The project's
+ * tools measure the pictures against it (a text's ink against its frame). */
+void save_boxes(const std::string &file)
+{
+    std::string out;
+    auto put = [&out](const char *fmt, ...) {
+        char buf[2048];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof buf, fmt, ap);
+        va_end(ap);
+        out += buf;
+    };
+    auto esc = [](const Rml::String &s) {
+        std::string o;
+        for (char c : s) {
+            if (c == '"' || c == '\\') o += '\\';
+            if ((unsigned char)c < 0x20) { o += ' '; continue; }
+            o += c;
+        }
+        return o;
+    };
+    int n = 0;
+    std::function<void(Rml::Element *, int, int)> walk = [&](Rml::Element *e, int depth, int parent) {
+        if (!e->IsVisible()) return;
+        const int me = n++;
+        const Rml::ComputedValues &cv = e->GetComputedValues();
+        if (Rml::ElementText *t = rmlui_dynamic_cast<Rml::ElementText *>(e)) {
+            const Rml::FontMetrics &m = Rml::GetFontEngineInterface()->GetFontMetrics(t->GetFontFaceHandle());
+            Rml::Vector2f o = t->GetAbsoluteOffset();
+            for (const auto &ln : t->GetLines()) {
+                if (ln.text.find_first_not_of(" \t\n") == std::string::npos) continue;
+                put("{\"k\":\"t\",\"n\":%d,\"p\":%d,\"x\":%.3f,\"y\":%.3f,\"w\":%d,\"size\":%d,\"asc\":%.3f,\"desc\":%.3f,"
+                           "\"xh\":%.3f,\"style\":%d,\"weight\":%d,\"tt\":%d,\"family\":\"%s\",\"text\":\"%s\"}\n",
+                        me, parent, o.x + ln.position.x, o.y + ln.position.y, ln.width, m.size, m.ascent, m.descent, m.x_height,
+                        (int)cv.font_style(), (int)cv.font_weight(), (int)cv.text_transform(), esc(cv.font_family()).c_str(),
+                        esc(ln.text).c_str());
+            }
+            return;
+        }
+        const Rml::Box &b = e->GetBox();
+        Rml::Vector2f bo = e->GetAbsoluteOffset(Rml::BoxArea::Border), bs = b.GetSize(Rml::BoxArea::Border);
+        Rml::Vector2f po = e->GetAbsoluteOffset(Rml::BoxArea::Padding), ps = b.GetSize(Rml::BoxArea::Padding);
+        Rml::Vector2f co = e->GetAbsoluteOffset(Rml::BoxArea::Content), cs = b.GetSize(Rml::BoxArea::Content);
+        Rml::Colourb bg = cv.background_color(), bc = cv.border_top_color();
+        const bool deco = e->GetLocalProperty(Rml::PropertyId::Decorator) != nullptr || cv.has_decorator();
+        put("{\"k\":\"e\",\"n\":%d,\"p\":%d,\"d\":%d,\"tag\":\"%s\",\"id\":\"%s\",\"cls\":\"%s\",\"bx\":[%.3f,%.3f,%.3f,%.3f],"
+                   "\"px\":[%.3f,%.3f,%.3f,%.3f],\"cx\":[%.3f,%.3f,%.3f,%.3f],\"bw\":[%.3f,%.3f,%.3f,%.3f],\"bg\":[%d,%d,%d,%d],"
+                   "\"bc\":[%d,%d,%d,%d],\"deco\":%d,\"skew\":%d,\"fs\":%.3f,\"lh\":%.3f,\"va\":%d}\n",
+                me, parent, depth, esc(e->GetTagName()).c_str(), esc(e->GetId()).c_str(), esc(e->GetClassNames()).c_str(),
+                bo.x, bo.y, bs.x, bs.y, po.x, po.y, ps.x, ps.y, co.x, co.y, cs.x, cs.y,
+                b.GetEdge(Rml::BoxArea::Border, Rml::BoxEdge::Top), b.GetEdge(Rml::BoxArea::Border, Rml::BoxEdge::Right),
+                b.GetEdge(Rml::BoxArea::Border, Rml::BoxEdge::Bottom), b.GetEdge(Rml::BoxArea::Border, Rml::BoxEdge::Left),
+                bg.red, bg.green, bg.blue, bg.alpha, bc.red, bc.green, bc.blue, bc.alpha, deco ? 1 : 0,
+                cv.has_local_transform() ? 1 : 0, cv.font_size(), cv.line_height().value, (int)cv.vertical_align().type);
+        for (int i = 0; i < e->GetNumChildren(); i++) walk(e->GetChild(i), depth + 1, me);
+    };
+    Rml::ElementDocument *d = !g.modal.empty() && g.dialog && g.dialog->IsVisible() ? g.dialog : page_doc();
+    if (d) walk(d, 0, -1);
+    SDL_IOStream *io = SDL_IOFromFile(file.c_str(), "wb");
+    if (!io || SDL_WriteIO(io, out.data(), out.size()) != out.size()) otlog("boxes: cannot write %s", file.c_str());
+    else otlog("boxes %s %d", file.c_str(), n);
+    if (io) SDL_CloseIO(io);
+}
+
 void script_step()
 {
+    if (g_pages.script_hold && g_pages.script_hold()) return;   /* a wait of an extra page's test step */
+    if (g.script_pos < g.script.size() && g.script[g.script_pos] == "waitrace") {
+        /* test: until a game has been started (a room's race starts when the room says so) and has closed */
+        if (g.game || g.games_started == 0) return;
+        g.script_pos++;
+        g.script_wait = 30;
+        return;
+    }
     if (g.script_pos < g.script.size() && g.script[g.script_pos] == "waitgame") {
         if (g.game) return;
         g.script_pos++;
@@ -1954,7 +2993,7 @@ void script_step()
             Rml::Vector2f o = e->GetAbsoluteOffset(Rml::BoxArea::Border), z = e->GetBox().GetSize(Rml::BoxArea::Border);
             otlog("probe #%s at %.1f,%.1f size %.1fx%.1f", b.c_str(), o.x, o.y, z.x, z.y);
         }
-    } else if (a == "mclick" || a == "mhover") {
+    } else if (a == "mclick" || a == "mhover" || a == "mdown") {
         /* The mouse at x,y (window pixels) as a player's would be; the element
          * under it and the dialog opened (if any) are logged. */
         int x = atoi(b.c_str()), y = b.find(':') != std::string::npos ? atoi(b.c_str() + b.find(':') + 1) : 0;
@@ -1962,15 +3001,36 @@ void script_step()
         g.ctx->ProcessMouseMove(x, y, 0);
         Rml::Element *h = g.ctx->GetHoverElement();
         if (a == "mclick") {
+            g.mouse_click = true;
             g.ctx->ProcessMouseButtonDown(0, 0);
             g.ctx->ProcessMouseButtonUp(0, 0);
+            g.mouse_click = false;
+        } else if (a == "mdown") {
+            g.ctx->ProcessMouseButtonDown(0, 0);   /* held: never released (the shot, then quit) */
         }
         otlog("%s %d,%d -> %s -> modal=%s", a.c_str(), x, y, h ? h->GetAddress(false, false).c_str() : "-",
               g.modal.empty() ? "-" : g.modal.c_str());
     } else if (a == "shot") {
         g.shot_pending = b;
+    } else if (a == "boxes") {
+        g.boxes_pending = b;
+    } else if (a == "find") {
+        g.disc_found = find_discs(false);   /* the "discs" dialog, even empty (no file dialog in a test) */
+        g.model.DirtyVariable("disc_found");
+        show_modal("discs");
     } else if (a == "disc") {
-        set_disc(b);                  /* as if this disc image was chosen or dropped */
+        set_disc(b);                  /* as if this disc image was chosen */
+    } else if (a == "drop") {
+        file_dropped(b);              /* as if this file was dropped on the window */
+    } else if (a == "focus") {
+        focus_back();                 /* as if the window got the focus back from another program */
+    } else if (a == "size") {
+        int w = 0, h = 0;             /* the window resized, as by a drag (in window units) */
+        if (sscanf(b.c_str(), "%dx%d", &w, &h) == 2) SDL_SetWindowSize(g.window, w, h);
+    } else if (a == "text") {
+        g.ctx->ProcessTextInput(b);   /* typed into the focused field */
+    } else if (g_pages.script_step && g_pages.script_step(a, b)) {
+        /* a test step of an extra page */
     } else if (a == "wait") {
         g.script_wait = atoi(b.c_str());
     } else if (a == "quit") {
@@ -1992,9 +3052,9 @@ bool build_model()
         h.RegisterMember("label", &Row::label);
         h.RegisterMember("value", &Row::value);
         h.RegisterMember("button", &Row::button);
-        h.RegisterMember("pc", &Row::pc);
         h.RegisterMember("changed", &Row::changed);
         h.RegisterMember("pending", &Row::pending);
+        h.RegisterMember("idle", &Row::idle);
         h.RegisterMember("arrows", &Row::arrows);
         h.RegisterMember("toggle", &Row::toggle);
         h.RegisterMember("on", &Row::on);
@@ -2018,6 +3078,13 @@ bool build_model()
         h.RegisterMember("items", &NoteSec::items);
     }
     c.RegisterArray<std::vector<NoteSec>>();
+    if (auto h = c.RegisterStruct<DiscFound>()) {
+        h.RegisterMember("name", &DiscFound::name);
+        h.RegisterMember("dir", &DiscFound::dir);
+        h.RegisterMember("cur", &DiscFound::cur);
+    }
+    c.RegisterArray<std::vector<DiscFound>>();
+    c.Bind("disc_found", &g.disc_found);
     c.Bind("carpet", &g.carpet);
     c.Bind("rows", &g.rows);
     c.Bind("ctls", &g.ctls);
@@ -2029,11 +3096,13 @@ bool build_model()
     c.Bind("preset", &g.preset);
     c.Bind("help_title", &g.help_title);
     c.Bind("help_text", &g.help_text);
-    c.Bind("help_default", &g.help_default);
     c.Bind("help_extra", &g.help_extra);
-    c.Bind("help_pc", &g.help_pc);
+    c.Bind("prev_src", &g.prev_src);
+    c.Bind("prev_old", &g.prev_old);
+    c.Bind("prev_label", &g.prev_label);
     c.Bind("help_pending", &g.help_pending);
     c.Bind("pad_active", &g.pad_active);
+    c.Bind("page", &g.page);              /* the sidebar's icon and the hints follow it (tpl_*.rml) */
     c.Bind("have_disc", &g.have_disc);
     c.Bind("disc_state", &g.disc_state);
     c.Bind("disc_title", &g.disc_title);
@@ -2047,6 +3116,10 @@ bool build_model()
     c.Bind("track", &g.track);
     c.Bind("track_name", &g.track_name);
     c.Bind("version_text", &g.version_text);
+    c.Bind("ver_num", &g.ver_num);
+    c.Bind("ver_note", &g.ver_note);
+    c.Bind("inst_busy", &g.inst_busy);
+    c.Bind("inst_word", &g.inst_word);
     c.BindFunc("version", [](Rml::Variant &v) { v = Rml::String(OT_VERSION); });
     c.Bind("saved_note", &g.saved_note);
     c.Bind("ini_note", &g.ini_note);
@@ -2060,6 +3133,7 @@ bool build_model()
              { "inst_s1", &g.inst_s1 }, { "inst_s2", &g.inst_s2 }, { "inst_s3", &g.inst_s3 }, { "inst_l1", &g.inst_l1 },
              { "inst_l3", &g.inst_l3 }, { "inst_bar", &g.inst_bar }, { "inst_foot", &g.inst_foot } })
         c.Bind(b.first, b.second);
+    c.Bind("inst_cancel", &g.inst_cancel);
     c.Bind("modal", &g.modal);
     c.Bind("cap_kind", &g.cap_kind);
     c.Bind("cap_for", &g.cap_for);
@@ -2092,13 +3166,24 @@ bool build_model()
         if (a.empty()) return;
         int id = a[0].Get<int>();
         if (id < 0) return;
+        /* A mouse click on an action row opens it only on its button (on a path row: its value). */
+        if (g.mouse_click && (id >= 1000 || settings_def(id)->type == SETTING_PATH) &&
+            !has_class_up(ev.GetTargetElement(), id >= 1000 ? "ab" : "plainv")) return;
         if (id >= 1000) { row_action(id); return; }
         const SettingDef *d = settings_def(id);
         if (d->type == SETTING_PATH) { choose_path(id); return; }
         if (d->type == SETTING_KEY) return;
-        /* A click on the left arrow steps back; anywhere else steps forward. */
+        /* Enter / A (and a test's click:) step forward; a mouse click selects the row and only
+         * its arrows or its switch change the value. */
         Rml::Element *t = ev.GetTargetElement();
-        step_value(id, t && t->IsClassSet("left") ? -1 : 1);
+        int dir = 1;
+        if (g.mouse_click) {
+            if (has_class_up(t, "left")) dir = -1;
+            else if (!has_class_up(t, "right") && !has_class_up(t, "tog")) return;
+        } else if (t && t->IsClassSet("left")) {
+            dir = -1;
+        }
+        step_value(id, dir);
         if (id == S_BUTTON_STYLE) rebuild_ctls();
     });
     c.BindEventCallback("ctl_click", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &a) {
@@ -2129,7 +3214,17 @@ bool build_model()
         if (a.empty()) return;
         Rml::String w = a[0].Get<Rml::String>();
         const char *url = w == "releases" ? k_url_releases : w == "github" ? k_url_github : w == "kofi" ? k_url_kofi : nullptr;
-        if (url && !SDL_OpenURL(url)) otlog("cannot open %s: %s", url, SDL_GetError());
+        if (!url) return;
+        /* OT_OPENURL_FAIL: test only, as if there was no browser (Game Mode has none). */
+        if (getenv("OT_OPENURL_FAIL") || !SDL_OpenURL(url)) {
+            otlog("cannot open %s: %s", url, getenv("OT_OPENURL_FAIL") ? "test" : SDL_GetError());
+            g.notice_kick = "LINK";
+            g.notice_head = "COULDN'T OPEN THE BROWSER";
+            g.notice_text = std::string("Open this address on another device or in a browser: ") + url;
+            g.notice_file = "";
+            for (const char *v : { "notice_kick", "notice_head", "notice_text", "notice_file" }) g.model.DirtyVariable(v);
+            show_modal("notice");
+        }
     });
     c.BindEventCallback("dlg", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &a) {
         if (!a.empty()) dialog_action(a[0].Get<Rml::String>());
@@ -2148,9 +3243,16 @@ bool build_model()
         rebuild_ctls();
         settings_changed(-1);
     });
-    c.BindEventCallback("choose_disc", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) {
-        choose_path(S_DISC_IMAGE);
+    c.BindEventCallback("choose_disc", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &) { choose_disc(); });
+    c.BindEventCallback("disc_pick", [](Rml::DataModelHandle, Rml::Event &, const Rml::VariantList &a) {
+        int i = a.empty() ? -1 : a[0].Get<int>();
+        if (i < 0 || i >= (int)g.disc_found.size()) return;
+        std::string p = g.disc_found[(size_t)i].path;
+        close_modal();
+        otlog("find discs: chosen %s", ot_file_name(p).c_str());
+        set_disc(p);
     });
+    if (g_pages.bind) g_pages.bind(c);
     g.model = c.GetModelHandle();
     return true;
 }
@@ -2204,9 +3306,13 @@ void load_notes()
 }
 
 /* ── Is there a newer version? (ot_update.h) ─────────────────────────
- * One check per start at most, in a thread of its own: the home page shows
- * at once with the version alone and the built-in notes, and the pill
- * changes if the list of releases comes within k_update_wait_ms. */
+ * One automatic check per start at most, in a thread of its own: the home
+ * page shows at once with the version alone and the built-in notes, and the
+ * pill changes if the list of releases comes within k_update_wait_ms; no
+ * answer says nothing. Check now (a click on the pill when there is no
+ * update to show, or Settings > Advanced > Updates) asks at once, even with
+ * Check for updates = Never: the pill says "Checking...", then the answer,
+ * or that it couldn't check. */
 
 struct UpdateJob {
     std::mutex m;
@@ -2214,7 +3320,10 @@ struct UpdateJob {
     OtUpdateResult r;
 };
 std::shared_ptr<UpdateJob> g_update_job;
+bool g_update_job_manual = false;     /* the running check is the player's (or the player clicked during it) */
 bool g_update_late_logged = false;
+const double k_update_manual_wait_ms = 10000;
+const double k_update_click_gap_ms = 60000;     /* clicks reach GitHub once a minute at most (the cache answers between) */
 
 bool updates_off() { return SDL_strcasecmp(settings_get(g.set, S_CHECK_UPDATES), "never") == 0; }
 
@@ -2232,15 +3341,15 @@ void update_back_to_installed()
         g.model.DirtyVariable("upd_view");
 }
 
-/* The pill from what was read: "✓ vX · Latest", "Update to vY", or "vX"
- * (never checked, no answer, Never, a skipped version, or this build newer
- * than any release). */
+/* The pill from what was read: "Update to vY", "Checking…" while a check asked by the player
+ * runs, otherwise "vX" (up to date, never checked, no answer, Never, a skipped version, or this
+ * build newer than any release). */
 void update_apply()
 {
     g.upd_state = "";
     g.upd_url.clear();
     g.upd_tag.clear();
-    if (!updates_off() && g.upd_have) {
+    if ((!updates_off() || g.upd_manual) && g.upd_have) {
         bool unstable = SDL_strcasecmp(settings_get(g.set, S_UPDATE_CHANNEL), "unstable") == 0;
         int i = ot_update_pick(g.upd_releases, unstable);
         if (i >= 0) {
@@ -2260,18 +3369,86 @@ void update_apply()
             otlog("updates: no release with a version in the list");
         }
     }
+    /* A newer version stays shown while the player checks again. */
+    if (g.upd_state != "update") {
+        if (g_update_job && g_update_job_manual) g.upd_state = "checking";
+        else if (g.upd_error) g.upd_state = "error";
+    }
     if (g.upd_state == "update") g.version_text = "Update to v" + tag_version(g.upd_tag);
-    else if (g.upd_state == "latest") g.version_text = std::string("v") + OT_VERSION + " \xC2\xB7 Latest";
+    /* quiet when nothing is to be done: up to date or not checked, the version only (the answer is in
+     * Settings > Advanced > Updates); the pill speaks up for an update only */
+    else if (g.upd_state == "checking") g.version_text = "Checking\xE2\x80\xA6";
+    else if (g.upd_state == "error" && g.upd_fail_until > now_ms()) g.version_text = "Couldn't check";
     else g.version_text = std::string("v") + OT_VERSION;
+    /* The label: the version, and a word for its state (none while nothing is known). */
+    g.ver_num = g.upd_state == "update" ? "v" + tag_version(g.upd_tag) : std::string("v") + OT_VERSION;
+    if (g.upd_state == "latest") g.ver_note = "Latest";
+    else if (g.upd_state == "update") g.ver_note = "Available";
+    else if (g.upd_state == "checking") g.ver_note = "Checking\xE2\x80\xA6";
+    else if (g.upd_state == "error" && g.upd_fail_until > now_ms()) g.ver_note = "Couldn't check";
+    else g.ver_note = "";
     if (g.upd_state != "update" && g.upd_view) update_back_to_installed();
     if (g.model)
-        for (const char *v : { "version_text", "upd_state" }) g.model.DirtyVariable(v);
+        for (const char *v : { "version_text", "upd_state", "ver_num", "ver_note" }) g.model.DirtyVariable(v);
+    update_row_refresh();
 }
 
-void update_start()
+/* Settings > Advanced > Updates: the last answer. */
+/* One message per row, a few words each: the value is the version (or the new one available), the button
+ * says what happens: Check now, Checking..., Up to date (dimmed for a minute), Update, Try again.
+ * A failed check is also said by the pill on the home page. */
+std::string update_row_value()
 {
-    if (g.upd_started) return;
-    if (updates_off()) {
+    if (g.upd_state == "update") return "v" + tag_version(g.upd_tag) + " available";
+    return std::string("v") + OT_VERSION;
+}
+
+std::string update_row_button(bool *idle)
+{
+    *idle = false;
+    if (g.upd_state == "update") return "Update";
+    if (g.upd_state == "checking") { *idle = true; return "Checking\xE2\x80\xA6"; }
+    if (update_just_checked()) { *idle = true; return "Up to date"; }
+    if (g.upd_error) return "Try again";
+    return "Check now";
+}
+
+/* A second Check now within k_update_click_gap_ms only rereads the cache, so nothing would seem to happen.
+ * After a manual check that found this version up to date, the button says so, dimmed and inert, for that
+ * minute; then Check now works again. */
+bool update_just_checked()
+{
+    return g.upd_state == "latest" && g.upd_manual && !g_update_job && now_ms() - g.upd_last_click < k_update_click_gap_ms;
+}
+
+void update_row_refresh()
+{
+    for (Row &r : g.rows)
+        if (r.id == A_CHECK_UPDATES) {
+            bool idle;
+            std::string b = update_row_button(&idle);
+            if (r.value == update_row_value() && r.button == b && r.idle == idle) continue;
+            r.value = update_row_value();
+            r.button = b;
+            r.idle = idle;
+            if (g.model) g.model.DirtyVariable("rows");
+        }
+}
+
+void update_start(bool manual)
+{
+    if (g_update_job) {                 /* one at a time: a click during the check at start takes it over */
+        if (manual && !g_update_job_manual) {
+            g_update_job_manual = true;
+            g.upd_manual = true;
+            g.upd_error = false;
+            otlog("updates: Check now during the check at start: its answer is shown");
+            update_apply();
+        }
+        return;
+    }
+    if (!manual && g.upd_started) return;
+    if (!manual && updates_off()) {
         otlog("updates: Check for updates = Never, no request");
         return;
     }
@@ -2281,12 +3458,28 @@ void update_start()
     req.cache_file = g.upd_test_json.empty() && g.upd_test_url.empty() ? g.upd_cache : "";
     req.allow_loopback_http = !g.upd_test_url.empty();
     req.user_agent = std::string("OpenTricky-launcher/") + OT_VERSION;
-    req.timeout_ms = (int)k_update_wait_ms;
+    req.timeout_ms = (int)(manual ? k_update_manual_wait_ms : k_update_wait_ms);
     if (req.json_file.empty() && req.cache_file.empty() && g.upd_test_url.empty()) {
-        otlog("updates: no folder for the cache file, no request");     /* nothing would keep it to once a day */
+        otlog("updates: no folder for the cache file, no request");     /* nothing would keep it to every 6 hours */
         return;
     }
-    g.upd_started = true;
+    if (manual) {
+        req.force = now_ms() - g.upd_last_click >= k_update_click_gap_ms;
+        g.upd_last_click = now_ms();
+        g.upd_manual = true;
+        g.upd_error = false;
+        g.upd_fail_until = 0;
+        if (!g.upd_skip.empty()) {      /* the player asks: a skipped version shows again */
+            otlog("updates: Check now forgets the skipped %s", g.upd_skip.c_str());
+            g.upd_skip.clear();
+            if (req.cache_file.empty()) otlog("updates: (test: the cache file is not changed)");
+            else if (!ot_update_write_skip(req.cache_file, "")) otlog("updates: could not clear the skipped version");
+        }
+    } else {
+        g.upd_started = true;
+    }
+    g_update_job_manual = manual;
+    g_update_late_logged = false;
     g.upd_t0 = now_ms();
     auto job = std::make_shared<UpdateJob>();
     g_update_job = job;
@@ -2296,19 +3489,23 @@ void update_start()
         job->r = std::move(r);
         job->done = true;
     }).detach();
-    otlog("updates: check started (%s)", !req.json_file.empty() ? "test file" : req.cache_file.empty() ? "test address" : "cache or GitHub");
+    otlog("updates: %s started (%s)", manual ? (req.force ? "Check now" : "Check now (within a minute: the cache first)") : "check",
+          !req.json_file.empty() ? "test file" : req.cache_file.empty() ? "test address" : "cache or GitHub");
+    if (manual) update_apply();         /* "Checking..." */
 }
 
 /* From the main loop: takes the answer when it is there. */
 void update_poll()
 {
+    static bool just = false;                 /* the minute after a Check now ends: the row comes back */
+    if (just != update_just_checked()) { just = !just; update_row_refresh(); }
     if (!g_update_job) return;
     double waited = now_ms() - g.upd_t0;
     OtUpdateResult r;
     {
         std::lock_guard<std::mutex> lk(g_update_job->m);
         if (!g_update_job->done) {
-            if (waited > k_update_wait_ms && !g_update_late_logged) {
+            if (!g_update_job_manual && waited > k_update_wait_ms && !g_update_late_logged) {
                 otlog("updates: no answer within %.0f ms: the version alone", k_update_wait_ms);
                 g_update_late_logged = true;
             }
@@ -2317,9 +3514,19 @@ void update_poll()
         r = std::move(g_update_job->r);
     }
     g_update_job.reset();
-    otlog("updates: %s, %s, after %.0f ms (%d releases)", r.ok ? "read" : "nothing", r.source.c_str(), waited, (int)r.releases.size());
-    if (!r.ok) return;
-    if (waited > k_update_wait_ms + 250) {      /* the main loop looks every 100 ms at most */
+    bool manual = g_update_job_manual;
+    g_update_job_manual = false;
+    otlog("updates: %s, %s, after %.0f ms (%d releases)%s", r.ok ? "read" : "nothing", r.source.c_str(), waited,
+          (int)r.releases.size(), manual ? " (Check now)" : "");
+    if (!r.ok) {
+        g.upd_error = manual;           /* said only to a player who asked */
+        if (manual) {
+            g.upd_fail_until = now_ms() + 3000;      /* the pill says it for a moment, then is quiet again */
+            update_apply();
+        }
+        return;
+    }
+    if (!manual && waited > k_update_wait_ms + 250) {      /* the main loop looks every 100 ms at most */
         otlog("updates: too late to be shown");
         return;
     }
@@ -2342,6 +3549,7 @@ void update_settings_changed()
 
 std::shared_ptr<OtInstallState> g_install;
 bool g_install_restore = false;
+bool g_quit_after_install = false;
 std::string g_install_version;
 
 const OtRelease *update_release()
@@ -2353,6 +3561,7 @@ const OtRelease *update_release()
 
 void install_texts()
 {
+    g.model.DirtyVariable("inst_cancel");
     for (const char *v : { "inst_kick", "inst_head", "inst_text", "inst_phase", "inst_s1", "inst_s2", "inst_s3",
                            "inst_l1", "inst_l3", "inst_bar", "inst_foot" })
         g.model.DirtyVariable(v);
@@ -2377,14 +3586,16 @@ void install_start(bool restore)
     req.user_agent = std::string("OpenTricky-launcher/") + OT_VERSION;
     req.allow_loopback_http = !g.upd_test_url.empty();
     req.fail_at = g.inst_test_fail_at;
+    if (!g.upd_test_url.empty()) req.kill_at = g.inst_test_kill_at;   /* tests only: with a local fake GitHub */
     std::string backup_version;
     g_install_restore = restore;
-    g.inst_kick = restore ? "RESTORE" : (SDL_strcasecmp(settings_get(g.set, S_UPDATE_CHANNEL), "unstable") == 0 ? "UPDATE \xC2\xB7 UNSTABLE" : "UPDATE \xC2\xB7 STABLE");
+    g.inst_kick = restore ? "RESTORE" : (SDL_strcasecmp(settings_get(g.set, S_UPDATE_CHANNEL), "unstable") == 0 ? "UPDATE \xC2\xB7 BETA" : "UPDATE");
     g.inst_s1 = g.inst_s2 = g.inst_s3 = "";
     g.inst_bar = "0%";
     g.inst_l1 = "Download";
     g.inst_l3 = "Install";
     g.inst_foot = "";
+    g.inst_cancel = false;
     if (restore) {
         if (!ot_install_has_backup(g.base, backup_version)) return;
         g_install_version = backup_version;
@@ -2419,8 +3630,8 @@ void install_start(bool restore)
     if (!ot_install_writable(g.base)) {
         otlog("updates: the program's folder cannot be written");
         install_fail("nowrite", "CAN'T UPDATE HERE",
-                     "This folder can't be written (Program Files?), so nothing was changed. Download v" + g_install_version +
-                     " from its page and unzip it over this folder: your settings and saves stay.");
+                     "OpenTricky can't write to its folder. Nothing was changed. Download v" + g_install_version +
+                     " and copy what is in the folder inside its zip over this folder.");
         return;
     }
     if (ot_install_game_running(g.base)) {
@@ -2428,6 +3639,7 @@ void install_start(bool restore)
         return;
     }
     g.inst_phase = "run";
+    g.inst_cancel = !restore;
     install_texts();
     show_modal("update");
     auto st = std::make_shared<OtInstallState>();
@@ -2476,15 +3688,19 @@ void install_poll()
         char b[96];
         if (step <= 1 && total > 0) snprintf(b, sizeof b, "Downloading \xC2\xB7 %.1f / %.1f MB", got / 1048576.0, total / 1048576.0);
         else snprintf(b, sizeof b, "Downloaded \xC2\xB7 %.1f MB", (total > 0 ? total : got) / 1048576.0);
-        g.inst_l1 = b;
+        g.inst_l1 = st.cancel ? "Cancelling\xE2\x80\xA6" : b;
     }
+    g.inst_cancel = !g_install_restore && step < 3 && !st.cancel && !st.done;
     g.inst_s3 = step > 3 ? "ok" : step == 3 ? "run" : "";
-    g.inst_l3 = step >= 3 ? (g_install_restore ? "Putting back the previous version\xE2\x80\xA6" : "Installing\xE2\x80\xA6") : "Install";
+    g.inst_l3 = step >= 3 ? (g_install_restore ? "Restoring\xE2\x80\xA6" : "Installing\xE2\x80\xA6") : "Install";
     int pct = 0;
     if (g_install_restore) pct = step >= 4 ? 100 : 50;
     else if (step <= 1) pct = total > 0 ? (int)(got * 80 / total) : 0;
     else pct = step == 2 ? 85 : step == 3 ? 92 : 100;
     g.inst_bar = std::to_string(pct) + "%";
+    g.inst_busy = !st.done.load();
+    g.inst_word = g_install_restore ? "Restoring" : step <= 1 ? "Downloading" : step == 2 ? "Verifying" : "Installing";
+    for (const char *v : { "inst_busy", "inst_word" }) g.model.DirtyVariable(v);
     install_texts();
     if (!st.done.load()) return;
     bool ok;
@@ -2496,6 +3712,8 @@ void install_poll()
         detail = st.detail;
     }
     g_install.reset();
+    g.inst_cancel = false;
+    if (g_quit_after_install) g.quit = true;      /* the window was closed during the download */
     otlog("updates: %s %s%s%s", g_install_restore ? "restore" : "install", ok ? "done" : ("failed (" + fail + ")").c_str(),
           detail.empty() ? "" : ": ", detail.c_str());
     if (ok) {
@@ -2506,22 +3724,41 @@ void install_poll()
         install_relaunch();
         return;
     }
+    if (fail == "cancel") {             /* nothing changed: back where the player was */
+        close_modal();
+        return;
+    }
     if (fail == "signature")
         install_fail("fail", "UPDATE REFUSED", "This update isn't signed by the OpenTricky project, so it wasn't installed. Nothing was changed. Get it from the project's releases page if you trust it.");
     else if (fail == "verify") install_fail("fail", "UPDATE STOPPED", "The update couldn't be verified. Nothing was changed.");
     else if (fail == "download") install_fail("fail", "UPDATE STOPPED", "The update couldn't be downloaded. Nothing was changed.");
     else if (fail == "busy") install_fail("fail", "THE GAME IS RUNNING", "Close SSX Tricky first. Nothing was changed.");
+    else if (fail == "partial")
+        install_fail("fail", g_install_restore ? "RESTORE STOPPED" : "UPDATE STOPPED",
+                     "Some files are in use. Close SSX Tricky, then restart OpenTricky: the version you were using comes back as it was.");
     else if (g_install_restore) install_fail("fail", "RESTORE STOPPED", "The previous version couldn't be put back. Nothing was changed.");
     else install_fail("fail", "UPDATE STOPPED", "The update couldn't be installed. Nothing was changed.");
 }
 
 bool install_running() { return g_install != nullptr; }
 
+/* The player's Cancel (the button, Esc / B, closing the window): an update
+ * stops before its step 3, nothing changed. false: too late, or a Restore. */
+bool install_cancel()
+{
+    if (!g_install || g_install_restore || g_install->step.load() >= 3) return false;
+    if (!g_install->cancel.exchange(true)) otlog("updates: Cancel asked (step %d)", g_install->step.load());
+    return true;
+}
+
 /* The pill, and the three buttons under the newer version's notes. */
 void update_action(const std::string &a)
 {
     if (a == "pill") {
-        if (g.upd_state != "update") return;
+        if (g.upd_state != "update") {          /* Check now (nothing while a check of the player's runs) */
+            if (!(g_update_job && g_update_job_manual)) update_start(true);
+            return;
+        }
         int i = -1;
         for (int k = 0; k < (int)g.upd_releases.size(); k++)
             if (g.upd_releases[k].tag == g.upd_tag) i = k;
@@ -2547,13 +3784,111 @@ void update_action(const std::string &a)
     }
 }
 
+/* ── One launcher per install ─────────────────────────────────────────
+ * A second launcher of the same folder (a double-click while the first is
+ * open) brings the first one's window to the front and quits: two never
+ * write settings.ini, nor update-tmp\ during an update, at once. The
+ * launcher an update or a Restore starts waits for the one that installed
+ * it to close. */
+
+#ifdef _WIN32
+HANDLE g_instance = nullptr;
+
+BOOL CALLBACK raise_other_launcher(HWND w, LPARAM exe)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    wchar_t title[32];
+    if (pid == GetCurrentProcessId() || !IsWindowVisible(w) || GetWindowTextW(w, title, 32) <= 0 || wcscmp(title, L"OpenTricky") != 0)
+        return TRUE;
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return TRUE;
+    wchar_t path[MAX_PATH];
+    DWORD n = MAX_PATH;
+    bool same = QueryFullProcessImageNameW(p, 0, path, &n) && _wcsicmp(path, (const wchar_t *)exe) == 0;
+    CloseHandle(p);
+    if (!same) return TRUE;
+    if (no_activate()) return FALSE;    /* found, but left where it is */
+    if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
+    SetForegroundWindow(w);
+    return FALSE;
+}
+#endif
+
+/* true: this is the install's only launcher (or no lock could be made). */
+bool instance_lock(bool wait)
+{
+#ifdef _WIN32
+    char name[128];
+    if (!settings_instance_name("Launcher", name, sizeof name)) return true;
+    g_instance = CreateMutexA(nullptr, FALSE, name);
+    if (!g_instance) return true;
+    DWORD r = WaitForSingleObject(g_instance, wait ? 30000 : 0);
+    if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) return true;   /* abandoned: the other one ended without letting go */
+    CloseHandle(g_instance);
+    g_instance = nullptr;
+    wchar_t exe[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) EnumWindows(raise_other_launcher, (LPARAM)exe);
+    return false;
+#else
+    (void)wait;
+    return true;
+#endif
+}
+
+void instance_unlock()
+{
+#ifdef _WIN32
+    if (!g_instance) return;
+    ReleaseMutex(g_instance);
+    CloseHandle(g_instance);
+    g_instance = nullptr;
+#endif
+}
+
+/* Under Wine, gamescope (Steam's Game Mode) or Steam's Big Picture: a full
+ * screen launcher. The variables come from the Linux side. */
+bool game_mode_screen(std::string &why)
+{
+    const char *o = getenv("OT_LAUNCHER_FULLSCREEN");
+    if (o && *o) { why = std::string("OT_LAUNCHER_FULLSCREEN=") + o; return o[0] == '1'; }
+    SettingsPlatform p;
+    settings_platform_probe(&p, nullptr);
+    if (!p.wine) { why = "not under Wine"; return false; }
+    const char *gs = getenv("GAMESCOPE_WAYLAND_DISPLAY"), *de = getenv("XDG_CURRENT_DESKTOP"), *ui = getenv("SteamGamepadUI");
+    if (gs && *gs) { why = "gamescope"; return true; }
+    if (de && SDL_strcasestr(de, "gamescope")) { why = "XDG_CURRENT_DESKTOP=gamescope"; return true; }
+    if (ui && !strcmp(ui, "1")) { why = "SteamGamepadUI=1"; return true; }
+    why = "under Wine, a desktop";
+    return false;
+}
+
 /* Resize the RmlUi context to the window. */
 void fit_window(int pw, int ph)
 {
+    float dp = std::min(pw / 1280.0f, ph / 800.0f);
+    g.rescaled = g.rescaled || dp != g.ctx->GetDensityIndependentPixelRatio();
     g.render->SetViewport(pw, ph);
     g.ctx->SetDimensions({ pw, ph });
-    g.ctx->SetDensityIndependentPixelRatio(std::min(pw / 1280.0f, ph / 800.0f));
+    g.ctx->SetDensityIndependentPixelRatio(dp);
     apply_layout();
+}
+
+/* After a new scale, the texts are sized again. RmlUi 6.3 computes again,
+ * on a new dp ratio, only the properties written in dp: those written with
+ * a variable (font-size: var(--fs-l) in launcher.rcss, the variable holding
+ * the dp) keep their old value, so after a live resize the boxes followed the
+ * window but the texts kept their old size (a title wrapped on two lines, the
+ * footer's links run together). Releasing the font sizes dirties the font size
+ * of every element, which computes all of its properties again, variables
+ * included, with no page loaded again: the dialog open, a key being captured,
+ * the unsaved settings, the tab and the focus stay as they are. Once per frame
+ * at most (a drag sends many sizes). */
+void refit_texts()
+{
+    if (!g.rescaled) return;
+    g.rescaled = false;
+    Rml::ReleaseFontResources();
 }
 
 } // namespace
@@ -2578,12 +3913,15 @@ int main(int argc, char **argv)
         else if (a == "--no-skip") no_skip = true;
         else if (a == "--crash-test") crash_test = next();
         else if (a == "--report-dir") g_report_dir = next();
+        else if (a == "--find-root") { g.find_root = next(); if (!g.find_root.empty() && !ends_with_ci(g.find_root, "\\")) g.find_root += "\\"; }
         /* Tests of the update check: a local JSON file instead of GitHub, or
          * another https address (no cache read or written with either). */
         else if (a == "--updates-json") g.upd_test_json = next();
         else if (a == "--updates-url") g.upd_test_url = next();
         else if (a == "--updates-fail-at") g.inst_test_fail_at = next();   /* tests: an install that fails there */
+        else if (a == "--updates-kill-at") g.inst_test_kill_at = next();   /* tests: an install cut there (OtInstallRequest) */
         else if (a == "--updated" || a == "--restored") { g.started_restored = a == "--restored"; g.started_after = next(); }
+        else if (g_pages.arg && g_pages.arg(a, next)) {}   /* an option of an extra page */
         else if (a == "--script") {
             std::string s = next();
             size_t p = 0;
@@ -2599,6 +3937,10 @@ int main(int argc, char **argv)
     otlog("OpenTricky launcher %s", OT_VERSION);
     if (!g.started_after.empty()) otlog("started after %s %s", g.started_restored ? "the restore of" : "the update to", g.started_after.c_str());
     otlog("timing process_to_main_ms=%.1f", t_main);
+    if (!instance_lock(!g.started_after.empty())) {
+        otlog("another launcher of this folder is open: it is brought to the front, this one closes");
+        return 3;
+    }
 
     double t0 = now_ms();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
@@ -2608,6 +3950,34 @@ int main(int argc, char **argv)
     double t_sdl = now_ms();
     const char *bp = SDL_GetBasePath();
     g.base = bp ? bp : "";
+    {
+        /* An update or a Restore cut half-way: put back (or finished) before
+         * anything reads the program's files; the player is told at the first frame. */
+        OtRecovery r = ot_install_recover(g.base);
+        if (r.found) {
+            otlog("updates: an interrupted %s was found: %s%s%s", r.kind.empty() ? "install" : r.kind.c_str(),
+                  !r.ok ? (r.gave_up ? "not put right, given up" : "not put right yet") : r.finished ? "finished" : ("v" + r.version + " is back").c_str(),
+                  r.detail.empty() ? "" : ": ", r.detail.c_str());
+            g.notice_kick = "UPDATES";
+            if (r.ok && r.finished) {
+                g.notice_head = r.kind == "restore" ? "RESTORE FINISHED" : "UPDATE FINISHED";
+                g.notice_text = r.kind == "restore" ? "The last restore is now complete. Your settings and saves are unchanged."
+                                                    : "The last update is now complete. Your settings and saves stay (a preset takes its new values).";
+            } else if (r.ok) {
+                g.notice_head = r.kind == "restore" ? "RESTORE INTERRUPTED" : "UPDATE INTERRUPTED";
+                g.notice_text = std::string("The last ") + (r.kind == "restore" ? "restore" : "update") + " was interrupted, so it was undone: v" +
+                                r.version + " is back as it was. Your settings and saves were never touched.";
+            } else {
+                g.notice_head = r.kind == "restore" ? "RESTORE INTERRUPTED" : "UPDATE INTERRUPTED";
+                g.notice_text = std::string("The last ") + (r.kind == "restore" ? "restore" : "update") +
+                                (r.gave_up
+                                     ? " was interrupted and couldn't be undone. Download OpenTricky from its releases page and copy what is in the folder inside the zip over this folder: your settings and saves stay."
+                                     : " was interrupted and couldn't be undone yet (a file in use?). Close SSX Tricky, then start OpenTricky again.");
+            }
+            g.notice_file.clear();
+            g.recovered = true;
+        }
+    }
     {
         /* The game in bin\ (0.1.2 and later): the copies of the program an
          * update from 0.1.1, or a new version unzipped over an old one, left
@@ -2650,15 +4020,17 @@ int main(int argc, char **argv)
     for (int t = 0; t < SETTINGS_TAB_COUNT; t++) g.tabs.push_back(settings_tab_name(t));
     for (int p = 0; p < SETTINGS_PRESET_CUSTOM + 1; p++) g.presets.push_back(settings_preset_name(p));
     g.version_text = std::string("v") + OT_VERSION;   /* until the list of releases is read (update_apply) */
+    g.ver_num = g.version_text;
     if (tab_arg >= 0 && tab_arg < SETTINGS_TAB_COUNT) g.tab = tab_arg;
     load_notes();
     {
         std::string ini = !g.ini_write.empty() ? g.ini_write : g.ini_read;
         if (!ini.empty()) g.upd_cache = ot_dir_of(ini) + "update-cache.txt";
+        if (!ini.empty()) g.theme_order = ot_dir_of(ini) + "theme-order.txt";
     }
 
     /* Skip launcher: straight to the game, unless Shift / Select is held. */
-    if (!no_skip && crash_test.empty() && g.script.empty() && settings_get_bool(g.set, S_SKIP_LAUNCHER)) {
+    if (!no_skip && crash_test.empty() && g.script.empty() && !g.recovered && settings_get_bool(g.set, S_SKIP_LAUNCHER)) {
         if (launcher_key_held()) {
             otlog("skip launcher: Shift / Select held, the launcher shows");
         } else {
@@ -2688,12 +4060,31 @@ int main(int argc, char **argv)
      * (OpenTricky.rc, the OT badge): SDL loads the first ICON group of the
      * exe for its window class on Windows, at every size the .ico holds.
      * SDL_SetWindowIcon would replace it with a single-size copy. */
+    if (no_activate()) {                        /* test tools: never the focus (show_launcher_window) */
+        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "0");
+        otlog("window: XBOX_NO_ACTIVATE: shown without the focus, behind the other windows");
+    }
     g.window = SDL_CreateWindow("OpenTricky", ww, wh, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
     if (!g.window) {
         otlog("error: window: %s", SDL_GetError());
         return 1;
     }
-    SDL_SetWindowMinimumSize(g.window, 640, 400);
+    /* The window resizes only into shapes the page is drawn for, 16:10
+     * (1280 x 800, the Steam Deck) to 2:1 (the widest stage, 1600 dp), and
+     * never too small to read. Full screen (Game Mode) is not bound by it. */
+    SDL_SetWindowMinimumSize(g.window, 960, 600);
+    SDL_SetWindowAspectRatio(g.window, 1.6f, 2.0f);
+    {
+        /* Steam's Game Mode (gamescope: a Steam Deck, Big Picture): the
+         * launcher fills the screen, as the game does; on a desktop it stays
+         * a window. OT_LAUNCHER_FULLSCREEN=1 / 0 decides instead. */
+        std::string why;
+        bool full = game_mode_screen(why);
+        if (full && !size_arg.empty()) otlog("window: Game Mode (%s), but --size given: a window", why.c_str());
+        else if (full) otlog("window: Game Mode (%s): full screen%s", why.c_str(), SDL_SetWindowFullscreen(g.window, true) ? "" : " refused");
+        else otlog("window: %s: a window", why.c_str());
+    }
     g.gl = SDL_GL_CreateContext(g.window);
     SDL_GL_MakeCurrent(g.window, g.gl);
     SDL_GL_SetSwapInterval(1);
@@ -2715,7 +4106,7 @@ int main(int argc, char **argv)
     Rml::SetRenderInterface(&render);
     Rml::SetFileInterface(&g.files);
     Rml::Initialise();
-    const char *fonts[] = { "ui/fonts/Inter-Variable.ttf", "ui/fonts/BebasNeue-Regular.ttf", "ui/fonts/Exo2-Italic-Variable.ttf" };
+    const char *fonts[] = { "ui/fonts/Inter-Variable.ttf", "ui/fonts/Exo2-Italic-Variable.ttf" };
     for (const char *f : fonts)
         if (!Rml::LoadFontFace(g.prog + f, f == fonts[0])) otlog("font missing: %s", f);
     /* Bullet (House Industries): the logo, PLAY and the titles; Exo 2 Black
@@ -2724,12 +4115,14 @@ int main(int argc, char **argv)
     otlog("display font: %s", g.bullet ? "Bullet" : "Exo 2 Black Italic (fallback)");
     double t_rml = now_ms();
 
+    if (g.iso.empty()) auto_pick_disc();
     load_disc();
+    if (g.disc_auto) save_settings_file();      /* remembered, as a chosen one */
     if (g.have_assets) {
         int t = track_arg;
-        /* A track picked at random at each start, with no choice anywhere;
-         * --track is for the project's tests only. */
-        if (t < 0) t = (int)(std::random_device{}() % OT_TRACK_COUNT);
+        /* A track dealt at each start (theme_next_track), with no choice
+         * anywhere; --track is for the project's tests only. */
+        if (t < 0) t = theme_next_track();
         g.track = t % OT_TRACK_COUNT;
     }
     pick_theme();
@@ -2764,7 +4157,11 @@ int main(int argc, char **argv)
         if (!play()) g.skip_mode = false;
     }
 
-    SDL_Gamepad *pad = nullptr;
+    /* Every controller is opened (a Steam Deck's own and a plugged one): any
+     * button works; the stick that moves the focus is the one of the
+     * controller last used. */
+    std::vector<SDL_Gamepad *> pads;
+    SDL_JoystickID pad_last = 0;
     bool first = true;
     int frames = 0;
     while (!g.quit) {
@@ -2777,8 +4174,9 @@ int main(int argc, char **argv)
         while (has) {
             switch (ev.type) {
             case SDL_EVENT_QUIT:
-                if (install_running()) otlog("close asked during an install: it finishes first");
-                else g.quit = true;
+                if (!install_running()) g.quit = true;
+                else if (install_cancel()) g_quit_after_install = true;      /* closes once the download has stopped */
+                else otlog("close asked during an install: it finishes first");
                 break;
             case SDL_EVENT_KEY_DOWN:
                 if (!key_down(ev.key.key, ev.key.scancode)) RmlSDL::InputEventHandler(g.ctx, g.window, ev);
@@ -2786,14 +4184,31 @@ int main(int argc, char **argv)
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
                 fit_window(ev.window.data1, ev.window.data2);
                 break;
-            case SDL_EVENT_GAMEPAD_ADDED:
-                if (!pad) pad = SDL_OpenGamepad(ev.gdevice.which);
-                otlog("controller: %s", pad ? SDL_GetGamepadName(pad) : "?");
+            case SDL_EVENT_GAMEPAD_ADDED: {
+                bool open = false;
+                for (SDL_Gamepad *p : pads) open = open || SDL_GetGamepadID(p) == ev.gdevice.which;
+                if (open) break;
+                SDL_Gamepad *p = SDL_OpenGamepad(ev.gdevice.which);
+                if (p) pads.push_back(p);
+                if (p && !pad_last) pad_last = ev.gdevice.which;
+                otlog("controller: %s (%d open)", p ? SDL_GetGamepadName(p) : "?", (int)pads.size());
                 break;
+            }
             case SDL_EVENT_GAMEPAD_REMOVED:
-                if (pad && SDL_GetGamepadID(pad) == ev.gdevice.which) { SDL_CloseGamepad(pad); pad = nullptr; }
+                for (size_t i = 0; i < pads.size(); i++)
+                    if (SDL_GetGamepadID(pads[i]) == ev.gdevice.which) {
+                        SDL_CloseGamepad(pads[i]);
+                        pads.erase(pads.begin() + (long)i);
+                        break;
+                    }
+                if (pad_last == ev.gdevice.which) pad_last = pads.empty() ? 0 : SDL_GetGamepadID(pads[0]);
+                break;
+            case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+                if (ev.gaxis.value > 20000 || ev.gaxis.value < -20000) pad_last = ev.gaxis.which;
+                RmlSDL::InputEventHandler(g.ctx, g.window, ev);
                 break;
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+                if (ev.gbutton.which) pad_last = ev.gbutton.which;      /* 0: a test step's button */
                 SDL_GamepadType t = SDL_GetGamepadTypeForID(ev.gbutton.which);
                 g.pad_is_ps = t == SDL_GAMEPAD_TYPE_PS3 || t == SDL_GAMEPAD_TYPE_PS4 || t == SDL_GAMEPAD_TYPE_PS5;
                 update_hint_style();
@@ -2809,11 +4224,18 @@ int main(int argc, char **argv)
                 set_pad_active(false);
                 RmlSDL::InputEventHandler(g.ctx, g.window, ev);
                 break;
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                g.mouse_click = true;              /* a click dispatched now is the mouse's */
+                RmlSDL::InputEventHandler(g.ctx, g.window, ev);
+                g.mouse_click = false;
+                break;
+            case SDL_EVENT_WINDOW_FOCUS_GAINED:
+                focus_back();
+                RmlSDL::InputEventHandler(g.ctx, g.window, ev);
+                break;
             case SDL_EVENT_DROP_FILE:
-                if (ev.drop.data && (ends_with_ci(ev.drop.data, ".iso") || ends_with_ci(ev.drop.data, ".xiso"))) {
-                    otlog("disc image dropped");
-                    set_disc(ev.drop.data);
-                }
+                if (ev.drop.data) file_dropped(ev.drop.data);
                 break;
             default: RmlSDL::InputEventHandler(g.ctx, g.window, ev); break;
             }
@@ -2826,19 +4248,24 @@ int main(int argc, char **argv)
                 g.game = nullptr;
                 game_ended(code);
             } else {
+                if (g_pages.tick_hidden) g_pages.tick_hidden();
                 continue;                       /* nothing to draw while the game runs */
             }
         }
         if (g.skip_mode && !g.game) { if (g.quit) break; continue; }
         if (!g.game && g.cap_until > 0 && g.modal == "capture" && now_ms() > g.cap_until) close_modal();
         if (g.modal != "capture") g.cap_until = 0;
-        stick_update(pad);
+        if (g.upd_fail_until > 0 && now_ms() > g.upd_fail_until) { g.upd_fail_until = 0; update_apply(); }
+        stick_update(pad_last ? SDL_GetGamepadFromID(pad_last) : nullptr);
         dialog_poll();
         update_poll();
         install_poll();
+        if (g_pages.poll) g_pages.poll();
         script_step();
+        refit_texts();
 
         g.ctx->Update();
+        fit_sized_pictures();
         if (g.focus_first_row && g.page == "settings" && g.settings && g.modal.empty()) {
             Rml::ElementList list;
             g.settings->QuerySelectorAll(list, ".row, .cell");
@@ -2863,26 +4290,33 @@ int main(int argc, char **argv)
         g.ctx->Render();
         render.EndFrame();
         if (!g.shot_pending.empty()) {
+            if (!g.boxes_pending.empty()) save_boxes(g.boxes_pending);
+            g.boxes_pending.clear();
             save_shot(g.shot_pending);
             g.shot_pending.clear();
         }
         SDL_GL_SwapWindow(g.window);
         frames++;
+#ifdef _WIN32
+        if (no_activate()) keep_out_of_front();
+#endif
         if (first) {
             if (!g.skip_mode && !g.game) {
-                SDL_ShowWindow(g.window);
+                show_launcher_window(false);
                 g.shown = true;
             }
             first = false;
             if (!g.skip_mode) update_start();      /* after the first frame: never in its way */
-            if (!g.started_after.empty() && g.modal.empty()) {
+            if (g.recovered && g.modal.empty()) {
+                show_modal("notice");             /* its texts were set at start (ot_install_recover) */
+            } else if (!g.started_after.empty() && g.modal.empty()) {
                 std::string v;
                 g.notice_kick = "UPDATES";
                 g.notice_head = (g.started_restored ? "BACK TO v" : "UPDATED TO v") + g.started_after;
                 g.notice_text = g.started_restored ? "The previous version is back. Your settings and saves are as they were."
-                              : ot_install_has_backup(g.base, v) ? "Your settings and saves are as they were. The previous version (v" + v +
+                              : ot_install_has_backup(g.base, v) ? "Your settings and saves stay (a preset takes its new values). The previous version (v" + v +
                                                                      ") is kept: Settings \xE2\x80\xBA Advanced \xE2\x80\xBA Restore."
-                                                                 : "Your settings and saves are as they were.";
+                                                                 : "Your settings and saves stay (a preset takes its new values).";
                 g.notice_file.clear();
                 show_modal("notice");
             }
@@ -2916,7 +4350,8 @@ int main(int argc, char **argv)
         SDL_DestroyProcess(g.game);
         g.game = nullptr;
     }
-    if (pad) SDL_CloseGamepad(pad);
+    for (SDL_Gamepad *p : pads) SDL_CloseGamepad(p);
+    if (g_pages.shutdown) g_pages.shutdown();
     g.ctx = nullptr;
     Rml::Shutdown();
     RmlGL3::Shutdown();
@@ -2926,5 +4361,6 @@ int main(int argc, char **argv)
     SDL_DestroyWindow(g.window);
     SDL_Quit();
     free(g.set);
+    instance_unlock();
     return 0;
 }

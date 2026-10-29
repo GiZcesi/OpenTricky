@@ -773,6 +773,20 @@ static void gather_settings(void)
     }
 }
 
+size_t crashreport_private_text(const char *src, size_t n, int ansi, char *dst, size_t cap)
+{
+    static volatile LONG names_once;
+    if (!dst || cap < 96) return 0;
+    dst[0] = 0;
+    /* Reports off (XBOX_CRASH_REPORT=0): the install root and the user name
+     * were not gathered at start; once, here. */
+    if (!s_on && InterlockedCompareExchange(&names_once, 1, 0) == 0) {
+        launcher_install_root_w(s_root, MAX_PATH);
+        gather_user();
+    }
+    return settings_lines(src, n, ansi ? CP_ACP : CP_UTF8, dst, cap);
+}
+
 /* ── Report folder ───────────────────────────────────────────── */
 
 static BOOL make_dir_chain(wchar_t *path)
@@ -937,9 +951,37 @@ static BOOL write_dump(const wchar_t *name, EXCEPTION_POINTERS *ep, DWORD tid)
     return ok;
 }
 
+static DWORD WINAPI flush_output_thread(LPVOID arg)
+{
+    (void)arg;
+    fflush(stdout);
+    fflush(stderr);
+    return 0;
+}
+
+/* The buffered output (log file, or the pipe of the in-memory log) out of
+ * the runtime's buffers before the log is read or the process ends. On a
+ * thread of its own, waited for at most 500 ms: the thread that crashed or
+ * froze may hold a stream's lock, and this one must go on with the report.
+ * FALSE when it did not end in time (or could not start): the log then
+ * lacks what the buffers held. */
+static BOOL flush_output(void)
+{
+    HANDLE t = CreateThread(NULL, 64 * 1024, flush_output_thread, NULL, 0, NULL);
+    BOOL done = FALSE;
+    if (t) {
+        done = WaitForSingleObject(t, 500) == WAIT_OBJECT_0;
+        CloseHandle(t);
+    }
+    return done;
+}
+
 static void write_common_files(void)
 {
     size_t n;
+    if (!flush_output() && (s_log_path[0] || s_pipe_read))
+        tadd("Log:       the last %s of output may be missing (an output stream stayed locked "
+             "or could not be flushed)\n", s_log_path[0] ? "second" : "lines");
     if (s_log_path[0]) n = file_tail();
     else if (s_pipe_read) n = ring_snapshot();
     else n = 0;
@@ -1085,6 +1127,13 @@ int crashreport_on_crash(EXCEPTION_POINTERS *ep, const char *details,
 
 /* ── Freeze watchdog ─────────────────────────────────────────── */
 
+static volatile LONGLONG s_hold_until;     /* now_ms() up to which a stall is a wait (crashreport_hold) */
+
+void crashreport_hold(unsigned ms)
+{
+    InterlockedExchange64(&s_hold_until, ms ? (LONGLONG)(now_ms() + ms) : 0);
+}
+
 static void write_hang_report(unsigned stalled_s, uint32_t draws, unsigned video)
 {
     uint32_t loc[16], pump0, pump1;
@@ -1130,6 +1179,7 @@ static void write_hang_report(unsigned stalled_s, uint32_t draws, unsigned video
         r = MessageBoxW(NULL, msg, L"SSX Tricky", MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
         if (r == IDYES) {
             crashreport_open_folder(s_dir);
+            flush_output();
             TerminateProcess(GetCurrentProcess(), 3);
         }
     }
@@ -1163,6 +1213,10 @@ static void watchdog_tick(void)
     last_sample = t;
     if (!stall_from) stall_from = t;
 
+    {   /* a wait on purpose (crashreport_hold): counted as progress, without the "then progress again" line */
+        LONGLONG h = InterlockedCompareExchange64(&s_hold_until, 0, 0);
+        if (h && (LONGLONG)t < h) { stall_from = t; reported = 0; return; }
+    }
     if (progress || IsDebuggerPresent()) {
         if (t - stall_from >= 5000)
             fprintf(stderr, "[WATCHDOG] nothing new on screen for %.1f s, then progress again%s\n",
@@ -1193,6 +1247,7 @@ static DWORD WINAPI report_thread(LPVOID arg)
                 /* Stack overflow: the faulting thread cannot run the filter
                  * or a message box, so this thread ends the process. */
                 if (s_player && s_written) crashreport_crash_dialog(code, s_dir);
+                flush_output();
                 TerminateProcess(GetCurrentProcess(), code);
             }
             SetEvent(s_done_event);
@@ -1270,10 +1325,9 @@ void crashreport_set_output(int player, const char *log_path, int output_redirec
     }
     fd = _open_osfhandle((intptr_t)wr, _O_WRONLY | _O_TEXT);
     if (fd < 0) { CloseHandle(wr); return; }  /* reader ends (broken pipe) */
-    /* Buffered (4 KB): the runtime prints ~30 KB/s while racing (the [VSH]
-     * statistics of the pump), and unbuffered that was a pipe write per line
-     * on the pump thread. The crash paths flush stderr before the report
-     * (VEH, filter); a freeze report can miss the last < 4 KB. */
+    /* Buffered (4 KB): unbuffered, every print was a pipe write on the
+     * thread printing, the pump's included. The reports empty the buffers
+     * before they read the log (flush_output). */
     if (freopen("NUL", "w", stdout)) { _dup2(fd, _fileno(stdout)); setvbuf(stdout, NULL, _IOFBF, 4096); }
     if (freopen("NUL", "w", stderr)) { _dup2(fd, _fileno(stderr)); setvbuf(stderr, NULL, _IOFBF, 4096); }
     _close(fd);                              /* the two duplicates stay open */

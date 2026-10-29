@@ -179,6 +179,60 @@ static uint8_t *iso_file(Iso *iso, const char *path, uint32_t off, uint32_t len,
     return buf;
 }
 
+/* Does the file hold the whole game partition? Every directory is walked
+ * once (a few dozen small reads) for the farthest byte a directory or a file
+ * needs; a file shorter than that is a copy or a download cut short, which
+ * the header alone does not show. A directory that cannot be read counts as
+ * missing. */
+static bool iso_complete(Iso *iso)
+{
+    typedef struct { uint32_t sec, size; } Dir;
+    enum { MAX_DIRS = 4096 };
+    Dir *todo = (Dir *)malloc(sizeof(Dir) * MAX_DIRS);
+    uint32_t n = 0, walked = 0;
+    uint64_t need = (uint64_t)iso->root_sec * SECTOR + iso->root_size, have;
+    bool ok = todo != NULL;
+    if (ok) { todo[n].sec = iso->root_sec; todo[n].size = iso->root_size; n++; }
+    while (ok && n && walked++ < MAX_DIRS) {
+        Dir d = todo[--n];
+        uint8_t *dir;
+        uint32_t *stack, sp = 0, visits = 0, cap;
+        if (d.size == 0) continue;
+        if (d.size > (16u << 20)) { ok = false; break; }
+        cap = d.size / 14 + 2;
+        dir = (uint8_t *)malloc(d.size);
+        stack = (uint32_t *)malloc(sizeof(uint32_t) * cap);
+        if (!dir || !stack || !iso_read(iso, (uint64_t)d.sec * SECTOR, dir, d.size)) { free(dir); free(stack); ok = false; break; }
+        stack[sp++] = 0;
+        while (sp && visits++ < d.size / 4 + 1) {           /* every node, as dir_find walks them */
+            uint32_t p = stack[--sp] * 4, sec, size;
+            uint16_t left, right;
+            if (p + 14 > d.size) continue;
+            left = le16(dir + p);
+            right = le16(dir + p + 2);
+            if (left == 0xFFFF) continue;                    /* sector padding */
+            sec = le32(dir + p + 4);
+            size = le32(dir + p + 8);
+            if ((uint64_t)sec * SECTOR + size > need) need = (uint64_t)sec * SECTOR + size;
+            if ((dir[p + 12] & ATTR_DIR) && n < MAX_DIRS) { todo[n].sec = sec; todo[n].size = size; n++; }
+            if (left && sp < cap) stack[sp++] = left;
+            if (right && sp < cap) stack[sp++] = right;
+        }
+        free(dir);
+        free(stack);
+    }
+    free(todo);
+    if (!ok) return false;
+#ifdef _WIN32
+    if (_fseeki64(iso->f, 0, SEEK_END) != 0) return false;
+    have = (uint64_t)_ftelli64(iso->f);
+#else
+    if (fseeko(iso->f, 0, SEEK_END) != 0) return false;
+    have = (uint64_t)ftello(iso->f);
+#endif
+    return have >= iso->base + need;
+}
+
 /* ── Disc check ──────────────────────────────────────────────────── */
 
 
@@ -203,7 +257,6 @@ OtDiscCheck ot_disc_check_entry(const char *path, uint32_t expected_entry)
     if (!iso_open(&iso, path)) return r;
     r.xbox = true;
     x = iso_file(&iso, "default.xbe", 0, 0x1000, &n);
-    iso_close(&iso);
     if (x && n >= 0x200 && !memcmp(x, "XBEH", 4)) {
         uint32_t base = le32(x + 0x104), cert = le32(x + 0x118) - base, entry = le32(x + 0x128);
         if (cert + 0xA4 <= n) {
@@ -224,6 +277,8 @@ OtDiscCheck ot_disc_check_entry(const char *path, uint32_t expected_entry)
             r.status = OT_DISC_OK;
         }
     }
+    if (r.status == OT_DISC_OK && !iso_complete(&iso)) r.status = OT_DISC_INCOMPLETE;
+    iso_close(&iso);
     free(x);
     return r;
 }
@@ -337,13 +392,40 @@ static uint8_t *bigf_entry(Iso *iso, const char *archive, const char *name, uint
 }
 
 /* ── SHPX texture banks ──────────────────────────────────────────────
- * The first entry, or the one named `name` (4 characters). Formats seen on
- * the disc: 0x7D 32-bit BGRA, linear; 0x61 DXT3. */
+ * The first entry, or the one named `name` (4 characters). Each entry: a
+ * 16-byte header (format byte, 24-bit size, u16 width, u16 height), then
+ * the top mip level, rows top-down. Formats seen on the disc: 0x7D 32-bit
+ * BGRA, 0x78 RGB 565, 0x6D ARGB 4444 (linear), 0x7B 8-bit with a BGRA
+ * palette of 256 after a 16-byte header; 0x60 / 0x61 / 0x62 DXT1 / 3 / 5.
+ * The cards use 0x7D and 0x61; the riders' textures (char/texxbx.big) 0x60
+ * and 0x61. */
+static bool shpx_blocks(const uint8_t *px, uint64_t avail, int w, int h, int fmt, OtImage *out)
+{
+    int bx, by, k, x, y, bs = fmt == 0x60 ? 8 : 16;
+    if ((uint64_t)((w + 3) / 4) * ((h + 3) / 4) * bs > avail) return false;
+    for (by = 0; by < h; by += 4)
+        for (bx = 0; bx < w; bx += 4) {
+            uint32_t blk[16];
+            const uint8_t *b = px + ((size_t)(by / 4) * ((w + 3) / 4) + bx / 4) * bs;
+            if (fmt == 0x60) ot_decode_bc1(b, blk, true);
+            else if (fmt == 0x61) ot_decode_bc2(b, blk);
+            else ot_decode_bc3(b, blk);
+            for (k = 0; k < 16; k++) {
+                x = bx + (k & 3); y = by + (k >> 2);
+                if (x < w && y < h) out->px[(size_t)y * w + x] = blk[k];
+            }
+        }
+    return true;
+}
+
 static bool shpx_image(const uint8_t *d, uint32_t n, const char *name, OtImage *out)
 {
     uint32_t count, i, off = 0;
-    int w, h, fmt, x, y;
+    int w, h, fmt;
+    uint64_t avail;
+    size_t x, np;
     const uint8_t *px;
+    bool ok = false;
     memset(out, 0, sizeof *out);
     if (n < 0x18 || memcmp(d, "SHPX", 4) != 0) return false;
     count = le32(d + 8);
@@ -354,32 +436,118 @@ static bool shpx_image(const uint8_t *d, uint32_t n, const char *name, OtImage *
     w = le16(d + off + 4);
     h = le16(d + off + 6);
     px = d + off + 16;
-    if (w <= 0 || h <= 0 || !ot_image_alloc(out, w, h)) return false;
-    if (fmt == 0x7D) {
-        if (off + 16 + (uint64_t)w * h * 4 > n) { ot_image_free(out); return false; }
-        for (y = 0; y < h; y++)
-            for (x = 0; x < w; x++) {
-                const uint8_t *s = px + ((size_t)y * w + x) * 4;      /* B G R A */
-                out->px[(size_t)y * w + x] = ((uint32_t)s[3] << 24) | (s[2] << 16) | (s[1] << 8) | s[0];
+    avail = n - (off + 16);
+    np = (size_t)w * h;
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096 || !ot_image_alloc(out, w, h)) return false;
+    switch (fmt) {
+    case 0x7D:
+        if ((ok = np * 4 <= avail))
+            for (x = 0; x < np; x++) {
+                const uint8_t *s = px + x * 4;                          /* B G R A */
+                out->px[x] = ((uint32_t)s[3] << 24) | (s[2] << 16) | (s[1] << 8) | s[0];
             }
-        return true;
-    }
-    if (fmt == 0x61) {
-        int bx, by, k;
-        if (off + 16 + (uint64_t)((w + 3) / 4) * ((h + 3) / 4) * 16 > n) { ot_image_free(out); return false; }
-        for (by = 0; by < h; by += 4)
-            for (bx = 0; bx < w; bx += 4) {
-                uint32_t blk[16];
-                ot_decode_bc2(px + ((size_t)(by / 4) * ((w + 3) / 4) + bx / 4) * 16, blk);
-                for (k = 0; k < 16; k++) {
-                    x = bx + (k & 3); y = by + (k >> 2);
-                    if (x < w && y < h) out->px[(size_t)y * w + x] = blk[k];
-                }
+        break;
+    case 0x78:
+    case 0x6D:
+        if ((ok = np * 2 <= avail))
+            for (x = 0; x < np; x++) {
+                uint32_t c = le16(px + x * 2);
+                if (fmt == 0x78)
+                    out->px[x] = 0xFF000000u | ((((c >> 11) * 255 + 15) / 31) << 16) |
+                                 (((((c >> 5) & 63) * 255 + 31) / 63) << 8) | (((c & 31) * 255 + 15) / 31);
+                else
+                    out->px[x] = (((c >> 12) * 17) << 24) | ((((c >> 8) & 15) * 17) << 16) |
+                                 ((((c >> 4) & 15) * 17) << 8) | ((c & 15) * 17);
             }
-        return true;
+        break;
+    case 0x7B:
+        if ((ok = np + 16 + 1024 <= avail)) {
+            const uint8_t *pal = px + np + 16;
+            for (x = 0; x < np; x++) {
+                const uint8_t *s = pal + px[x] * 4;                     /* B G R A */
+                out->px[x] = ((uint32_t)s[3] << 24) | (s[2] << 16) | (s[1] << 8) | s[0];
+            }
+        }
+        break;
+    case 0x60:
+    case 0x61:
+    case 0x62:
+        ok = shpx_blocks(px, avail, w, h, fmt, out);
+        break;
+    default:
+        break;
     }
-    ot_image_free(out);
-    return false;
+    if (!ok) ot_image_free(out);
+    return ok;
+}
+
+bool ot_shpx_decode(const uint8_t *d, uint32_t n, const char *name, OtImage *out)
+{
+    return d && out && shpx_image(d, n, name, out);
+}
+
+/* ── Files and archive entries for other modules (the rider preview) ── */
+
+struct OtDiscFile { Iso iso; };
+
+OtDiscFile *ot_disc_open(const char *path)
+{
+    OtDiscFile *f = (OtDiscFile *)calloc(1, sizeof *f);
+    if (f && !iso_open(&f->iso, path)) { free(f); f = NULL; }
+    return f;
+}
+
+void ot_disc_close(OtDiscFile *f)
+{
+    if (!f) return;
+    iso_close(&f->iso);
+    free(f);
+}
+
+uint8_t *ot_disc_read(OtDiscFile *f, const char *path, uint32_t *len)
+{
+    return f ? iso_file(&f->iso, path, 0, 0, len) : NULL;
+}
+
+/* One entry of an EA archive on the disc, unpacked (RefPack): BIGF archives
+ * read only their table and the entry; c0fb ones are read whole (they are
+ * small: char/mdlxbx.big is 3.8 MB). `name` is the entry's full name. */
+uint8_t *ot_disc_archive_entry(OtDiscFile *f, const char *archive, const char *name, uint32_t *len)
+{
+    uint8_t *head, *raw = NULL;
+    uint32_t got = 0, n = 0;
+    if (!f || !archive || !name || !len) return NULL;
+    head = iso_file(&f->iso, archive, 0, 16, &got);
+    if (!head) return NULL;
+    if (got >= 4 && memcmp(head, "BIGF", 4) == 0) {
+        free(head);
+        raw = bigf_entry(&f->iso, archive, name, 0, &n);
+        if (raw && n > 2 && raw[1] == 0xFB && (raw[0] & 0x3E) == 0x10) {
+            uint8_t *u = refpack(raw, n, len);
+            free(raw);
+            return u;
+        }
+        if (raw) *len = n;
+        return raw;
+    }
+    if (got >= 2 && head[0] == 0xC0 && head[1] == 0xFB) {
+        uint8_t *all;
+        char suffix[160];
+        free(head);
+        all = iso_file(&f->iso, archive, 0, 0, &got);
+        if (!all) return NULL;
+        /* c0fb_entry matches the end of a name: a '/' before the file name
+         * keeps "jp_body.mxf" from matching another rider. */
+        {
+            const char *b = strrchr(name, '/');
+            snprintf(suffix, sizeof suffix, "/%s", b ? b + 1 : name);
+        }
+        raw = c0fb_entry(all, got, suffix, len);
+        free(all);
+        return raw;
+    }
+    free(head);
+    return NULL;
 }
 
 /* The loading cards are stored square (256 x 256) but the game shows them
@@ -470,6 +638,28 @@ static bool ffn_font(const uint8_t *d, uint32_t n, OtFont *f)
         else if (g->h > f->line) f->line = g->h;
     }
     return true;
+}
+
+bool ot_disc_font(const char *iso_path, const char *path, OtFont *f)
+{
+    Iso iso;
+    uint8_t *d;
+    uint32_t n = 0;
+    bool ok;
+    memset(f, 0, sizeof *f);
+    if (!iso_open(&iso, iso_path)) return false;
+    d = iso_file(&iso, path, 0, 0, &n);
+    iso_close(&iso);
+    ok = d && ffn_font(d, n, f);
+    free(d);
+    if (!ok) ot_font_free(f);
+    return ok;
+}
+
+void ot_font_free(OtFont *f)
+{
+    free(f->cov);
+    memset(f, 0, sizeof *f);
 }
 
 int ot_font_text_width(const OtFont *f, const char *s)

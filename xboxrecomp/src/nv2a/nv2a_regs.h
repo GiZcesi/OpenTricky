@@ -1021,6 +1021,7 @@
 #   define NV097_SET_SHADE_MODE                               0x0000037C
 #       define NV097_SET_SHADE_MODE_V_FLAT                        0x1D00
 #       define NV097_SET_SHADE_MODE_V_SMOOTH                      0x1D01
+#   define NV097_SET_LINE_WIDTH                               0x00000380   /* 1/8 px, 8:0 */
 #   define NV097_SET_POLYGON_OFFSET_SCALE_FACTOR              0x00000384
 #   define NV097_SET_POLYGON_OFFSET_BIAS                      0x00000388
 #   define NV097_SET_FRONT_POLYGON_MODE                       0x0000038C

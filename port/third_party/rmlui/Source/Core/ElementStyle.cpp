@@ -913,6 +913,25 @@ PropertyIdSet ElementStyle::ComputeValues(Style::ComputedValues& values, const S
 	SmallUnorderedSet<String> variable_dependencies;
 	bool dirty_em_properties = false;
 
+	// OpenTricky: font-size and line-height are computed before the loop below, which is where a property is dirtied
+	// when a variable it uses has changed. Dirty them here too, else a change of their variable alone is never applied.
+	if (!dirty_variables.empty())
+	{
+		for (const PropertyId id : {PropertyId::FontSize, PropertyId::LineHeight})
+		{
+			const Property* property = GetLocalProperty(id);
+			if (!property || dirty_properties.Contains(id))
+				continue;
+			variable_dependencies.clear();
+			if (ResolveVariables(id, property, variable_dependencies, property_storage))
+			{
+				for (const String& variable_name : variable_dependencies)
+					if (dirty_variables.count(variable_name) != 0)
+						dirty_properties.Insert(id);
+			}
+		}
+	}
+
 	// Always do font-size first if dirty, because of em-relative values
 	if (dirty_properties.Contains(PropertyId::FontSize))
 	{

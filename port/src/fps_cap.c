@@ -9,10 +9,15 @@
 #include <math.h>
 #include "recomp/recomp_types.h"
 #include "fps_cap.h"
+#include "hud_anchor.h"
+#include "frame_clock.h"
+#include "../../xboxrecomp/src/kernel/xbox_perf.h"
 
 void sub_000B2750(void);    /* XBoxExecutionMan_WaitForFrameEvent (thiscall, ret) */
 void sub_00151D07(void);    /* WaitForSingleObject (stdcall, ret 8) */
 unsigned d3d8_PresentSeq(void);
+double d3d8_display_rate(LONG *gen);       /* d3d8_sync.h: the game window's display, exact rate */
+void d3d8_sync_set_pace(int fps);          /* d3d8_sync.h */
 
 int g_fps_cap_on;
 static int s_in_extra;          /* an extra render is in progress */
@@ -47,7 +52,21 @@ static struct {
     int      from_wait;             /* the next tick follows a return of the frame wait */
     double   next_render;
     double   avg_render;
+    int      grid;                  /* XBOX_FPS_CAP_GRID (default 1): continuous render grid */
+    double   last_tick_sig;         /* time the last tick's event was seen signaled (or released, if unknown) */
+    /* The instant each render shows (interpolation): its slot, see
+     * sample_time. frame_t: the slot of the render being dispatched (0 =
+     * none); render_slot / slot_due: the slot of the tick's render, given at
+     * the release of the frame wait and taken by that render. */
+    double   frame_t, render_slot;
+    int      slot_due;
     unsigned dump_from;             /* XBOX_D3D_DUMP_FROM (duplicate log, T4) */            /* running average of an extra render (ms) */
+    /* The limit follows the display ("Match screen", or a limit lowered to it
+     * under VSync / Adaptive): see match_fps. */
+    int      follow, follow_monitor;
+    double   req_fps;               /* limit asked (0 = none / the display) */
+    double   margin;                /* fraction under the display's exact rate */
+    LONG     rate_gen;              /* d3d8_display_rate's count when last read */
 } s;
 
 static struct {
@@ -100,9 +119,11 @@ static struct {
     int ok;                         /* prev and cur valid, same layout */
     double t_tick;                  /* start of the last tick */
     double t_est;                   /* estimated production time of the last tick (game timer) */
+    double ts;                      /* instant the last render showed (its slot, or its start) */
     int clock;                      /* XBOX_FPS_INTERP_CLOCK: 1 = timer-based tick time, 0 = consumption time */
     int mode;                       /* last interp_begin: 0 interpolated, 1 alpha >= 1, 2 memory != tick, 3 not applicable */
     float alpha;                    /* last alpha (before the >= 1 test) */
+    float t;                        /* fraction used by the render in progress (written = 1) */
     int written;                    /* interpolated state in memory (render in progress) */
     unsigned long long n_interp, n_mismatch, n_alpha1, n_cut_cam, n_cut_rider, n_badrot, n_logged;
     uint32_t log_from;
@@ -320,7 +341,11 @@ static void pages_report(void)
  * and a pointer it sets is kept (counted, logged).
  * Also: no extra render while the gameplay tick is frozen (pause and the
  * other blocking overlays, the game's own gate 0xAB170): the scene does not
- * move and the pause menu runs as at 60.
+ * move and the pause menu runs as at 60. Nor after a tick whose riders were
+ * frozen (hud_anchor_tick_frozen): the tick that closes the pause has not
+ * moved them, its image is the last one of the pause, and its extra renders
+ * (the panel closed by then, the race HUD back) showed a race frozen
+ * between it and the next tick.
  * XBOX_FIX_HUD_RATE=0: previous behavior. */
 #define OM_VTABLE   0x0019CB24u     /* OverlayManager (OverlayManager_Construct 0xDD7D0) */
 #define OM_PANELS   19u             /* panel pointers at +0x10..+0x58 */
@@ -330,10 +355,21 @@ static void pages_report(void)
 #define RDATA_LO    0x001872E0u     /* .rdata: panel vtables */
 #define RDATA_HI    0x001A9F68u
 
-/* Size of each panel, from its allocation in 0xDD7D0 (slot order). */
-static const uint32_t s_om_len[OM_PANELS] = {
-    0x5F0, 0x1314, 0x450, 0x590, 0x30, 0x498, 0x162C, 0x94, 0x28, 0x11DC,
-    0x340, 0x38C, 0x24, 0x590, 0x340, 0x11DC, 0x12D4, 0x11FC, 0x38C
+/* Each panel object, from its construction in 0xDD7D0 (slot order): size of
+ * the allocation (len), and where the pointer the manager keeps lies in it
+ * (off). That pointer is the panel base (0xCA8A0, 0x340 bytes); most panel
+ * classes inherit it virtually, so the manager stores the virtual base
+ * (object + vbptr + vbtable[1]), at the end of the object or after its first
+ * base: the object, and the state its own draw methods step, start off bytes
+ * before it. vbp: offset of that vbptr in the object (NO_VB: plain base,
+ * off 0); used to check that the object is the one 0xDD7D0 built. */
+#define NO_VB 0xFFFFFFFFu
+static const struct { uint32_t len, off, vbp; } s_om[OM_PANELS] = {
+    { 0x5F0, 0, NO_VB },   { 0x1314, 0x104, 0 }, { 0x450, 0x110, 0 },    { 0x590, 0x250, 0 },
+    { 0x30, 0, NO_VB },    { 0x498, 0, NO_VB },  { 0x162C, 0x12EC, 0xE78 }, { 0x94, 0, NO_VB },
+    { 0x28, 0, NO_VB },    { 0x11DC, 0xE9C, 0xE78 }, { 0x340, 0, NO_VB }, { 0x38C, 0x4C, 0 },
+    { 0x24, 0, NO_VB },    { 0x590, 0x250, 0 },  { 0x340, 0, NO_VB },    { 0x11DC, 0xE9C, 0xE78 },
+    { 0x12D4, 0xF94, 0xE78 }, { 0x11FC, 0xEBC, 0xE78 }, { 0x38C, 0x4C, 0 }
 };
 /* Globals stepped by panel draws: 0xD06C0 pulse speed / scale, 0x56A60
  * pulse speed / scale, 0xD4DE0 counter. */
@@ -356,24 +392,42 @@ static int is_race_render(uint32_t st)
     return st >= 0x1000u && MEM32(st) >= 0x1000u && MEM32(MEM32(st) + 0x18u) == 0x000AB610u;
 }
 
+/* A guest object of len bytes: in the low memory, or in the contiguous memory
+ * the title allocates its race objects from (0x80000000 up: the OverlayManager
+ * and its panels are there; with the low range only, no panel was copied and
+ * their animations ran at the render rate above 60). */
+static int hud_obj(uint32_t p, uint32_t len)
+{
+    return (p >= 0x1000u && p < 0x08000000u - len) || (p >= 0x80000000u && p < 0x84000000u - len);
+}
+
 /* Panels of the race state st (only if it is InGameState), then the globals. */
 static uint32_t hud_layout(HudLayout *l, uint32_t st)
 {
     uint32_t i, off = 0, om = is_race_render(st) ? MEM32(st + 0x38u) : 0;
     l->st = st; l->n = 0;
-    if (om >= 0x1000u && om < 0x08000000u && MEM32(om) == OM_VTABLE) {
+    if (hud_obj(om, 0x60u) && MEM32(om) == OM_VTABLE) {
         for (i = 0; i < OM_PANELS; i++) {
-            uint32_t p = MEM32(om + 0x10u + 4u * i), vt = p >= 0x1000u && p < 0x08000000u - s_om_len[i] ? MEM32(p) : 0;
-            /* every panel class shares the base methods +0x28 / +0x2C */
-            if (vt < RDATA_LO || vt >= RDATA_HI || MEM32(vt + 0x28u) != 0x000C3770u || MEM32(vt + 0x2Cu) != 0x000C3780u) {
+            uint32_t p = MEM32(om + 0x10u + 4u * i), obj = p - s_om[i].off, vt = 0, vbo = 0;
+            if (p >= s_om[i].off && hud_obj(obj, s_om[i].len)) {
+                vt = MEM32(p);
+                if (s_om[i].vbp != NO_VB) {
+                    uint32_t vbt = MEM32(obj + s_om[i].vbp);
+                    vbo = vbt >= RDATA_LO && vbt < RDATA_HI - 8u ? MEM32(vbt + 4u) : 0;
+                }
+            }
+            /* every panel class shares the base methods +0x28 / +0x2C; a
+             * virtual base must be where the object's vbtable puts it */
+            if (vt < RDATA_LO || vt >= RDATA_HI || MEM32(vt + 0x28u) != 0x000C3770u || MEM32(vt + 0x2Cu) != 0x000C3780u
+                || (s_om[i].vbp != NO_VB && vbo != s_om[i].off - s_om[i].vbp)) {
                 if (p && !(H.bad_slot & (1u << i))) {
                     H.bad_slot |= 1u << i;
-                    fprintf(stderr, "[FPSCAP] hud: slot %u (%08X, vt %08X) is not a panel, skipped\n", i, p, vt);
+                    fprintf(stderr, "[FPSCAP] hud: slot %u (%08X, vt %08X, vb %X) is not a panel, skipped\n", i, p, vt, vbo);
                 }
                 continue;
             }
-            l->rg[l->n].va = p; l->rg[l->n].len = s_om_len[i]; l->rg[l->n].off = off; l->rg[l->n].id = i;
-            off += s_om_len[i] / 4u; l->n++;
+            l->rg[l->n].va = obj; l->rg[l->n].len = s_om[i].len; l->rg[l->n].off = off; l->rg[l->n].id = i;
+            off += s_om[i].len / 4u; l->n++;
         }
     }
     for (i = 0; i < HUD_GLOB; i++) {
@@ -393,6 +447,7 @@ static int hud_ptr_pair(uint32_t a, uint32_t b)
 {
     return (a | b) && (!a || hud_ptr(a)) && (!b || hud_ptr(b));
 }
+
 
 /* Before the normal race render. */
 static void hud_capture(uint32_t st)
@@ -416,10 +471,14 @@ static int hud_swap_in(uint32_t app)
         H.valid = 0; H.stale++;
         return 0;
     }
+    /* every post first, before any pre is written: a post taken after an
+     * overlapping region's pre was written would hold that pre (the panels
+     * were once copied from their virtual base on, over the next panels: the
+     * finish banner's fade-in was reset to 0 after every extra render) */
+    for (k = 0; k < l.n; k++) memcpy(&H.post[l.rg[k].off], (const void *)XBOX_PTR(l.rg[k].va), l.rg[k].len);
     for (k = 0; k < l.n; k++) {
         const HudRg *g = &l.rg[k];
         uint32_t *m = (uint32_t *)XBOX_PTR(g->va), *pre = &H.pre[g->off], *post = &H.post[g->off];
-        memcpy(post, m, g->len);
         if (!memcmp(pre, post, g->len)) continue;
         for (w = 0; w < g->len / 4u; w++)
             if (pre[w] != post[w] && !hud_ptr_pair(pre[w], post[w])) { m[w] = pre[w]; H.words++; }
@@ -489,11 +548,14 @@ static void hud_probe_report(void)
     for (id = 0; id < HUD_RG_MAX; id++) if (HP.renders[id]) fprintf(stderr, " %u:%llu", id, HP.renders[id]);
     fprintf(stderr, "; words (region+offset:count)");
     for (id = 0; id < HUD_RG_MAX; id++) {
-        uint32_t len = id < OM_PANELS ? s_om_len[id] : s_hud_glob[id - OM_PANELS][1];
+        uint32_t len = id < OM_PANELS ? s_om[id].len : s_hud_glob[id - OM_PANELS][1];
         if (!HP.hist[id]) continue;
         for (w = 0; w < len / 4u && shown < 48u; w++)
             if (HP.hist[id][w]) { fprintf(stderr, " %u+%X:%u", id, w * 4u, HP.hist[id][w]); shown++; }
     }
+    fputc('\n', stderr);
+    fprintf(stderr, "[FPSCAP]   hud layout (region:object/len):");
+    for (id = 0; id < HP.l.n; id++) fprintf(stderr, " %u:%08X/%X", HP.l.rg[id].id, HP.l.rg[id].va, HP.l.rg[id].len);
     fputc('\n', stderr);
 }
 
@@ -581,15 +643,25 @@ static int extra_allowed(uint32_t app)
      * have no logic effect. The other states (boot, videos, loading) advance
      * the state machine in their render or block: no extra render, as in the
      * original. With the HUD fix, none either while the gameplay tick is
-     * frozen (pause): see the HUD section. */
-    if (va == 0x000AB610u) return (int32_t)MEM32(st + 0x6Cu) <= 0 && !(s_fix_hud && gameplay_frozen(st));
+     * frozen (pause), nor after a tick that was (the one that closes the
+     * pause): see the HUD section. */
+    if (va == 0x000AB610u)
+        return (int32_t)MEM32(st + 0x6Cu) <= 0 && !(s_fix_hud && (gameplay_frozen(st) || hud_anchor_tick_frozen()));
     return va == 0x0007CBD0u;
 }
 
 /* ── interpolation ────────────────────────────────────────────────
- * A render shows lerp(tick N-1, tick N, alpha), alpha = time since tick N /
- * 16.67 ms: the normal render (right after the tick) as well as the extra
- * ones. Display is one tick late (+16.7 ms latency), no extrapolation.
+ * A render shows lerp(tick N-1, tick N, alpha), alpha = (the render's
+ * instant - the time tick N was produced) / 16.67 ms: the normal render
+ * (right after the tick) as well as the extra ones. The render's instant is
+ * the one its image reaches the screen at (sample_time: its slot when frames
+ * wait for a refresh, its start when they are shown at once), the tick's
+ * time the frame timer's point of its exact grid (hook_AD4A0): so the
+ * simulated time of two images in a row differs by the time between them on
+ * the display. Measured from the render's start and from the moment the
+ * frame wait saw the tick's event instead, the image after each tick jumped
+ * ahead (6-7 ms of motion for a 4.17 ms refresh at 240 Hz) and the next one
+ * fell back. Display is one tick late (+16.7 ms latency), no extrapolation.
  * State (measured):
  *   InGameState +0xB0 + i*0x80 (view i < [+0x298]): camera position (4 f),
  *     view matrix +0xC0 (rows 0-2 = rotation, row 3 = -c*R),
@@ -772,24 +844,26 @@ static void cut_note(const char *what, uint32_t va, const float *a, const float 
             race ? MEM32(race + 0x1Cu) : 0, race ? MEM32(race + 0x18u) : 0, dist3(a, b));
 }
 
-/* Writes the interpolated state before an InGameState render; 1 if written. */
-static int interp_begin(uint32_t st)
+/* Writes the interpolated state before an InGameState render shown at the
+ * instant ts (sample_time); 1 if written. */
+static int interp_begin(uint32_t st, double ts)
 {
     double a;
     float t;
     uint32_t k;
     VS *o = &I.out;
     I.written = 0;
-    I.mode = 3; I.alpha = 0.0f;
+    I.mode = 3; I.alpha = 0.0f; I.ts = ts;
     if (!I.on || !I.ok || I.cur.st != st || GetCurrentThreadId() != s.tid) return 0;
     if (!vs_equals_mem(&I.cur)) { I.n_mismatch++; I.mode = 2; return 0; }
-    a = (now_ms() - I.t_tick) / TICK_MS;
+    a = (ts - I.t_tick) / TICK_MS;
     if (I.synth && s.dup > 0) a = (double)s_dup_k / (s.dup + 1);   /* DUP test: synthetic time */
     I.alpha = (float)a;
     if (a >= 1.0) { I.n_alpha1++; I.mode = 1; return 0; }
     I.mode = 0;
     if (a < 0.0) a = 0.0;
     t = (float)a;
+    I.t = t;
     memcpy(o, &I.cur, sizeof *o - sizeof o->w + I.cur.nw * sizeof(float));
     for (k = 0; k < I.cur.n; k++) {
         const Span *p = &I.cur.sp[k];
@@ -825,11 +899,123 @@ static int interp_begin(uint32_t st)
     return 1;
 }
 
+/* How far the render in progress is behind tick N, in ticks: it shows
+ * lerp(N-1, N, alpha), so 1 - alpha when interpolated, 0 otherwise. Game
+ * thread, read by the speed blur at FRAME_END (speedfx.c). */
+double fps_cap_render_lag(void)
+{
+    if (!I.written) return 0.0;
+    return 1.0 - (I.alpha > 0.0f ? (double)I.alpha : 0.0);
+}
+
+/* Probe: the view matrix of view 0 at tick N (what the memory holds
+ * between renders); 0 when unknown. */
+int fps_cap_tick_view(float *m)
+{
+    uint32_t k;
+    if (!I.ok) return 0;
+    for (k = 0; k < I.cur.n; k++)
+        if (I.cur.sp[k].kind == SP_VIEW) { memcpy(m, &I.cur.w[I.cur.sp[k].off + 4u], 16 * sizeof(float)); return 1; }
+    return 0;
+}
+
 static void interp_end(void)
 {
     if (!I.written) return;
     vs_write(&I.cur);       /* state of tick N, bit exact */
     I.written = 0;
+}
+
+/* ── Marker above a rider (XBOX_FIX_MARKER_INTERP, default 1) ─────
+ * The relationship icon an AI rider shows above its head (the rival "!")
+ * belongs to an indicator object of the rider (rider sub-object +0x3F8).
+ * Its world anchor is computed by the tick, 0x43340 (called by the rider's
+ * update, 0x455ED): per player slot (count +0x40, 1 or 2, stride 0x70),
+ * anchor +0x60 (4 f) = attachment point (+0x130 of [[rider+0x42E8]+4]) +
+ * root bone row 2 (rider +0x48D0) * 95.9. The rider's render (0x44FD0,
+ * rider vtable slot 2) draws it with 0x43690, which projects that anchor
+ * with the current view. Above 60 the camera and the rider are drawn at
+ * lerp(N-1, N, t), the anchor stays at tick N: the icon steps at 60 Hz
+ * against a smooth rider (ghosting).
+ * Fix: the anchors of each indicator are kept for the last two ticks; around
+ * 0x43690, in a render that interpolates (I.written), the anchor shown is
+ * lerp(N-1, N, t), written back bit exact after the call. Nothing changes at
+ * 60 (no interpolation) nor in the logic (the tick never sees the lerp). */
+#define MK_MAX      16u
+#define MK_SLOTS    2u
+#define MK_COUNT    0x40u           /* indicator: number of player slots */
+#define MK_ANCHOR   0x60u           /* indicator: anchor of slot 0 (4 f) */
+#define MK_STRIDE   0x70u
+static struct {
+    int on;
+    uint32_t seq;                   /* race ticks seen by hook_AD4A0 */
+    int in_tick;
+    struct { uint32_t ind, seq, n; int has_prev; float prev[MK_SLOTS][4], cur[MK_SLOTS][4]; } e[MK_MAX];
+    unsigned long long n_tick, n_outside, n_full, n_lerp, n_cut, n_stale, n_kept;
+} M;
+
+static uint32_t mk_count(uint32_t ind)
+{
+    uint32_t n = MEM32(ind + MK_COUNT);
+    return n > MK_SLOTS ? MK_SLOTS : n;
+}
+
+void sub_00043340(void);    /* indicator: anchors and fades (thiscall, rider; ret 4) */
+void sub_00043690(void);    /* indicator: draw (thiscall) */
+
+void hook_fps_00043340(void)
+{
+    uint32_t ind = g_ecx, k, i, slot = MK_MAX, n;
+    sub_00043340();
+    if (!M.on || !I.on || ind < 0x1000u) return;
+    if (!M.in_tick) { M.n_outside++; return; }      /* only the tick's anchors are kept */
+    M.n_tick++;
+    for (i = 0; i < MK_MAX; i++) if (M.e[i].ind == ind) { slot = i; break; }
+    for (i = 0; i < MK_MAX && slot == MK_MAX; i++)
+        if (!M.e[i].ind || M.seq - M.e[i].seq > 2u) slot = i;      /* free, or not refreshed for 2 ticks */
+    if (slot == MK_MAX) { M.n_full++; return; }
+    n = mk_count(ind);
+    if (M.e[slot].ind != ind || M.e[slot].n != n || (M.e[slot].seq != M.seq && M.e[slot].seq + 1u != M.seq)) {
+        M.e[slot].ind = ind; M.e[slot].n = n; M.e[slot].has_prev = 0;
+    } else if (M.e[slot].seq + 1u == M.seq) {
+        memcpy(M.e[slot].prev, M.e[slot].cur, sizeof M.e[slot].prev);
+        M.e[slot].has_prev = 1;
+    }   /* same tick again: only cur is refreshed */
+    M.e[slot].seq = M.seq;
+    for (k = 0; k < n; k++) memcpy(M.e[slot].cur[k], (const void *)XBOX_PTR(ind + MK_ANCHOR + k * MK_STRIDE), 16);
+}
+
+void hook_fps_00043690(void)
+{
+    uint32_t ind = g_ecx, i, k;
+    float save[MK_SLOTS][4], put[MK_SLOTS][4];
+    int done[MK_SLOTS] = { 0 }, any = 0;
+    if (M.on && I.written && ind >= 0x1000u) {
+        for (i = 0; i < MK_MAX; i++) if (M.e[i].ind == ind) break;
+        if (i < MK_MAX && M.e[i].seq == M.seq && M.e[i].has_prev && M.e[i].n == mk_count(ind)) {
+            for (k = 0; k < M.e[i].n; k++) {
+                float *m = (float *)XBOX_PTR(ind + MK_ANCHOR + k * MK_STRIDE);
+                const float *a = M.e[i].prev[k], *b = M.e[i].cur[k];
+                int j;
+                if (memcmp(m, b, 16)) { M.n_stale++; continue; }     /* not the tick's anchor: left alone */
+                if (!(dist3(a, b) < TELEPORT)) { M.n_cut++; continue; }
+                for (j = 0; j < 4; j++) put[k][j] = a[j] + (b[j] - a[j]) * I.t;
+                memcpy(save[k], m, 16);
+                memcpy(m, put[k], 16);
+                done[k] = 1; any = 1;
+            }
+            if (any) M.n_lerp++;
+        }
+    }
+    sub_00043690();
+    if (!any) return;
+    for (k = 0; k < MK_SLOTS; k++) {
+        float *m;
+        if (!done[k]) continue;
+        m = (float *)XBOX_PTR(ind + MK_ANCHOR + k * MK_STRIDE);
+        if (memcmp(m, put[k], 16)) { M.n_kept++; continue; }      /* written by the draw: kept */
+        memcpy(m, save[k], 16);
+    }
 }
 
 /* ── Leg smoothing (XBOX_FPS_SMOOTH_LEGS=1; off by default) ────────
@@ -1193,7 +1379,10 @@ static unsigned s_jank_n;
 /* Trace (XBOX_FPS_INTERP_TRACE=file): one line per InGameState render on the
  * loop thread ("R"), per race tick ("T") and per injected stall ("J"); times
  * in ms since start. R: t_start t_end present tick race_state extra mode alpha
- * camera(3) rider0(3) camera_step(3) rider0_step(3) -- step = tick N - tick N-1. */
+ * camera(3) rider0(3) camera_step(3) rider0_step(3) shown_at -- step = tick N -
+ * tick N-1, shown_at = the instant alpha is measured at (sample_time). T:
+ * t tick from_wait fresh tick_time old_clock seen -- tick_time = the time the
+ * tick was produced (the alpha's origin), seen = when the frame wait saw it. */
 static FILE *s_trace;
 static unsigned s_trace_n;
 
@@ -1219,22 +1408,161 @@ static void trace_render(uint32_t race, double t0, double t1, const float *cam, 
             if (dst) for (i = 0; i < 3; i++) dst[i] = I.cur.w[p->off + i] - I.prev.w[p->off + i];
         }
     }
-    fprintf(s_trace, "R %.3f %.3f %u %u %u %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+    fprintf(s_trace, "R %.3f %.3f %u %u %u %d %d %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.3f\n",
             t0 - s_t0_run, t1 - s_t0_run, d3d8_PresentSeq(), MEM32(race + 0x18u), MEM32(race + 0x1Cu), s_in_extra,
-            I.mode, I.alpha, cam[0], cam[1], cam[2], rp[0], rp[1], rp[2], cv[0], cv[1], cv[2], rv[0], rv[1], rv[2]);
+            I.mode, I.alpha, cam[0], cam[1], cam[2], rp[0], rp[1], rp[2], cv[0], cv[1], cv[2], rv[0], rv[1], rv[2],
+            I.ts - s_t0_run);
     trace_flush();
+}
+
+/* ── render gate (XBOX_RENDER_GATE, d3d8_sync.h; off by default) ─────
+ * Before a render starts (its content is frozen there: interp_begin reads
+ * the clock), the game's thread waits until at most N frames are on their
+ * way to the screen: frames submitted and not yet presented (the title's
+ * own frame counts, producer - consumer, see sub_001688D0) plus frames in
+ * the DXGI queue. Only the time of the render moves: every call the game
+ * makes, its order and the ticks are the same. Above 60 fps only (at 60 the
+ * game's own timer paces the frames, hooks not installed); bounded wait
+ * (2 periods + 4 ms) so that a display that stops taking frames (hidden
+ * window, display off) cannot hold the game. */
+#define GPU_CTX_PTR     0x001776C0u
+#define CTX_FRAME_CONS  0x2518u
+#define CTX_FRAME_PROD  0x2B60u
+int d3d8_sync_gate(void);
+int d3d8_sync_immediate(void);
+int d3d8_sync_queued(void);
+long d3d8_sync_retired(void);
+void d3d8_sync_gate_stats(double *stats_minus_count, unsigned long long *resync);
+static struct {
+    unsigned long long n, waited, timeouts, bypassed;
+    double ms, max, t_log;
+    int run;                        /* timeouts in a row */
+    long stuck_at;                  /* retired count when the gate stood aside */
+} GT;
+
+/* 1 if it held the render: the display, not the slot, then times the frame. */
+static int render_gate(void)
+{
+    int gate = d3d8_sync_gate(), pb, q;
+    uint32_t ctx;
+    double t0, t, lim;
+    if (!gate || !g_fps_cap_on || s.cap == 60 || !s.tid || GetCurrentThreadId() != s.tid) return 0;
+    /* The display takes no frame (2 timeouts in a row: hidden, off, mode
+     * change): the gate stands aside until a frame leaves the queue again,
+     * rather than costing its full wait on every render. */
+    if (GT.run >= 2 && d3d8_sync_retired() != GT.stuck_at) GT.run = 0;
+    ctx = MEM32(GPU_CTX_PTR);
+    t0 = t = now_ms();
+    lim = t0 + 2.0 * (s.period_ms > 0.0 ? s.period_ms : 4.0) + 4.0;
+    if (GT.run >= 2) GT.bypassed++;
+    else for (;;) {
+        pb = ctx >= 0x1000u ? (int)(MEM32(ctx + CTX_FRAME_PROD) - MEM32(ctx + CTX_FRAME_CONS)) : 0;
+        if (pb < 0 || pb > 2) pb = 0;      /* not a count (device not up yet) */
+        q = d3d8_sync_queued();
+        if (pb + q <= gate) break;
+        if ((t = now_ms()) > lim) {
+            GT.timeouts++;
+            if (++GT.run >= 2) GT.stuck_at = d3d8_sync_retired();
+            break;
+        }
+        YieldProcessor();
+        if (lim - t > 0.3) Sleep(0);
+    }
+    if (t <= lim) GT.run = 0;
+    GT.n++;
+    if (t > t0) {
+        double d = t - t0;
+        GT.waited++;
+        GT.ms += d;
+        if (d > GT.max) GT.max = d;
+    }
+    if (t - GT.t_log >= 10000.0) {
+        if (GT.t_log > 0.0) {
+            double dq;
+            unsigned long long rs;
+            d3d8_sync_gate_stats(&dq, &rs);
+            fprintf(stderr, "[GATE] %d: %llu renders, %llu waited (%.3f ms avg per render, max %.2f), %llu timeouts, "
+                    "%llu let through (display not taking frames); queue count vs statistics %+.2f, corrected %llu\n",
+                    gate, GT.n, GT.waited, GT.n ? GT.ms / (double)GT.n : 0.0, GT.max, GT.timeouts, GT.bypassed, dq, rs);
+            fflush(stderr);
+            GT.n = GT.waited = GT.timeouts = GT.bypassed = 0;
+            GT.ms = GT.max = 0.0;
+        }
+        GT.t_log = t;
+    }
+    return t > t0;
+}
+
+static void sleep_until(double when);
+
+/* ── the instant a render shows ───────────────────────────────────────
+ * An image shows the race at the instant it reaches the screen.
+ * - Frames that wait for a refresh (VSync; Adaptive while the game keeps its
+ *   pace; VSync off and a slow Adaptive too when composed, without tearing or
+ *   while unknown; the legacy chain, assumed to wait: d3d8_sync_immediate):
+ *   every render belongs to one slot of the render grid, and its frame
+ *   is shown on the refresh after it, one period after the previous one, even
+ *   when the render starts a little after its slot: its image is the race at
+ *   its slot. Extra renders are dispatched at their slot (grid_wait, the old
+ *   loop: frame_t); the tick's render waits for its slot after the tick
+ *   (render_slot_wait).
+ * - Frames shown as soon as they are ready (VSync off, or Adaptive while the
+ *   game is slower than its pace, with tearing allowed and the frames flipped
+ *   on their own, not composed by the desktop: d3d8_sync_immediate): the image
+ *   is the race at its render's start, its slot when it starts on time.
+ * - Without a frame rate limit there is no slot. A render no slot started (a
+ *   tick the loop found already due, without a frame wait; a test mode), or
+ *   one the render gate held (the display times it), shows its start.
+ * A variable refresh display (VRR) shows the frames as they come, but cannot
+ * be told here: a render that starts after its slot shows its slot there. */
+static double sample_time(double now)
+{
+    double f = s.frame_t;
+    s.frame_t = 0.0;
+    if (f > 0.0 && now - f < TICK_MS && f - now < s.period_ms && !d3d8_sync_immediate()) return f;
+    return now;
+}
+
+/* The tick's render on its slot. The frame wait releases the tick as soon as
+ * its event is seen and gives its render the slot that follows (grid_wait);
+ * the tick runs, then its render waits here for that slot. Every render, the
+ * tick's too, then starts one period after the previous one: before, the
+ * tick ran at the slot and its render started the logic's time later (about
+ * 1 ms at 240 fps), and so reached the display that much later than the
+ * others. The wait is the frame wait's, for XBOX_PERF. */
+static void render_slot_wait(void)
+{
+    double t, w;
+    if (!s.slot_due || s_in_extra || GetCurrentThreadId() != s.tid) return;
+    s.slot_due = 0;
+    w = s.render_slot;
+    t = now_ms();
+    if (w > t && w - t <= s.period_ms + 1.0) {
+        if (g_perf_on) {
+            int prev = perf_zone_enter(PZ_FWAIT);
+            double t0 = perf_now();
+            sleep_until(w);
+            perf_zone_leave(PZ_FWAIT, prev, perf_now() - t0);
+        } else {
+            sleep_until(w);
+        }
+    }
+    s.frame_t = w;
 }
 
 static void hook_AB610(void)
 {
     uint32_t state = g_ecx, app = MEM32(APP_GLOBAL), sv_eax, sv_ecx, sv_edx;
-    double t0 = now_ms();
+    double t0;
     int k;
     double t_in;
+    render_slot_wait();
+    if (render_gate()) s.frame_t = 0.0;
+    t0 = now_ms();
     if (s_fix_hud && s.cap != 60 && !s_in_extra && app >= 0x1000u && MEM32(app + 4u) == state
         && (!s.tid || GetCurrentThreadId() == s.tid))
         hud_capture(state);
-    interp_begin(state);
+    interp_begin(state, sample_time(now_ms()));
     legs_begin();
     if (s_trace && GetCurrentThreadId() == s.tid) {
         /* position as the render sees it (interpolated or tick N) */
@@ -1272,17 +1600,175 @@ static void hook_AB610(void)
     g_eax = sv_eax; g_ecx = sv_ecx; g_edx = sv_edx;
 }
 
-/* Menu render 0x7CBD0: only measured (duration for the pacing). */
+/* Menu render 0x7CBD0: on its slot as the race's, and measured (duration for
+ * the pacing); nothing interpolated. */
 void sub_0007CBD0(void);
 static void hook_7CBD0(void)
 {
-    double t0 = now_ms();
+    double t0;
+    render_slot_wait();
+    render_gate();
+    s.frame_t = 0.0;
+    t0 = now_ms();
     sub_0007CBD0();
     if ((g_eax & 0xFFu) && (!s.tid || GetCurrentThreadId() == s.tid)) {
         maybe_stall();
         render_time(now_ms() - t0);
         s_measured = 1;
     }
+}
+
+/* ── continuous render grid ─────────────────────────────────────────
+ * The renders used to restart their grid at every tick (next = tick + period):
+ * with a limit that is not a multiple of 60 the last slot before the next tick
+ * was cut short. At 144, renders at T, T+6.94, T+13.89 and the tick's at
+ * T+16.67: 6.94 / 6.94 / 2.78 ms, 180 fps instead of 144 when a render takes
+ * less than 2.78 ms (165 fps in race, 180.0 in the menus). Now the slots run
+ * every period whatever the ticks, one render per slot; a tick is released as
+ * soon as its event is seen and its render takes the first slot after the
+ * event (render_slot_wait): the logic is the same, its image up to one period
+ * later (< 16.7 ms: no tick is lost), and every render, normal or extra,
+ * starts one period after the previous one and shows the race at its slot
+ * (sample_time). XBOX_FPS_CAP_GRID=0: the previous behaviour (comparison). */
+
+/* Slots more than half a period behind are dropped; the phase is kept. */
+static void grid_catch_up(double t)
+{
+    if (s.next_render <= 0.0 || t - s.next_render > 10.0 * TICK_MS) { s.next_render = t; return; }   /* start, pause, load */
+    while (t - s.next_render > 0.5 * s.period_ms) s.next_render += s.period_ms;
+}
+
+/* Precise sleep until `when` (no event watched). */
+static void sleep_until(double when)
+{
+    double t;
+    while ((t = now_ms()) < when) {
+        if (when - t > 1.5) Sleep((DWORD)(when - t - 1.0));
+        else { YieldProcessor(); if (when - t > 0.3) Sleep(0); }
+    }
+}
+
+/* Waits for the tick's event until `when`; 1 if it was signaled (*t_sig: when seen). */
+static int event_until(uint32_t handle, double when, double *t_sig)
+{
+    double t = now_ms(), rem = when - t;
+    if (rem > 1.5 && guest_wait(handle, (uint32_t)(rem - 1.0)) != WAIT_TIMEOUT_) { *t_sig = now_ms(); return 1; }
+    while ((t = now_ms()) < when) {
+        if (guest_wait(handle, 0) == WAIT_OBJ_0) { *t_sig = t; return 1; }
+        YieldProcessor();
+        if (when - t > 0.3) Sleep(0);
+    }
+    if (guest_wait(handle, 0) == WAIT_OBJ_0) { *t_sig = now_ms(); return 1; }   /* a due tick goes first */
+    return 0;
+}
+
+/* The frame wait with the grid: extra renders on the free slots, then the
+ * tick, released at once; its render's slot in s.render_slot. Sets
+ * s.tick_fresh / s.last_tick_sig; s.next_render = the slot after the tick's
+ * render. */
+static void grid_wait(uint32_t app, uint32_t handle)
+{
+    double t = now_ms(), sig = 0.0, slot;
+    int pending = 0, fresh = 0;
+    grid_catch_up(t);
+    /* Already signaled (during the previous render, time unknown): not fresh. */
+    if (guest_wait(handle, 0) == WAIT_OBJ_0) pending = 1;
+    while (!pending) {
+        double expected_tick, tick_slot, k;
+        t = now_ms();
+        grid_catch_up(t);
+        slot = s.next_render;
+        /* The next tick: one timer period after the previous one (see the
+         * old loop below); its slot is the first one at or after it. */
+        expected_tick = s.last_tick_sig + TICK_MS;
+        if (I.clock && I.on && I.t_est > 0.0 && t - I.t_est < 10.0 * TICK_MS) expected_tick = I.t_est + TICK_MS;
+        k = ceil((expected_tick - slot) / s.period_ms);
+        tick_slot = slot + (k < 1.0 ? 1.0 : k) * s.period_ms;
+        /* An extra render that would end after the tick's slot would push the
+         * tick (and the slots after it): this slot stays free. */
+        if (!s.noskip && s.avg_render > 0.0 && slot + s.avg_render > tick_slot && t < expected_tick + TICK_MS) {
+            P.skip_tick++;
+            guest_wait(handle, 0xFFFFFFFFu);
+            sig = now_ms(); pending = fresh = 1;
+            break;
+        }
+        if (event_until(handle, slot, &sig)) { pending = fresh = 1; break; }
+        t = now_ms();
+        if (t > slot + 1.0) P.late++;
+        s.frame_t = slot;                                  /* the extra render shows its slot */
+        if (!extra_allowed(app) || !extra_render(app)) {   /* frame skip, or refused (as 0xAA28B): wait for the tick */
+            s.frame_t = 0.0;
+            guest_wait(handle, 0xFFFFFFFFu);
+            sig = now_ms(); pending = fresh = 1;
+            break;
+        }
+        s.frame_t = 0.0;
+        s.next_render = slot + s.period_ms;
+        report(0);
+    }
+    /* The tick at once; its render on the next slot (render_slot_wait).
+     * Loads, videos, frame skip (no extra render there): its render at
+     * once too, as the original. */
+    t = now_ms();
+    grid_catch_up(t);
+    slot = s.next_render;
+    if (extra_allowed(app)) {
+        s.render_slot = slot;
+        s.slot_due = 1;
+        s.next_render = slot + s.period_ms;
+    } else {
+        s.next_render = (slot > t ? slot : t) + s.period_ms;
+    }
+    s.tick_fresh = fresh;
+    s.last_tick_sig = fresh ? sig : now_ms();
+}
+
+
+/* ── the limit follows the display ─────────────────────────────────
+ * A limit at the integer rate Windows lists (240 for a 239.98 Hz signal)
+ * made frames slightly faster than the display: the DXGI queue filled up
+ * and stayed full, each frame reaching the screen ~0.7 refresh later (+2.5 to +3 ms at 240 Hz). The limit is now the display's exact rate
+ * (d3d8_monitor_rate) less a small margin, so the game never produces
+ * faster than the screen and a queue filled by a hitch empties again
+ * (one refresh shown twice every 1 / (margin x rate) s: ~8 s at 240 Hz
+ * with 0.05 %, against a queue that never empties). 60 Hz displays (59.94
+ * included) keep the game's own 60 fps pace. XBOX_FPS_CAP_MATCH_MARGIN=<%>
+ * (0 to 5, default 0.05): the margin. */
+#define MATCH_MARGIN_PCT 0.05
+
+static double match_fps(double rate)
+{
+    double f;
+    if (rate <= 61.0 || rate > 1000.0) return 60.0;
+    f = rate * (1.0 - s.margin);
+    return f < 60.0 ? 60.0 : f;
+}
+
+/* The limit for a display at `rate` Hz: "Match screen" = the display;
+ * a limit asked is lowered to it only when it is above (VSync / Adaptive). */
+static double follow_fps(double rate)
+{
+    double m = match_fps(rate);
+    if (s.follow_monitor || s.req_fps <= 0.0 || s.req_fps > m) return m;
+    return s.req_fps;
+}
+
+/* Game thread, at every frame wait: the window's display changed rate (window
+ * created on another display, moved, mode changed): the limit follows. */
+static void follow_display(void)
+{
+    LONG gen;
+    double rate = d3d8_display_rate(&gen), f, p;
+    if (gen == s.rate_gen) return;
+    s.rate_gen = gen;
+    if (rate <= 0.0) return;
+    f = follow_fps(rate);
+    p = 1000.0 / f;
+    if (fabs(p - s.period_ms) < 1e-6) return;
+    fprintf(stderr, "[FPSCAP] display %.3f Hz: cap %.3f fps (was %.3f)\n", rate, f, 1000.0 / s.period_ms);
+    fflush(stderr);
+    s.period_ms = p;
+    d3d8_sync_set_pace((int)(f + 0.5));
 }
 
 /* ── hook 0xB2750 ─────────────────────────────────────────────── */
@@ -1309,7 +1795,14 @@ static void hook_B2750(void)
         return;
     }
     if (!s.tid) s.tid = GetCurrentThreadId();
+    s.slot_due = 0;       /* a slot the previous release gave and no render took */
+    s.frame_t = 0.0;
+    if (s.follow) follow_display();
     handle = MEM32(self + 4u);
+    if (s.grid) {
+        grid_wait(app, handle);
+        goto released;
+    }
     t = now_ms();
     /* The normal render just happened (tick -> render -> wait). */
     if (s.next_render < s.last_tick_ret) s.next_render = s.last_tick_ret + s.period_ms;
@@ -1353,11 +1846,16 @@ static void hook_B2750(void)
             s.tick_fresh = 1;
             break;
         }
+        /* the extra render shows the instant it was due; without a limit no
+         * render is due at any instant: it shows its start */
+        s.frame_t = s.period_ms > 0.0 ? wait_until : 0.0;
         if (!extra_render(app)) {           /* refused: as 0xAA28B does, wait for the tick */
+            s.frame_t = 0.0;
             r = guest_wait(handle, 0xFFFFFFFFu);
             s.tick_fresh = 1;
             break;
         }
+        s.frame_t = 0.0;
         /* No catch-up: one render late at most. */
         s.next_render += s.period_ms;
         t = now_ms();
@@ -1365,11 +1863,23 @@ static void hook_B2750(void)
         report(0);
     }
 tick:
+    s.last_tick_ret = now_ms();
+    s.last_tick_sig = s.last_tick_ret;
+    s.next_render = s.last_tick_ret + s.period_ms;
+    /* With a limit, the renders' slots start again here: the tick's render
+     * shows this instant, not its start after the logic. Without one there
+     * is no slot: every render shows its start. */
+    if (s.period_ms > 0.0) {
+        s.render_slot = s.last_tick_ret;
+        s.slot_due = 1;
+    }
+    goto done;
+released:                 /* grid: next_render and last_tick_sig set by grid_wait */
+    s.last_tick_ret = now_ms();
+done:
     H.valid = 0;          /* a tick follows: the HUD copy belongs to the previous one */
     P.ticks_ev++;
-    s.last_tick_ret = now_ms();
     s.from_wait = 1;
-    s.next_render = s.last_tick_ret + s.period_ms;
     report(0);
     g_eax = 0;            /* WAIT_OBJECT_0, as the original */
     g_ecx = self;
@@ -1395,10 +1905,14 @@ static void hook_AD4A0(void)
 {
     uint32_t app = MEM32(APP_GLOBAL), st = app >= 0x1000u ? MEM32(app + 4u) : 0, race;
     double t = now_ms();
+    double ref = I.on ? frame_clock_tick_ref() : 0.0;   /* before the tick runs: the timer's next one is not this */
     int pre = 0;
     if (I.written) interp_end();     /* to be safe: never a tick on an interpolated state */
     if (I.on && vs_layout(&I.pre, st)) { vs_read(&I.pre); pre = 1; }
+    M.seq++;
+    M.in_tick = 1;
     sub_000AD4A0();
+    M.in_tick = 0;
     if (I.on) {
         I.ok = 0;
         if (pre && MEM32(app + 4u) == st && vs_layout(&I.cur, st) && vs_same_layout(&I.cur, &I.pre)) {
@@ -1412,12 +1926,18 @@ static void hook_AD4A0(void)
          * wrong time: alpha restarts late (the motion slows down, then jumps)
          * or uses the previous wait (it overshoots, then freezes at N). */
         double old = (t >= s.last_tick_ret && t - s.last_tick_ret < TICK_MS) ? s.last_tick_ret : t;
-        /* New clock: the time the game's timer produced this tick. Exact when
-         * the wait saw the event signaled while waiting; otherwise one period
-         * after the previous tick's (the timer is regular), never later than
-         * now. Re-anchored after a pause (> 10 ticks). */
+        /* New clock: the time the game's timer produced this tick. With the
+         * frame clock (the default), the exact point of its grid
+         * (frame_clock_tick_ref). Otherwise: when the wait saw the event
+         * signaled while waiting -- late by as much as the render in progress
+         * when the event fired during an extra render; else one period after
+         * the previous tick's (the timer is regular), never later than now.
+         * Re-anchored after a pause (> 10 ticks). */
         double est;
-        if (s.from_wait && s.tick_fresh) est = s.last_tick_ret;
+        if (ref > 0.0 && ref <= t && t - ref < 2.0 * TICK_MS) est = ref;
+        /* last_tick_sig: when the wait saw the event (with or without the
+         * grid, the tick is released then; without it, = last_tick_ret) */
+        else if (s.from_wait && s.tick_fresh) est = s.last_tick_sig;
         else if (I.t_est > 0.0 && t - I.t_est < 10.0 * TICK_MS) { est = I.t_est + TICK_MS; if (est > t) est = t; }
         else { est = s.from_wait ? s.last_tick_ret : t; if (t - est > TICK_MS) est = t; }
         if (est > t) est = t;
@@ -1425,8 +1945,8 @@ static void hook_AD4A0(void)
         I.t_tick = I.clock ? est : old;
         if (s_trace) {
             uint32_t rc = race_ptr();
-            fprintf(s_trace, "T %.3f %u %d %d %.3f %.3f\n", t - s_t0_run, rc ? MEM32(rc + 0x18u) : 0, s.from_wait, s.tick_fresh,
-                    est - s_t0_run, old - s_t0_run);
+            fprintf(s_trace, "T %.3f %u %d %d %.3f %.3f %.3f\n", t - s_t0_run, rc ? MEM32(rc + 0x18u) : 0, s.from_wait,
+                    s.tick_fresh, est - s_t0_run, old - s_t0_run, s.last_tick_sig - s_t0_run);
             trace_flush();
         }
     }
@@ -1454,24 +1974,49 @@ static void hook_AD4A0(void)
 
 static void fps_cap_atexit(void)
 {
+    extern void *xbox_GetMemoryBase(void);      /* xbox_memory_layout.c */
     if (!g_fps_cap_on) return;
+    /* The report reads the game's memory (race_ptr). On the error paths
+     * that leave main() before the Xbox memory is mapped (default.xbe not
+     * loaded, layout refused) or after it is released, nothing ran and
+     * there is nothing to read: the process must end on its message, not
+     * on an access violation. */
+    if (!xbox_GetMemoryBase()) return;
     report(1);
     if (L.on && (s.log || s.check))
         fprintf(stderr, "[LEGS] renders=%llu resets=%llu skipped(memory!=tick)=%llu\n", L.n_render, L.n_reset, L.n_skip);
+    if (M.on && (s.log || s.check))
+        fprintf(stderr, "[MARKER] tick writes=%llu outside tick=%llu table full=%llu draws lerped=%llu cut=%llu stale=%llu kept=%llu\n",
+                M.n_tick, M.n_outside, M.n_full, M.n_lerp, M.n_cut, M.n_stale, M.n_kept);
 }
 
 void fps_cap_init(void)
 {
     extern int d3d8_monitor_hz(HWND hwnd);     /* d3d8_sync.h */
-    extern void d3d8_sync_set_pace(int fps);   /* d3d8_sync.h */
-    const char *e = getenv("XBOX_FPS_CAP"), *sy = getenv("XBOX_SYNC");
+    extern void d3d8_test_display_hz_apply(void);   /* d3d8_sync.h: XBOX_TEST_DISPLAY_HZ, test only */
+    extern double d3d8_monitor_rate(HWND hwnd, const char **src);   /* d3d8_sync.h */
+    const char *e = getenv("XBOX_FPS_CAP"), *sy = getenv("XBOX_SYNC"), *src;
     LARGE_INTEGER f;
-    int cap = 60, hz = d3d8_monitor_hz(NULL);
+    int cap = 60, hz;
+    double rate, cap_fps = 0.0;
+    d3d8_test_display_hz_apply();               /* before the refresh rate is read: "monitor" follows it */
+    hz = d3d8_monitor_hz(NULL);
+    rate = d3d8_monitor_rate(NULL, &src);       /* exact (239.98), see match_fps */
+    {
+        const char *m = getenv("XBOX_FPS_CAP_MATCH_MARGIN");
+        double v = m && *m ? atof(m) : MATCH_MARGIN_PCT;
+        s.margin = (v >= 0.0 && v <= 5.0 ? v : MATCH_MARGIN_PCT) / 100.0;
+    }
     if (e && !_stricmp(e, "monitor")) {
-        /* Refresh rate of the primary monitor (the game window opens there);
-         * 60 Hz or less, or unknown: 60 = hook not installed. */
-        cap = hz > 61 && hz <= 1000 ? hz : 60;
-        fprintf(stderr, "[FPSCAP] XBOX_FPS_CAP=monitor: display %d Hz -> cap %d\n", hz, cap);
+        /* Exact refresh rate of the primary monitor (the game window opens
+         * there; followed afterwards, follow_display), less the margin;
+         * 61 Hz or less (59.94 included), or unknown: 60 = hook not installed. */
+        cap_fps = match_fps(rate);
+        cap = rate > 61.0 && rate <= 1000.0 ? (int)(cap_fps + 0.5) : 60;
+        if (cap == 60) cap_fps = 0.0;
+        else s.follow = s.follow_monitor = 1;
+        fprintf(stderr, "[FPSCAP] XBOX_FPS_CAP=monitor: display %d Hz (exact %.3f Hz, %s) -> cap %.3f (%.2f %% under)\n",
+                hz, rate, src, cap_fps ? cap_fps : 60.0, cap_fps ? 100.0 * s.margin : 0.0);
     } else if (e && *e) {
         char *end;
         long v = strtol(e, &end, 10);
@@ -1484,12 +2029,22 @@ void fps_cap_init(void)
     /* With VSync / Adaptive, a cap above the monitor (or no limit) makes the
      * pump's Present wait on every extra frame, which delays the game (49 fps,
      * 18 % of frames held at 60 Hz): the cap is lowered to the refresh rate.
-     * XBOX_FPS_CAP_SYNC_CLAMP=0 (test): no clamp. */
-    if (sy && (!_stricmp(sy, "vsync") || !_stricmp(sy, "adaptive")) && hz > 0
-        && (cap == 0 || cap > hz) && !((e = getenv("XBOX_FPS_CAP_SYNC_CLAMP")) && e[0] == '0')) {
-        int was = cap;
-        cap = hz > 61 && hz <= 1000 ? hz : 60;
-        fprintf(stderr, "[FPSCAP] XBOX_SYNC=%s: cap %d lowered to the display (%d Hz) -> %d\n", sy, was, hz, cap);
+     * XBOX_FPS_CAP_SYNC_CLAMP=0 (test): no clamp. The display's exact rate
+     * (less the margin) is the bound: a limit of 240 on a 239.98 Hz display
+     * filled the queue as "Match screen" did; and the bound follows the
+     * display afterwards (follow_display). */
+    if (sy && (!_stricmp(sy, "vsync") || !_stricmp(sy, "adaptive")) && rate > 0.0 && !s.follow_monitor
+        && !((e = getenv("XBOX_FPS_CAP_SYNC_CLAMP")) && e[0] == '0')) {
+        double m = match_fps(rate);
+        s.req_fps = cap;
+        if (cap == 0 || cap > m) {
+            int was = cap;
+            cap = rate > 61.0 && rate <= 1000.0 ? (int)(m + 0.5) : 60;
+            cap_fps = cap == 60 ? 0.0 : m;
+            fprintf(stderr, "[FPSCAP] XBOX_SYNC=%s: cap %d lowered to the display (%d Hz, exact %.3f Hz, %s) -> %.3f\n",
+                    sy, was, hz, rate, src, cap_fps ? cap_fps : 60.0);
+        }
+        s.follow = cap != 60;
     }
     /* Adaptive sync compares the frames' arrival to this pace when it is
      * below the display (60 included: the game's own pace, no hook). */
@@ -1499,13 +2054,19 @@ void fps_cap_init(void)
     QueryPerformanceFrequency(&f);
     s.freq = (double)f.QuadPart;
     s.cap = cap;
-    s.period_ms = cap ? 1000.0 / cap : 0.0;
+    s.period_ms = cap_fps > 0.0 ? 1000.0 / cap_fps : cap ? 1000.0 / cap : 0.0;
+    if (s.follow) {
+        LONG g;
+        (void)d3d8_display_rate(&g);
+        s.rate_gen = g;     /* the game window's display: read when it is created (gen moves) */
+    }
     e = getenv("XBOX_FPS_CAP_LOG");   s.log = e && e[0] == '1';
     e = getenv("XBOX_FPS_CAP_CHECK"); s.check = e ? atoi(e) : 0;   /* 1 = probe, 2 = control without render */
     e = getenv("XBOX_FPS_CAP_DUP"); s.dup = e ? atoi(e) : 0;     /* test, see hook_AB610 */
     e = getenv("XBOX_FPS_INTERP_DUMP"); s_dump_at = e ? atoi(e) : 0;
     e = getenv("XBOX_FPS_INTERP"); I.on = e && *e ? e[0] == '1' : 1;     /* default 1 when cap != 60 */
-    if (cap == 60) I.on = 0;            /* 60 with leg smoothing: no interpolation, no extra frame */
+    if (cap == 60) I.on = 0;            /* 60: no interpolation, no extra frame */
+    e = getenv("XBOX_FIX_MARKER_INTERP"); M.on = I.on && !(e && e[0] == '0');   /* default 1 */
     e = getenv("XBOX_FPS_INTERP_SYNTH"); I.synth = e && e[0] == '1';   /* DUP test: alpha = k / (DUP + 1) */
     e = getenv("XBOX_FPS_INTERP_LOG");
     if (e && *e) { I.log = atoi(e); e = strchr(e, '@'); I.log_from = e ? (uint32_t)atoi(e + 1) : 0; }
@@ -1520,6 +2081,9 @@ void fps_cap_init(void)
         if (s_trace) setvbuf(s_trace, NULL, _IOFBF, 1 << 16);
     }
     e = getenv("XBOX_FPS_CAP_NOSKIP"); s.noskip = e && e[0] == '1';   /* test: render even if it delays the tick */
+    e = getenv("XBOX_FPS_CAP_GRID"); s.grid = cap > 60 && !(e && e[0] == '0');   /* default 1; no limit: no grid */
+    if (cap > 60) fprintf(stderr, "[FPSCAP] XBOX_FPS_CAP_GRID=%d (%s)\n", s.grid,
+                          s.grid ? "continuous render grid, tick on its slot" : "grid restarted at every tick");
     e = getenv("XBOX_FIX_HUD_RATE"); s_fix_hud = !(e && e[0] == '0');  /* default 1 */
     fprintf(stderr, "[FPSCAP] XBOX_FIX_HUD_RATE=%d (overlay animations at tick rate, no extra frame while paused)\n", s_fix_hud);
     e = getenv("XBOX_D3D_DUMP_FROM"); s.dump_from = (e && getenv("XBOX_D3D_DUMP")) ? (unsigned)atoi(e) : 0;
@@ -1531,11 +2095,13 @@ void fps_cap_init(void)
     P.t0 = s_t0_run = now_ms();
     g_fps_cap_on = 1;
     atexit(fps_cap_atexit);
-    fprintf(stderr, "[FPSCAP] cap %d%s (%s; logic 60 Hz)%s%s\n",
-            cap, cap ? " fps" : " = no limit",
-            cap == 60 ? "no extra frame" : I.on ? "camera + riders interpolation" : "duplicates without a tick",
+    fprintf(stderr, "[FPSCAP] cap %d%s, period %.4f ms%s (%s; logic 60 Hz)%s%s\n",
+            cap, cap ? " fps" : " = no limit", s.period_ms, s.follow ? ", follows the display" : "",
+            cap == 60 ? "no extra frame"
+                      : I.on ? "camera + riders interpolation" : "duplicates without a tick",
             s.check ? "; state probe active" : "", L.on ? "; leg smoothing" : "");
 }
+
 
 void (*fps_cap_lookup(unsigned int xbox_va))(void)
 {
@@ -1543,5 +2109,9 @@ void (*fps_cap_lookup(unsigned int xbox_va))(void)
     if (xbox_va == 0x000AB610u) return hook_AB610;
     if (xbox_va == 0x0007CBD0u && s.cap != 60) return hook_7CBD0;
     if (xbox_va == 0x000AD4A0u && (I.on || s_dump_at || L.on)) return hook_AD4A0;
+    /* plain form: the regen also routes the direct calls (fix_manual_hook_calls.py);
+     * both hooks pass straight through when the marker fix is off (60, M.on = 0) */
+    if (xbox_va == 0x00043340u) return hook_fps_00043340;
+    if (xbox_va == 0x00043690u) return hook_fps_00043690;
     return 0;
 }

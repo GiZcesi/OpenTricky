@@ -43,6 +43,8 @@ extern IDirect3DTexture8 *txd_find(const TXD_Dict *dict, const char *name);
 static int g_textures_loaded = 0;
 #endif
 
+#include "../kernel/xbox_logstats.h"
+
 /* Font atlas DXT5 data - game-specific, only available in burnout3 */
 #ifdef GAME_HAS_FONT_ATLAS
 #include "font_atlas_data.h"
@@ -229,6 +231,7 @@ static struct {
     int      point_params_enable, point_smooth;
     float    point_params[8];       /* SET_POINT_PARAMS 0x0A30..0x0A4C */
     uint32_t point_size;
+    uint32_t line_width;            /* SET_LINE_WIDTH, 1/8 px (kept for the logs only) */
     int      specular_enable;       /* SET_SPECULAR_ENABLE: oD1 reaches the combiners */
     /* Stencil, face culling. GL enums as the push buffer sends
      * them; applied to program draws. */
@@ -251,6 +254,8 @@ static struct {
         uint32_t image_rect; /* IMAGE_RECT (0x1B1C) -- linear w/h */
         int enabled;         /* Decoded from control0 bit 30 */
         IDirect3DTexture8 *d3d;   /* Uploaded texture, if any */
+        int light;                /* fork: a light texture (d3d8_lights.h) */
+        uint64_t lkey;            /* fork: its key (nv2a_hdtex.h), 0 = not computed */
         uint32_t d3d_offset;      /* The (offset, format) this was built from, */
         uint32_t d3d_format;      /* so a rebind with the same pair is free */
         uint32_t bump[6];         /* SET_BUMP_ENV_MAT 00 01 10 11, SCALE, OFFSET (0x1B28..0x1B3C, floats) */
@@ -276,6 +281,7 @@ static struct {
     uint32_t prog_load, prog_start;
     float    vconst[VSHCPU_CONSTANTS][4];
     uint32_t const_load;
+    uint32_t vgen;                      /* +1 when a constant changes value (stable decals) */
     int      prog_dirty;
     int      prog_len;                  /* decoded length, -1 = no FINAL */
     uint16_t prog_inputs;               /* bit n: the program reads v[n] */
@@ -301,6 +307,15 @@ static float u2f(uint32_t u) {
     union { float f; uint32_t i; } x;
     x.i = u;
     return x.f;
+}
+
+/* A transform constant written; the generation moves only when its bits
+ * change, so two draws with the same generation share their transform. */
+static void vc_set(float *dst, uint32_t param)
+{
+    uint32_t old;
+    memcpy(&old, dst, 4);
+    if (old != param) { memcpy(dst, &param, 4); g_pg.vgen++; }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -441,6 +456,9 @@ static float g_flat_rgba[4];
 static int g_alpha_t0z;
 
 void pgraph_d3d11_set_draw_subst(pgraph_draw_subst_fn fn) { g_subst_fn = fn; }
+/* Fork: draw observer (lightmap_map.c), sees every program draw first, changes nothing. */
+static pgraph_draw_observe_fn g_observe_fn;
+void pgraph_d3d11_set_draw_observe(pgraph_draw_observe_fn fn) { g_observe_fn = fn; }
 
 void pgraph_d3d11_tex_state(int stage, uint32_t *format, uint32_t *filter, uint32_t *address, uint32_t *control0, int *enabled)
 {
@@ -821,6 +839,7 @@ static struct {
     uint32_t draw_mark;                     /* stats.draw_calls at the last change */
     uint32_t draws[PGRAPH_PHASE_COUNT];     /* this presented image */
     int      in_frame, have_begin, have_seq, trlog, trlog_read;
+    int      group;                         /* of the last GROUP marker, -1 none (speed effect) */
     uint32_t last_begin, last_seq;
     unsigned long long tags, images, ooo, lost_end, gaps;
     unsigned long long total[PGRAPH_PHASE_COUNT];
@@ -829,6 +848,9 @@ static struct {
 
 void pgraph_d3d11_set_pass_phase_callback(pgraph_pass_phase_fn fn) { g_ph.cb = fn; }
 int  pgraph_d3d11_pass_phase(void) { return g_ph.phase; }
+
+static pgraph_image_end_fn g_image_end_cb;     /* fork: online waiting banner (nv2a_pgraph_d3d11.h) */
+void pgraph_d3d11_set_image_end_callback(pgraph_image_end_fn fn) { g_image_end_cb = fn; }
 
 static void phase_set(int ph, uint32_t tag)
 {
@@ -848,6 +870,11 @@ static void phase_set(int ph, uint32_t tag)
     }
 }
 
+/* Fork: distance veil, below draw_program's helpers. */
+static void vl_frame_begin(void);
+static void vl_point(int view, int end);
+static int g_vl_on = -1, g_vl_cur_view = -1, g_vl_cur_grp = -1;
+
 static void pass_tag_seen(uint32_t p)
 {
     uint32_t f = p & 0x1FFFu;
@@ -863,11 +890,16 @@ static void pass_tag_seen(uint32_t p)
         g_ph.have_begin = 1;
         g_ph.in_frame = 1;
         g_ph.have_seq = 0;
+        g_ph.group = -1;
+        if (g_vl_on < 0) g_vl_on = d3d8_VeilWanted();
+        if (g_vl_on) vl_frame_begin();         /* fork: distance veil */
         phase_set(PGRAPH_PHASE_BEGIN, p);
         break;
     case 1:                                         /* FRAME_END */
         if (!g_ph.in_frame || f != g_ph.last_begin) g_ph.ooo++;
         g_ph.in_frame = 0;
+        g_ph.group = -1;
+        if (g_vl_on > 0) vl_point(-1, 1);       /* fork: distance veil, if group 6 did not */
         phase_set(PGRAPH_PHASE_END, p);
         break;
     case 2: {                                       /* GROUP */
@@ -879,6 +911,12 @@ static void pass_tag_seen(uint32_t p)
         }
         g_ph.last_seq = seq;
         g_ph.have_seq = 1;
+        g_ph.group = (int)grp;
+        if (g_vl_on > 0) {                      /* fork: distance veil */
+            g_vl_cur_view = (int)((p >> 10) & 7u);
+            g_vl_cur_grp = ortho ? -1 : (int)grp;
+            if (g_ph.in_frame && grp == 6u && !ortho) vl_point(g_vl_cur_view, 0);
+        }
         phase_set(grp < 7u ? PGRAPH_PHASE_3D
                   : ortho ? PGRAPH_PHASE_HUD : PGRAPH_PHASE_AFTER3D_PERSP, p);
         break;
@@ -886,6 +924,179 @@ static void pass_tag_seen(uint32_t p)
     default:                                        /* ORTHO: not emitted */
         break;
     }
+}
+
+/* The image's lights (fork; d3d8_lights.h), the source of the selective
+ * bloom: is the draw about to be issued one of the title's lights?
+ *   2, a halo the bloom replaces: additive blending (dfactor ONE, sfactor ONE
+ *     or SRC_ALPHA) in the perspective groups >= 7 with the halo atlas
+ *     (lighttex_is_halo: the lamps', the gates' and the flares' glow sprites);
+ *   3, a light texture that stays and glows: whatever its blending, in the
+ *     3D or the perspective groups, a stage-0 light texture (lighttex_is_light
+ *     below; only its lit texels emit, d3d8_lights.h);
+ *   1, a light that stays and glows: additive blending, some colour written, in a pass group of
+ *     XBOX_LIGHT_GROUPS (bit g = 3D group g, bit 7 = the perspective groups
+ *     >= 7; default 0x40: the effects group 6 -- sparks, the Uber glow, the
+ *     pick-ups' glow; never the snow's spray and the board's trail, which
+ *     are additive too, in group 2).
+ * The group comes from the markers: none, no light. No luminance test
+ * anywhere. */
+static int lighttex_is_halo(uint64_t key);
+/* XBOX_LIGHTS_LOG=1 (probe): every 300th presented image, one line per
+ * blended draw of the 3D or perspective groups whose dfactor is ONE, and per
+ * draw of a light texture: group, blending, stage-0 key, depth test / write,
+ * outcome. */
+static void light_probe(int bit, int add, uint64_t key, int r)
+{
+    static int log = -1;
+    static unsigned img, n;
+    if (log < 0) { const char *e = getenv("XBOX_LIGHTS_LOG"); log = e && e[0] == '1'; }
+    if (!log || (!add && !r) || d3d8_PresentSeq() % 300u != 0u) return;
+    if (img != d3d8_PresentSeq()) { img = d3d8_PresentSeq(); n = 0; }
+    if (n++ >= 300) return;
+    fprintf(stderr, "[LIGHTS-PROBE] img %u g%d blend %X/%X tex %016llx z %d/%d -> %d\n",
+            d3d8_PresentSeq(), bit, g_pg.blend_sfactor, g_pg.blend_dfactor,
+            (unsigned long long)key, g_pg.depth_test, g_pg.depth_mask, r);
+}
+
+static int light_draw(void)
+{
+    static int on = -1;
+    static uint32_t groups;
+    int bit;
+    if (on < 0) {
+        const char *e = getenv("XBOX_LIGHT_GROUPS");
+        groups = e && *e ? (uint32_t)strtoul(e, NULL, 16) : 0x40u;
+        on = d3d8_lights_wanted();
+    }
+    if (!on || !d3d8_lights_active() || !(g_pg.color_mask & 0x00010101u)) return 0;
+    if (g_ph.phase == PGRAPH_PHASE_AFTER3D_PERSP) bit = 7;
+    else if (g_ph.phase == PGRAPH_PHASE_3D && g_ph.group >= 0 && g_ph.group <= 6) bit = g_ph.group;
+    else return 0;
+    /* fork: the 3D brought to the output size at FRAME_END (temporal, render
+     * scale): the perspective groups' lights are the title's (their targets
+     * would otherwise change size inside the image) */
+    if (bit == 7 && d3d8_temporal_moved()) return 0;
+    {
+        int add = g_pg.blend_enable && g_pg.blend_dfactor == 1 &&
+                  (g_pg.blend_sfactor == 1 || g_pg.blend_sfactor == 0x302);
+        int tex = g_pg.tex[0].enabled && g_pg.tex[0].d3d;
+        int r = 0;
+        if (tex && g_pg.tex[0].light) { r = 3; g_d3d8_light_tex_key = g_pg.tex[0].lkey; }
+        else if (add && bit == 7 && tex && lighttex_is_halo(g_pg.tex[0].lkey)) r = 2;
+        else if (add && ((groups >> bit) & 1u)) r = 1;
+        light_probe(bit, add, tex ? g_pg.tex[0].lkey : 0, r);
+        return r;
+    }
+}
+
+/* Light textures: pictures that are lights themselves, drawn opaque or
+ * blended -- neon signs, lit screens, LED boards, the start lights, the lit
+ * checkpoint, glowing chevrons and arrows -- keyed as the HD textures are
+ * (FNV-1a 64 of the level-0 bytes, nv2a_hdtex.h). Made from the night and
+ * city tracks (Tokyo Megaplex, Merqury City, Snowdream); the shared ones
+ * (start lights, checkpoint, LED boards, chevrons) light the other tracks
+ * too. Never the snow, the stands or the scenery. Only the lit states of
+ * pictures the title swaps (a checkpoint, a blinking neon) are listed.
+ * XBOX_LIGHT_TEX adds keys (hex, comma separated), XBOX_LIGHT_DENY removes. */
+static const uint64_t k_light_tex[] = {
+    /* Tokyo Megaplex */
+    0xe18593b21594de96ull,  /* lamp row */
+    0x105c4bc1ceb858d6ull,  /* glowing frame, yellow */
+    0x3aac1a94ebace679ull,  /* glowing frame, blue */
+    0xd8697e90cf36a22eull,  /* light tube */
+    0xc365a605f51d4990ull,  /* light panels */
+    0x0badfe5006764468ull,  /* blue light tubes */
+    0xc47d77dccbea627full,  /* green arrows */
+    0xf8365123059516cdull,
+    0xf228f585e19954c1ull,
+    0x5255f4c4fe37c524ull,  /* green lamp */
+    0xd5e9e4704cad95f6ull,  /* red lamp */
+    /* shared by several tracks */
+    0x6b44082240a06642ull,  /* checkpoint, lit */
+    0x57ce79e6c18128e2ull,  /* arrows */
+    0x8f60dae778eaab31ull,  /* lightning sign */
+    0xfc6c7da05d1735daull,  /* start lights */
+    0x664798246c61e4acull,
+    0xd12fdc7423120817ull,
+    0x267fbdcd4de1b7ecull,
+    0x14ac7e9631727118ull,  /* red chevrons */
+    0x37b34486f415e37bull,
+    0x799621c83b4ce86cull,
+    0xdebffa62e71f7b2cull,  /* blue chevrons */
+    0x813ed2107127fdb9ull,
+    0xc29340d4487519b3ull,
+    0xe99820d2c89a7038ull,  /* LED boards */
+    0x633c1c390e9421b9ull,
+    /* Merqury City */
+    0x9ace7bb122dc44d0ull,  /* neon sign, lit */
+    0xf3a0e214385d02a8ull,  /* neon sign */
+    0x1214c36205caca04ull,  /* neon sign */
+    0xc3f93a48437a475cull,  /* tree lights */
+    0x07fc03dc41a89a62ull,  /* light tube */
+    0xfab7c10fdd728fdcull,  /* neon sign */
+    0x3d4bceff9f86d055ull,  /* neon lines */
+    0x8e3eaee123d2f328ull,  /* neon sign */
+    0xe4ffcda414dbe29bull,  /* screen */
+    /* Snowdream */
+    0x4bfead97cbb2619bull,  /* lit sign */
+    0x79156a338f146423ull,  /* floodlights */
+};
+
+/* The halo atlas (ring, soft glow, star, square; the perspective groups >= 7):
+ * the glow sprites of the lamps, the gates and the flares, which the bloom
+ * replaces (light_draw 2). */
+static const uint64_t k_halo_tex[] = {
+    0xd0ca847a171ba325ull,
+};
+
+static int lighttex_is_halo(uint64_t key)
+{
+    size_t i;
+    if (!key) return 0;
+    for (i = 0; i < sizeof k_halo_tex / sizeof k_halo_tex[0]; i++) if (key == k_halo_tex[i]) return 1;
+    return 0;
+}
+
+static struct {
+    int      on;
+    int      nadd, ndeny;
+    uint64_t add[16], deny[16];
+} g_lt = { -1 };
+
+static int lighttex_list(const char *e, uint64_t *v, int max)
+{
+    int n = 0;
+    while (e && *e && n < max) {
+        char *end;
+        unsigned long long x = strtoull(e, &end, 16);
+        if (end == e) break;
+        v[n++] = (uint64_t)x;
+        e = end;
+        while (*e == ',' || *e == ' ' || *e == ';') e++;
+    }
+    return n;
+}
+
+/* 1 if these level-0 bytes are a light texture. Off (no bloom, no speed
+ * effect): 0 at once, nothing hashed. */
+static int lighttex_is_light(const uint8_t *level0, uint32_t n0, uint64_t *out_key)
+{
+    uint64_t key;
+    size_t i;
+    int j;
+    if (g_lt.on < 0) {
+        g_lt.on = d3d8_lights_wanted();
+        g_lt.nadd = lighttex_list(getenv("XBOX_LIGHT_TEX"), g_lt.add, 16);
+        g_lt.ndeny = lighttex_list(getenv("XBOX_LIGHT_DENY"), g_lt.deny, 16);
+    }
+    if (!g_lt.on || !level0 || !n0) return 0;
+    key = hdtex_key(level0, n0);
+    *out_key = key;
+    for (j = 0; j < g_lt.ndeny; j++) if (key == g_lt.deny[j]) return 0;
+    for (j = 0; j < g_lt.nadd; j++) if (key == g_lt.add[j]) return 1;
+    for (i = 0; i < sizeof k_light_tex / sizeof k_light_tex[0]; i++) if (key == k_light_tex[i]) return 1;
+    return 0;
 }
 
 /* Just before the title's frame is presented (flip, or clear without flips). */
@@ -954,6 +1165,10 @@ static void nop_note(uint32_t param)
         (param >> 16) == PGRAPH_BOX_TAG_MAGIC ||    /* 16:9 frame */
         (param >> 16) == PGRAPH_PANEL_TAG_MAGIC || (param >> 16) == PGRAPH_PANEL_TAG_MAGIC_R) {
         hud_tag_seen(param);
+        return;
+    }
+    if ((param >> 16) == PGRAPH_HDGATE_TAG_MAGIC) {     /* this image's HD HUD gate */
+        hdtex_frame_gate(param & 3u);
         return;
     }
     for (i = 0; i < g_nop.n; i++)
@@ -1232,6 +1447,10 @@ typedef struct {
     uint32_t hd_bytes;          /* GPU bytes of an HD replacement, else 0 */
     uint32_t hd_tick;           /* pump tick of its last use */
     HdJob   *hd_job;            /* its HD copy, being loaded */
+    int8_t   hd_gate;           /* a font / HUD atlas under the per-image gate: its HDTEX_GATE_*, else -1 */
+    IDirect3DTexture8 *hd_tex;  /* such an entry's HD copy, kept beside its own picture (tex) */
+    int      light;             /* fork: a light texture (light_draw) */
+    uint64_t lkey;              /* fork: its key, 0 = not computed */
 } TcEntry;
 static TcEntry g_tc[TC_POOL];
 static int g_tc_head[TC_BUCKETS];
@@ -1239,6 +1458,8 @@ static int g_tc_free = -1, g_tc_ready = 0;
 static unsigned g_texcache_clock, g_tc_uploads, g_tc_live;
 static uint64_t g_tc_hd_bytes;  /* live HD replacements, in GPU bytes */
 static uint32_t g_sig_gen = 1;  /* pump tick, see tex_sig */
+static int g_tc_found_light;    /* fork: the light flag of texcache_find's hit */
+static uint64_t g_tc_found_lkey;
 
 static unsigned tc_bucket(uint32_t offset, uint32_t format)
 {
@@ -1265,6 +1486,8 @@ static void tc_remove_why(int i, int over_budget)
     if (*link == i) *link = g_tc[i].next;
     if (g_tc[i].tex) g_tc[i].tex->lpVtbl->Release(g_tc[i].tex);
     g_tc[i].tex = NULL;
+    if (g_tc[i].hd_tex) g_tc[i].hd_tex->lpVtbl->Release(g_tc[i].hd_tex);
+    g_tc[i].hd_tex = NULL;
     if (g_tc[i].hd_bytes) {
         g_tc_hd_bytes -= g_tc[i].hd_bytes;
         hdtex_note_evicted(g_tc[i].hd_bytes, over_budget);
@@ -1352,7 +1575,12 @@ static IDirect3DTexture8 *texcache_find(uint32_t offset, uint32_t format, uint32
                 uint32_t bytes;
                 if (hdtex_collect(g_tc[i].hd_job, &hd, &bytes)) {
                     g_tc[i].hd_job = NULL;
-                    if (hd) {
+                    if (hd && g_tc[i].hd_gate >= 0) {
+                        g_tc[i].hd_tex = hd;   /* gated: the title's texture stays for the images without */
+                        g_tc[i].hd_bytes = bytes;
+                        g_tc_hd_bytes += bytes;
+                        tc_hd_budget();
+                    } else if (hd) {
                         g_tc[i].tex->lpVtbl->Release(g_tc[i].tex);
                         g_tc[i].tex = hd;
                         g_tc[i].hd_bytes = bytes;
@@ -1361,13 +1589,16 @@ static IDirect3DTexture8 *texcache_find(uint32_t offset, uint32_t format, uint32
                     }
                 }
             }
+            g_tc_found_light = g_tc[i].light;
+            g_tc_found_lkey = g_tc[i].lkey;
+            if (g_tc[i].hd_tex && hdtex_gate_now(g_tc[i].hd_gate)) return g_tc[i].hd_tex;
             return g_tc[i].tex;
         }
     return NULL;
 }
 
 static void texcache_put(uint32_t offset, uint32_t format, uint32_t sig, IDirect3DTexture8 *tex,
-                         HdJob *hd_job)
+                         HdJob *hd_job, int hd_gate, int light, uint64_t lkey)
 {
     unsigned b;
     int i;
@@ -1390,6 +1621,10 @@ static void texcache_put(uint32_t offset, uint32_t format, uint32_t sig, IDirect
     g_tc[i].hd_bytes = 0;
     g_tc[i].hd_tick  = g_sig_gen;
     g_tc[i].hd_job   = hd_job;
+    g_tc[i].hd_gate  = (int8_t)hd_gate;
+    g_tc[i].hd_tex   = NULL;
+    g_tc[i].light    = light;
+    g_tc[i].lkey     = lkey;
     g_tc[i].next     = g_tc_head[b];
     g_tc_head[b]     = i;
     g_tc_live++;
@@ -1397,7 +1632,7 @@ static void texcache_put(uint32_t offset, uint32_t format, uint32_t sig, IDirect
     {   /* one line per 600 frames: uploads per frame should fall to ~0 */
         static unsigned last_seq = 0, last_up = 0;
         unsigned seq = d3d8_PresentSeq();
-        if (seq - last_seq >= 600) {
+        if (seq - last_seq >= 600 && xbox_log_stats()) {
             fprintf(stderr, "[TEXCACHE] %u textures kept, %u uploads in the last %u frames\n",
                     g_tc_live, g_tc_uploads - last_up, seq - last_seq);
             last_seq = seq;
@@ -1516,6 +1751,9 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
     HRESULT hr;
     int linear = !tex_is_swizzled(color) && !tex_dxt_format(color, &xfmt, &block_bytes);
 
+    g_pg.tex[stage].light = 0;               /* fork: set below for a light texture */
+    g_pg.tex[stage].lkey = 0;
+
     /* A linear image's size is its IMAGE_RECT; the format's log2 size fields
      * are zero (they decoded as 1x1, so a linear texture was one texel). */
     if (linear && g_pg.tex[stage].image_rect) {
@@ -1595,8 +1833,12 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
         }
         sig = tex_sig(offset, sz);
         if (linear) sig ^= g_pg.tex[stage].image_rect * 0x9E3779B1u;   /* same bytes, other shape */
+        g_tc_found_light = 0;
+        g_tc_found_lkey = 0;
         hit = fresh ? hd_alt_memo_find(offset, fmt, sig) : texcache_find(offset, fmt, sig);
         if (hit) {
+            g_pg.tex[stage].light = g_tc_found_light;
+            g_pg.tex[stage].lkey = g_tc_found_lkey;
             g_pg.tex[stage].d3d = hit;
             g_pg.tex[stage].d3d_offset = offset;
             g_pg.tex[stage].d3d_format = fmt;
@@ -1764,6 +2006,7 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
          * has one (XBOX_HD_TEXTURES), is loaded and swapped in by texcache_find.
          * Linear images (render targets, video frames) never. */
         HdJob *job = NULL;
+        int gate = -1;
         if (fresh) {
             hd_alt_keep(tex);                /* not cached: the reference frame */
             hd_alt_memo_put(offset, fmt, sig, tex);
@@ -1781,9 +2024,19 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
             }
             if (!icons && !linear && hdtex_on()) {
                 uint32_t n0 = tex_level_bytes(color, w, h, 0);
-                job = hdtex_request(va_ptr(offset, n0), n0, w, h);
+                job = hdtex_request(va_ptr(offset, n0), n0, w, h, levels, &gate);
             }
-            texcache_put(offset, fmt, sig, tex, job);
+            {   /* fork: a light texture? (only with the bloom or the speed effect) */
+                int light = 0;
+                uint64_t lkey = 0;
+                if (!linear && d3d8_lights_wanted()) {
+                    uint32_t n0 = tex_level_bytes(color, w, h, 0);
+                    light = lighttex_is_light(va_ptr(offset, n0), n0, &lkey);
+                }
+                g_pg.tex[stage].light = light;
+                g_pg.tex[stage].lkey = lkey;
+                texcache_put(offset, fmt, sig, tex, job, gate, light, lkey);
+            }
         }
     }
     g_pg.tex[stage].d3d        = tex;
@@ -2209,6 +2462,14 @@ static struct { uint32_t addr; int span[OCC_SPANS]; int n; LARGE_INTEGER t0; } g
 static int      g_occ_njob;
 static unsigned long long g_occ_reports, g_occ_lat_us, g_occ_dropped;
 
+/* No room for a query, a span or a report: an error, written when it
+ * happens (the first 20); the [OCCL] summary is a statistic. */
+static void occ_drop(const char *what)
+{
+    if (g_occ_dropped++ < 20u)
+        fprintf(stderr, "[OCCL] %s: dropped\n", what);
+}
+
 static int occ_enabled(void)
 {
     static int on = -1;
@@ -2236,14 +2497,14 @@ static void occ_enable(int on)
 {
     if (on && g_occ_open < 0) {
         int h = d3d8_OcclusionBegin(), s;
-        if (h < 0) { g_occ_dropped++; return; }
+        if (h < 0) { occ_drop("no occlusion query free (256 in use, or none created): span"); return; }
         s = h;                                    /* one span slot per query handle */
         g_occ_span[s].h = h; g_occ_span[s].refs = 1; g_occ_span[s].ready = 0; g_occ_span[s].n = 0;
         g_occ_open = s;
     } else if (!on && g_occ_open >= 0) {
         d3d8_OcclusionEnd(g_occ_span[g_occ_open].h);
         if (g_occ_ncur < OCC_SPANS) g_occ_cur[g_occ_ncur++] = g_occ_open;
-        else { occ_unref(g_occ_open); g_occ_dropped++; }
+        else { occ_unref(g_occ_open); occ_drop("16 spans since the last clear: span"); }
         g_occ_open = -1;
     }
 }
@@ -2263,7 +2524,7 @@ static void occ_get_report(uint32_t param)
         }
     }
     if ((param >> 24) != 1) return;                   /* only the zpass pixel count */
-    if (g_occ_njob >= OCC_JOBS) { g_occ_dropped++; return; }
+    if (g_occ_njob >= OCC_JOBS) { occ_drop("64 reports pending: report"); return; }
     j = g_occ_njob++;
     g_occ_job[j].addr = param & 0x00FFFFFFu;
     g_occ_job[j].n = g_occ_ncur;
@@ -2371,9 +2632,9 @@ static void drawlog_program_draw(const uint32_t *indices, uint32_t v0, uint32_t 
         uint32_t f = g_pg.tex[st].format;
         if (!g_pg.tex[st].enabled) continue;
         fprintf(stderr, "[DRAW]   t%d off %08X fmt %08X (color %02X %ux%u mips %u cube %u dim %u) "
-                "addr %08X  oT%d %g %g %g %g\n", st, g_pg.tex[st].offset, f, TEXFMT_COLOR(f),
+                "addr %08X filter %08X  oT%d %g %g %g %g\n", st, g_pg.tex[st].offset, f, TEXFMT_COLOR(f),
                 1u << TEXFMT_SIZE_U(f), 1u << TEXFMT_SIZE_V(f), TEXFMT_MIPS(f), (f >> 2) & 1,
-                (f >> 4) & 0xF, g_pg.tex[st].address, st, out[VSHCPU_OUT_T0 + st][0],
+                (f >> 4) & 0xF, g_pg.tex[st].address, g_pg.tex[st].filter, st, out[VSHCPU_OUT_T0 + st][0],
                 out[VSHCPU_OUT_T0 + st][1], out[VSHCPU_OUT_T0 + st][2], out[VSHCPU_OUT_T0 + st][3]);
     }
     for (st = 0; st < nst && st < 8; st++)
@@ -2585,10 +2846,17 @@ static float points_kx(void)
     return kx;
 }
 
+static uint32_t g_gpu_lo;               /* first vertex of the current GPU draw */
+static const uint32_t *g_gpu_ib;        /* its index list as built here, title order */
+
 static int gpu_prepare(Nv2aVshDraw *d, const uint32_t *indices, uint32_t start, uint32_t count)
 {
     static int on = -1;
-    static uint32_t *ib = NULL, ib_cap = 0;
+    /* Two index buffers used in turn: the previous draw's list is
+     * still intact while the next draw is prepared (zd_remember). */
+    static uint32_t *ibs[2], caps[2];
+    static int cur;
+    uint32_t *ib, ib_cap;
     uint32_t lo, hi, i, a, n = 0, need;
     uint32_t mode = g_pg.draw_mode;
 
@@ -2608,14 +2876,18 @@ static int gpu_prepare(Nv2aVshDraw *d, const uint32_t *indices, uint32_t start, 
         lo = start;
         hi = start + count - 1;
     }
+    g_gpu_lo = lo;                      /* rebased index -> title index (zd_clip) */
+    cur ^= 1;
+    ib = ibs[cur];
+    ib_cap = caps[cur];
 
     /* The index list, rebased to lo, in the primitive form assemble() builds. */
     need = count * 6u + 8u;
     if (need > ib_cap) {
         uint32_t *nb = (uint32_t *)realloc(ib, need * sizeof *nb);
         if (!nb) GPU_NO(0);
-        ib = nb;
-        ib_cap = need;
+        ibs[cur] = ib = nb;
+        caps[cur] = ib_cap = need;
     }
     #define IX(k) ((indices ? indices[k] : start + (k)) - lo)
     switch (mode) {
@@ -2656,6 +2928,7 @@ static int gpu_prepare(Nv2aVshDraw *d, const uint32_t *indices, uint32_t start, 
     if (mode >= 5) d->topology = D3DPT_TRIANGLELIST;
     if (n == 0) GPU_NO(3);
     d->indices = ib;
+    g_gpu_ib = ib;
     d->nindices = n;
 
     va_const_init();
@@ -2776,6 +3049,881 @@ static uint32_t points_squares(const ProgVertex *vb, const uint8_t *okb, const f
     }
     return o;
 }
+
+/* Lines at the target's scale. D3D11 rasterises a line one pixel of the
+ * render target wide, whatever its size: right at 640x480, a third of the
+ * title's width at 1440 lines. Above 480 lines (the 3D target's height,
+ * render scale included) each segment becomes a quad one title pixel wide,
+ * across its minor axis as the rasteriser does -- x-major segments one
+ * title pixel tall, y-major ones one wide (that half-width scaled as the
+ * point sprites', points_kx) -- so a line keeps its share of the image at
+ * every resolution. At 480 lines and below the draw is not touched.
+ * XBOX_LINES_SCALE=0 keeps the one-pixel lines. Returns 1 when lines are
+ * widened for the current target. */
+static int g_lines_scale = -1;
+
+/* The diag port's `set linescale 0|1` (bench: both on one held frame). */
+void pgraph_d3d11_set_lines_scale(int on)
+{
+    g_lines_scale = on ? 1 : 0;
+}
+
+/* ── Stable ties inside one mesh (XBOX_ZTIE) ─────────────────────────────
+ * Some scenery meshes hold faces that lie in the same plane and overlap (the
+ * steel trusses under Garibaldi's stands: two members of one mesh crossing
+ * in the truss plane). Which face shows there depends on rounding and flips
+ * with the smallest camera move -- on the console too, but small at 640x480.
+ * XBOX_ZTIE=1 finds such meshes once (model space: two triangles that share
+ * no edge, lie in one plane and overlap) and marks their draws (raster bit
+ * 0x40); d3d8_nv2a.c then draws them so that, among the faces within a few
+ * depth steps of the nearest, the first one in the mesh's order always wins.
+ * On by default (a fix of a defect); XBOX_ZTIE=0 (diagnostics) or a mesh
+ * with no such pair: nothing changes. */
+static int g_ztie = -1;
+static unsigned g_ztie_seen, g_ztie_marked, g_ztie_draws;
+
+static void ztie_init(void)
+{
+    const char *e;
+    if (g_ztie >= 0) return;
+    e = getenv("XBOX_ZTIE");
+    g_ztie = !(e && e[0] == '0');                  /* a fix of a defect: on by default */
+    if (g_ztie) fprintf(stderr, "[ZTIE] on: stable ties inside one mesh\n");
+}
+
+/* Diagnostics port `set ztie 0|1` (same frame, both ways). */
+void pgraph_d3d11_set_ztie(int on) { ztie_init(); g_ztie = on ? 1 : 0; }
+
+static int ztie_pos(const Nv2aVshDraw *d, uint32_t i, float p[3])
+{
+    uint32_t st = d->attr[0].stride, off = i * st;
+    if (off + 12u > d->attr[0].bytes) return 0;
+    memcpy(p, d->attr[0].base + off, 12);
+    return isfinite(p[0]) && isfinite(p[1]) && isfinite(p[2]);
+}
+
+/* 2D overlap of two triangles by separating axes, with a margin: touching
+ * along an edge or at a corner is not an overlap. */
+static int ztie_overlap2(const float a[3][2], const float b[3][2], float margin)
+{
+    const float (*t[2])[2];
+    int s, e, k;
+    t[0] = a; t[1] = b;
+    for (s = 0; s < 2; s++)
+        for (e = 0; e < 3; e++) {
+            const float *p = t[s][e], *q = t[s][(e + 1) % 3];
+            float nx = q[1] - p[1], ny = p[0] - q[0], len = sqrtf(nx * nx + ny * ny);
+            float amin = 1e30f, amax = -1e30f, bmin = 1e30f, bmax = -1e30f;
+            if (len <= 0.0f) return 0;
+            nx /= len; ny /= len;
+            for (k = 0; k < 3; k++) {
+                float va = a[k][0] * nx + a[k][1] * ny, vb = b[k][0] * nx + b[k][1] * ny;
+                if (va < amin) amin = va;
+                if (va > amax) amax = va;
+                if (vb < bmin) bmin = vb;
+                if (vb > bmax) bmax = vb;
+            }
+            if (amax - margin <= bmin || bmax - margin <= amin) return 0;
+        }
+    return 1;
+}
+
+/* The triangles of the mesh that overlap another one in the same plane
+ * (sharing no edge with it): flags in `inv`, their count returned. All
+ * pairs, once per mesh. */
+static uint32_t ztie_analyse(const Nv2aVshDraw *d, uint8_t *inv)
+{
+    uint32_t nt = d->nindices / 3u, i, j, k, found = 0;
+    float (*pt)[3][3], (*nrm)[4], *sz;
+    if (nt < 2 || nt > 2048u) return 0;
+    pt = (float (*)[3][3])malloc(nt * sizeof *pt);
+    nrm = (float (*)[4])malloc(nt * sizeof *nrm);
+    sz = (float *)malloc(nt * sizeof *sz);
+    if (!pt || !nrm || !sz) { free(pt); free(nrm); free(sz); return 0; }
+    memset(inv, 0, nt);
+    for (i = 0; i < nt; i++) {
+        float e1[3], e2[3], n[3], l;
+        for (k = 0; k < 3; k++)
+            if (!ztie_pos(d, d->indices[3 * i + k], pt[i][k])) { free(pt); free(nrm); free(sz); return 0; }
+        for (k = 0; k < 3; k++) { e1[k] = pt[i][1][k] - pt[i][0][k]; e2[k] = pt[i][2][k] - pt[i][0][k]; }
+        n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        l = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        sz[i] = sqrtf(fmaxf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2],
+                            e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]));
+        if (l <= 1e-12f) { nrm[i][3] = NAN; continue; }   /* degenerate */
+        for (k = 0; k < 3; k++) nrm[i][k] = n[k] / l;
+        nrm[i][3] = nrm[i][0] * pt[i][0][0] + nrm[i][1] * pt[i][0][1] + nrm[i][2] * pt[i][0][2];
+    }
+    for (i = 0; i < nt; i++) {
+        if (isnan(nrm[i][3])) continue;
+        for (j = i + 1; j < nt; j++) {
+            float c, eps, a2[3][2], b2[3][2];
+            int shared = 0, ax, u, v, m;
+            if (isnan(nrm[j][3]) || (inv[i] && inv[j])) continue;
+            c = nrm[i][0] * nrm[j][0] + nrm[i][1] * nrm[j][1] + nrm[i][2] * nrm[j][2];
+            if (fabsf(c) < 0.9999f) continue;                       /* not parallel (~0.8 deg) */
+            eps = 1e-3f * fmaxf(sz[i], sz[j]) + 0.05f;              /* model units (cm) */
+            for (k = 0; k < 3; k++) {
+                float dist = nrm[i][0] * pt[j][k][0] + nrm[i][1] * pt[j][k][1] + nrm[i][2] * pt[j][k][2] - nrm[i][3];
+                if (fabsf(dist) > eps) break;
+            }
+            if (k < 3) continue;                                     /* not in the same plane */
+            for (k = 0; k < 3; k++)
+                for (m = 0; m < 3; m++)
+                    if (d->indices[3 * i + k] == d->indices[3 * j + m]) shared++;
+            if (shared >= 2) continue;                               /* neighbours */
+            ax = fabsf(nrm[i][0]) > fabsf(nrm[i][1]) ? (fabsf(nrm[i][0]) > fabsf(nrm[i][2]) ? 0 : 2)
+                                                      : (fabsf(nrm[i][1]) > fabsf(nrm[i][2]) ? 1 : 2);
+            u = ax == 0 ? 1 : 0;
+            v = ax == 2 ? 1 : 2;
+            for (k = 0; k < 3; k++) {
+                a2[k][0] = pt[i][k][u]; a2[k][1] = pt[i][k][v];
+                b2[k][0] = pt[j][k][u]; b2[k][1] = pt[j][k][v];
+            }
+            if (ztie_overlap2((const float (*)[2])a2, (const float (*)[2])b2, 1e-2f * fminf(sz[i], sz[j]))) {
+                if (!inv[i]) { inv[i] = 1; found++; }
+                if (!inv[j]) { inv[j] = 1; found++; }
+            }
+        }
+    }
+    free(pt); free(nrm); free(sz);
+    return found;
+}
+
+/* The mesh's triangles that overlap in one plane, first, then the others
+ * (a copy of the draw's indices in that order), and how many indices the
+ * first part holds; 0 when the mesh has none. Cached by the vertex data's
+ * address, the index count, a few positions and a few indices. A mesh is
+ * looked at only when the same key comes back in a later image: geometry
+ * rebuilt every image (riders, particles, trails) never is, and costs a
+ * lookup. 16 slots are probed; when they are all taken, a key seen only
+ * once goes first, then the one used least recently: the table never fills
+ * up and the meshes already looked at stay. At most two meshes are
+ * looked at per image. */
+#define ZTIE_SLOTS 8192u
+#define ZTIE_PROBE 16u
+static struct { uint64_t key; uint32_t first, used, nsub; uint32_t *order; uint8_t state; } g_ztie_tab[ZTIE_SLOTS];
+static unsigned g_ztie_evicted;
+static unsigned long long g_ztie_inserts, g_ztie_slots_seen;   /* new keys (XBOX_ZDECAL_COST) */
+
+static uint64_t zd_key(const Nv2aVshDraw *d);
+static uint32_t ztie_marked(const Nv2aVshDraw *d, const uint32_t **order, uint64_t prekey)
+{
+    static uint32_t budget_frame, budget;
+    uint64_t key = 1469598103934665603ULL;
+    uint32_t i, h, step, now = g_pg.frame_no, victim = 0, vage = 0;
+    float p[3];
+    if (d->topology != D3DPT_TRIANGLELIST || !d->indices || d->nindices < 6 || d->nindices % 3u) return 0;
+    if ((d->attr[0].kind & 0x0F) != NV2A_VSH_IN_FLOAT || !d->attr[0].base ||
+        (d->attr[0].dxgi_format != DXGI_FORMAT_R32G32B32_FLOAT &&
+         d->attr[0].dxgi_format != DXGI_FORMAT_R32G32B32A32_FLOAT)) return 0;
+    if (prekey) key = prekey;           /* the draw's key, computed once for ZTIE and ZDECAL */
+    else {
+        key = (key ^ (uint64_t)(uintptr_t)d->attr[0].base) * 1099511628211ULL;
+        key = (key ^ d->nindices) * 1099511628211ULL;
+        step = d->nindices / 16u + 1u;
+        for (i = 0; i < d->nindices; i += step) {
+            key = (key ^ d->indices[i]) * 1099511628211ULL;
+            if (ztie_pos(d, d->indices[i], p)) {
+                uint32_t w[3];
+                memcpy(w, p, 12);
+                key = (key ^ w[0] ^ ((uint64_t)w[1] << 21) ^ ((uint64_t)w[2] << 42)) * 1099511628211ULL;
+            }
+        }
+        if (!key) key = 1;
+    }
+    h = (uint32_t)(key ^ (key >> 29)) & (ZTIE_SLOTS - 1u);
+    for (i = 0; i < ZTIE_PROBE; i++) {
+        uint32_t s = (h + i) & (ZTIE_SLOTS - 1u);
+        g_ztie_slots_seen++;
+        if (g_ztie_tab[s].key == key) {
+            g_ztie_tab[s].used = now;
+            if (g_ztie_tab[s].state == 0 && now != g_ztie_tab[s].first) {   /* back in a later image */
+                uint32_t nt = d->nindices / 3u, ninv, t, a = 0, b;
+                uint8_t *inv;
+                if (budget_frame != now) { budget_frame = now; budget = 0; }
+                if (budget >= 2u) return 0;
+                budget++;
+                g_ztie_tab[s].state = 1;
+                g_ztie_seen++;
+                inv = (uint8_t *)malloc(nt ? nt : 1);
+                ninv = inv ? ztie_analyse(d, inv) : 0;
+                if (ninv) {
+                    uint32_t *o = (uint32_t *)malloc(d->nindices * sizeof *o);
+                    if (o) {
+                        b = ninv * 3u;
+                        for (t = 0; t < nt; t++) {
+                            uint32_t *dst = inv[t] ? o + 3u * a++ : o + b + 3u * (t - a);
+                            memcpy(dst, d->indices + 3u * t, 12);
+                        }
+                        g_ztie_tab[s].order = o;
+                        g_ztie_tab[s].nsub = ninv * 3u;
+                        g_ztie_marked++;
+                        fprintf(stderr, "[ZTIE] mesh marked: %u of %u triangles overlap in one plane, program %016llX, t0 %08X (%u meshes looked at, %u marked)\n",
+                                ninv, nt, (unsigned long long)d->prog_hash,
+                                g_pg.tex[0].enabled ? g_pg.tex[0].offset : 0, g_ztie_seen, g_ztie_marked);
+                    }
+                }
+                free(inv);
+            }
+            if (g_ztie_tab[s].nsub) *order = g_ztie_tab[s].order;
+            return g_ztie_tab[s].nsub;
+        }
+        if (!g_ztie_tab[s].key) { victim = s; vage = 0xFFFFFFFFu; break; }
+        {   /* replace a key seen once (rebuilt geometry) before a mesh already looked at */
+            uint32_t age = now - g_ztie_tab[s].used;
+            if (g_ztie_tab[s].state == 0) age = age > 0x7FFFFFFFu ? 0xFFFFFFFEu : age + 0x80000000u;
+            if (age >= vage) { victim = s; vage = age; }
+        }
+    }
+    if (g_ztie_tab[victim].key) g_ztie_evicted++;
+    free(g_ztie_tab[victim].order);
+    memset(&g_ztie_tab[victim], 0, sizeof g_ztie_tab[victim]);
+    g_ztie_inserts++;
+    g_ztie_tab[victim].key = key;                       /* first sight: pending */
+    g_ztie_tab[victim].first = g_ztie_tab[victim].used = now;
+    return 0;
+}
+
+/* ── Stable decals over the previous draw (XBOX_ZDECAL) ────────────
+ * Some scenery is drawn as a base and, right after it with the same
+ * transform, a second mesh lying on it (Merqury's facades: the dark window
+ * panes, then the lit windows on the same panes). Both test LESS and write
+ * depth; the second one shows only where its depth rounds strictly nearer,
+ * so parts of it vanish and come back with the smallest camera move -- on
+ * the console too (640x480, same flicker), more visible here. A draw whose
+ * triangles lie in the plane of the previous draw's triangles and overlap
+ * them is found once (model space, as XBOX_ZTIE) and those triangles are
+ * drawn with their depth pulled a few steps nearer (d3d8_nv2a.c, raster bit
+ * 0x80): the later mesh wins its ties, always. Elsewhere: the same image.
+ * On by default (a fix of a defect); XBOX_ZDECAL=0 or `set zdecal 0`
+ * (diagnostics) draws as the title does. */
+static int g_zdecal = -1;
+static unsigned g_zd_seen, g_zd_marked, g_zd_draws;
+
+static void zdecal_init(void)
+{
+    const char *e;
+    if (g_zdecal >= 0) return;
+    e = getenv("XBOX_ZDECAL");
+    g_zdecal = !(e && e[0] == '0');
+    if (!g_zdecal) fprintf(stderr, "[ZDECAL] off: decals over the previous draw as the title draws them\n");
+}
+
+/* Diagnostics port `set zdecal 0|1` (same frame, both ways). */
+void pgraph_d3d11_set_zdecal(int on) { zdecal_init(); g_zdecal = on ? 1 : 0; }
+
+static int zd_pos(const uint8_t *base, uint32_t stride, uint32_t bytes, uint32_t i, float p[3])
+{
+    uint32_t off = i * stride;
+    if (off + 12u > bytes) return 0;
+    memcpy(p, base + off, 12);
+    return isfinite(p[0]) && isfinite(p[1]) && isfinite(p[2]);
+}
+
+/* Can a draw have a mesh key (a triangle list of float positions)? */
+static int zd_keyable(const Nv2aVshDraw *d)
+{
+    if (d->topology != D3DPT_TRIANGLELIST || !d->indices || d->nindices < 3 || d->nindices % 3u) return 0;
+    return (d->attr[0].kind & 0x0F) == NV2A_VSH_IN_FLOAT && d->attr[0].base &&
+           (d->attr[0].dxgi_format == DXGI_FORMAT_R32G32B32_FLOAT ||
+            d->attr[0].dxgi_format == DXGI_FORMAT_R32G32B32A32_FLOAT);
+}
+
+static unsigned long long g_zd_nkeys;  /* keys worked out (XBOX_ZDECAL_COST) */
+static uint64_t zd_key_of(const uint8_t *base, uint32_t stride, uint32_t bytes, const uint32_t *indices, uint32_t nindices)
+{
+    uint64_t key = 1469598103934665603ULL;
+    uint32_t i, step;
+    float p[3];
+    key = (key ^ (uint64_t)(uintptr_t)base) * 1099511628211ULL;
+    key = (key ^ nindices) * 1099511628211ULL;
+    g_zd_nkeys++;
+    step = nindices / 16u + 1u;
+    for (i = 0; i < nindices; i += step) {
+        key = (key ^ indices[i]) * 1099511628211ULL;
+        if (zd_pos(base, stride, bytes, indices[i], p)) {
+            uint32_t w[3];
+            memcpy(w, p, 12);
+            key = (key ^ w[0] ^ ((uint64_t)w[1] << 21) ^ ((uint64_t)w[2] << 42)) * 1099511628211ULL;
+        }
+    }
+    return key ? key : 1;
+}
+
+/* Key of a mesh draw (positions as three floats), 0 if it cannot be one. */
+static uint64_t zd_key(const Nv2aVshDraw *d)
+{
+    if (!zd_keyable(d)) return 0;
+    return zd_key_of(d->attr[0].base, d->attr[0].stride, d->attr[0].bytes, d->indices, d->nindices);
+}
+
+/* The previous program draw, when it can be a base: its positions in guest
+ * memory (still there when the next draw comes) and a copy of its indices.
+ * Its key is worked out only when the next draw can pair with it (most
+ * draws never do): the same key, from the same indices and positions. */
+static struct {
+    uint64_t key, prog;
+    const uint8_t *base;
+    uint32_t stride, bytes, nidx, vgen, seq, t0;
+    int ok;
+    const uint32_t *idx;                /* gpu_prepare's previous buffer (two in turn) */
+} g_zd_prev;
+
+static uint64_t zd_prev_key(void)
+{
+    if (!g_zd_prev.key) g_zd_prev.key = zd_key_of(g_zd_prev.base, g_zd_prev.stride, g_zd_prev.bytes, g_zd_prev.idx, g_zd_prev.nidx);
+    return g_zd_prev.key;
+}
+
+/* key: the draw's key, or 0 when not worked out yet (then it must be keyable). */
+static void zd_remember(const Nv2aVshDraw *d, uint64_t key, int eligible)
+{
+    g_zd_prev.ok = 0;
+    if (!eligible || !g_gpu_ib || !(key || zd_keyable(d))) return;
+    if (d->attr[0].base < d->mem_lo || d->attr[0].base >= d->mem_hi) return;   /* a per-draw copy: gone by then */
+    g_zd_prev.key = key;
+    g_zd_prev.prog = d->prog_hash;
+    g_zd_prev.base = d->attr[0].base;
+    g_zd_prev.stride = d->attr[0].stride;
+    g_zd_prev.bytes = d->attr[0].bytes;
+    g_zd_prev.nidx = d->nindices;
+    g_zd_prev.vgen = g_pg.vgen;
+    g_zd_prev.seq = g_vs.prog_draws;
+    g_zd_prev.t0 = g_pg.tex[0].enabled ? g_pg.tex[0].offset : 0;
+    g_zd_prev.idx = g_gpu_ib;          /* the title's order, not ZTIE's (that one can be freed) */
+    g_zd_prev.ok = 1;
+}
+
+/* A triangle's plane (unit normal, offset) and size; 0 if degenerate. */
+static int zd_plane(const float t[3][3], float n[4], float *sz)
+{
+    float e1[3], e2[3], l;
+    int k;
+    for (k = 0; k < 3; k++) { e1[k] = t[1][k] - t[0][k]; e2[k] = t[2][k] - t[0][k]; }
+    n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    l = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    *sz = sqrtf(fmaxf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2], e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]));
+    if (!(l > 1e-12f)) return 0;
+    for (k = 0; k < 3; k++) n[k] /= l;
+    n[3] = n[0] * t[0][0] + n[1] * t[0][1] + n[2] * t[0][2];
+    return 1;
+}
+
+/* The current draw's program at a model-space point (the other inputs from
+ * vertex `ridx`, rebased, of the draw), as homogeneous rows linear in the
+ * point: x' = (screen x - viewport x) * w, y' likewise, and w (the program's
+ * screen-space tail divides by w, then scales and offsets). 0 if not finite. */
+static int zd_clip(uint32_t ridx, const float pos[3], double r[3])
+{
+    float in[16][4], out[VSHCPU_OUT_REGS][4];
+    int a;
+    for (a = 0; a < 16; a++) {
+        if (g_pg.prog_inputs & (1u << a))
+            va_fetch4(a, g_gpu_lo + ridx, in[a]);
+        else
+            in[a][0] = in[a][1] = in[a][2] = 0.0f, in[a][3] = 1.0f;
+    }
+    in[0][0] = pos[0]; in[0][1] = pos[1]; in[0][2] = pos[2]; in[0][3] = 1.0f;
+    vshcpu_run(g_pg.prog_dec, g_pg.prog_len, (const float (*)[4])in, g_pg.vconst, out);
+    r[2] = out[VSHCPU_OUT_POS][3];
+    r[0] = ((double)out[VSHCPU_OUT_POS][0] - g_pg.vp_offset[0]) * r[2];
+    r[1] = ((double)out[VSHCPU_OUT_POS][1] - g_pg.vp_offset[1]) * r[2];
+    return isfinite(r[0]) && isfinite(r[1]) && isfinite(r[2]);
+}
+
+/* The camera's position in model space: the point the program sends to
+ * x' = y' = w = 0, from four transformed points around p0; and the view
+ * axis (the direction w grows along, unit). 0 if not found. */
+static int zd_camera(uint32_t ridx, const float p0[3], double c[3], double fwd[3])
+{
+    double f0[3], j[3][3], det, b[3];
+    float q[3];
+    const double S = 100.0;
+    int i, k;
+    if (!zd_clip(ridx, p0, f0)) return 0;
+    for (i = 0; i < 3; i++) {
+        double fi[3];
+        q[0] = p0[0]; q[1] = p0[1]; q[2] = p0[2];
+        q[i] += (float)S;
+        if (!zd_clip(ridx, q, fi)) return 0;
+        for (k = 0; k < 3; k++) j[k][i] = (fi[k] - f0[k]) / S;    /* row k, column i */
+    }
+    for (k = 0; k < 3; k++) b[k] = -f0[k];
+    det = j[0][0] * (j[1][1] * j[2][2] - j[1][2] * j[2][1]) - j[0][1] * (j[1][0] * j[2][2] - j[1][2] * j[2][0])
+        + j[0][2] * (j[1][0] * j[2][1] - j[1][1] * j[2][0]);
+    if (!(fabs(det) > 1e-30)) return 0;
+    {
+        double l = sqrt(j[2][0] * j[2][0] + j[2][1] * j[2][1] + j[2][2] * j[2][2]);
+        if (!(l > 0.0)) return 0;
+        for (i = 0; i < 3; i++) fwd[i] = j[2][i] / l;
+    }
+    for (i = 0; i < 3; i++) {                                     /* Cramer */
+        double m[3][3];
+        int r2, c2;
+        for (r2 = 0; r2 < 3; r2++) for (c2 = 0; c2 < 3; c2++) m[r2][c2] = c2 == i ? b[r2] : j[r2][c2];
+        c[i] = p0[i] + (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                      + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det;
+    }
+    return isfinite(c[0]) && isfinite(c[1]) && isfinite(c[2]);
+}
+
+/* Census of the last analysis (logged with the mark): the largest offset of
+ * a decal triangle off its base's plane (model units), how many are exactly
+ * coplanar, how many lie a hair off it (histogram of the offsets). */
+static float g_zd_off;
+static uint32_t g_zd_flat, g_zd_hist[4];   /* offsets: <= 0.01, 0.1, 0.25, more (model units) */
+
+/* The triangles of draw b that lie on a triangle of the previous draw (same
+ * plane within ZD_EPS, overlapping it with real area): flags in `inv`, and
+ * for each, its base's plane and its side of it (0: exactly coplanar, a tie
+ * whichever side the camera is on; +1 / -1: a hair off it on the side of the
+ * plane's normal / the other side -- a decal, which wins its ties only when
+ * the camera is on its side, zd_order). Their count returned. */
+#define ZD_EPS_FLAT(s) (1e-4f * (s) + 1e-3f)     /* float rounding of model data */
+#define ZD_EPS(s)      (1e-4f * (s) + 2.0f)      /* a decal laid on its wall: 2 units (5 cm); Merqury's lit windows sit 1.26 off their panes */
+static uint32_t zd_analyse(const Nv2aVshDraw *b, uint8_t *inv, float (*plane)[4], int8_t *side)
+{
+    uint32_t nta = g_zd_prev.nidx / 3u, ntb = b->nindices / 3u, i, j, k, found = 0;
+    float (*pa)[3][3], (*na)[4], *sa, bmin[3] = { 1e30f, 1e30f, 1e30f }, bmax[3] = { -1e30f, -1e30f, -1e30f };
+    g_zd_off = 0.0f; g_zd_flat = 0;
+    memset(g_zd_hist, 0, sizeof g_zd_hist);
+    if (!nta || !ntb || (uint64_t)nta * ntb > (1u << 18)) return 0;    /* at most 262 144 tests (~1 ms) */
+    pa = (float (*)[3][3])malloc(nta * sizeof *pa);
+    na = (float (*)[4])malloc(nta * sizeof *na);
+    sa = (float *)malloc(nta * sizeof *sa);
+    if (!pa || !na || !sa) { free(pa); free(na); free(sa); return 0; }
+    memset(inv, 0, ntb);
+    for (i = 0; i < nta; i++) {
+        for (k = 0; k < 3; k++)
+            if (!zd_pos(g_zd_prev.base, g_zd_prev.stride, g_zd_prev.bytes, g_zd_prev.idx[3 * i + k], pa[i][k]))
+                break;
+        if (k < 3 || !zd_plane((const float (*)[3])pa[i], na[i], &sa[i])) { na[i][3] = NAN; continue; }
+        for (k = 0; k < 9; k++) {
+            float v = pa[i][k / 3][k % 3];
+            if (v < bmin[k % 3]) bmin[k % 3] = v;
+            if (v > bmax[k % 3]) bmax[k % 3] = v;
+        }
+    }
+    for (j = 0; j < ntb; j++) {
+        float pb[3][3], nb[4], sb, soff = 0.0f;
+        uint32_t best = 0xFFFFFFFFu;
+        float boff = 1e30f;
+        for (k = 0; k < 3; k++)
+            if (!zd_pos(b->attr[0].base, b->attr[0].stride, b->attr[0].bytes, b->indices[3 * j + k], pb[k])) break;
+        if (k < 3 || !zd_plane((const float (*)[3])pb, nb, &sb)) continue;
+        {   /* outside the base mesh's box: nothing to lie on */
+            int ax2;
+            for (ax2 = 0; ax2 < 3; ax2++) {
+                float lo2 = fminf(pb[0][ax2], fminf(pb[1][ax2], pb[2][ax2])), hi2 = fmaxf(pb[0][ax2], fmaxf(pb[1][ax2], pb[2][ax2]));
+                if (hi2 < bmin[ax2] - 1.0f || lo2 > bmax[ax2] + 1.0f) break;
+            }
+            if (ax2 < 3) continue;
+        }
+        for (i = 0; i < nta; i++) {                               /* the base triangle it lies closest on */
+            float c, off = 0.0f, sum = 0.0f, a2[3][2], b2[3][2];
+            int ax, u, v;
+            if (isnan(na[i][3])) continue;
+            {   /* the same face drawn again (a second pass, or the next picture of a menu's
+                 * slideshow on the same screen, its corners within 0.01 unit): the title's
+                 * own layering, not a decal on a wall */
+                int m, same = 0;
+                for (k = 0; k < 3; k++)
+                    for (m = 0; m < 3; m++) {
+                        float dx = pb[k][0] - pa[i][m][0], dy = pb[k][1] - pa[i][m][1], dz = pb[k][2] - pa[i][m][2];
+                        if (dx * dx + dy * dy + dz * dz <= 1e-4f) { same++; break; }
+                    }
+                if (same == 3) continue;
+            }
+            c = na[i][0] * nb[0] + na[i][1] * nb[1] + na[i][2] * nb[2];
+            if (fabsf(c) < 0.9999f) continue;                     /* not parallel (~0.8 deg) */
+            for (k = 0; k < 3; k++) {
+                float dist = na[i][0] * pb[k][0] + na[i][1] * pb[k][1] + na[i][2] * pb[k][2] - na[i][3];
+                if (fabsf(dist) > ZD_EPS(fmaxf(sa[i], sb))) break;
+                if (fabsf(dist) > off) off = fabsf(dist);
+                sum += dist;
+            }
+            if (k < 3 || off >= boff) continue;                    /* not in that plane, or a closer one found */
+            ax = fabsf(na[i][0]) > fabsf(na[i][1]) ? (fabsf(na[i][0]) > fabsf(na[i][2]) ? 0 : 2)
+                                                    : (fabsf(na[i][1]) > fabsf(na[i][2]) ? 1 : 2);
+            u = ax == 0 ? 1 : 0;
+            v = ax == 2 ? 1 : 2;
+            for (k = 0; k < 3; k++) {
+                a2[k][0] = pa[i][k][u]; a2[k][1] = pa[i][k][v];
+                b2[k][0] = pb[k][u];    b2[k][1] = pb[k][v];
+            }
+            if (!ztie_overlap2((const float (*)[2])a2, (const float (*)[2])b2, 1e-2f * fminf(sa[i], sb)))
+                continue;                                          /* no real overlap */
+            best = i; boff = off; soff = sum;
+        }
+        if (best == 0xFFFFFFFFu) continue;
+        memcpy(plane[found], na[best], sizeof plane[found]);
+        /* The side is the offset's sign, however small: up close a hair is many
+         * depth steps, and the title's result there is fixed (a menu's logo
+         * kept behind its picture). Only an offset of exactly 0 is a tie. */
+        side[found] = soff > 0.0f ? 1 : soff < 0.0f ? -1 : 0;
+        if (boff <= ZD_EPS_FLAT(fmaxf(sa[best], sb))) g_zd_flat++;
+        else g_zd_hist[boff <= 0.01f ? 0 : boff <= 0.1f ? 1 : boff <= 0.25f ? 2 : 3]++;
+        if (boff > g_zd_off) g_zd_off = boff;
+        inv[j] = 1; found++;
+    }
+    free(pa); free(na); free(sa);
+    return found;
+}
+
+/* As ztie_marked, for the pair (previous draw, this draw): the triangles of
+ * this draw lying on the previous one first (a copy of the indices), with
+ * their bases' planes and sides; 0 when none. A pair is looked at when its
+ * key is still the same ZD_STATIC images later, at most two pairs per image. */
+#define ZD_SLOTS 4096u
+#define ZD_STATIC 16u   /* geometry rebuilt every tick (particles, crowd cards, trails) never is */
+#define ZD_PROBE 16u
+typedef struct { uint64_t key; uint32_t first, used, nsub, nflat; uint32_t *order; float (*plane)[4]; int8_t *side; uint8_t state; } ZdEntry;
+static ZdEntry g_zd_tab[ZD_SLOTS];
+static unsigned long long g_zd_probes, g_zd_slots_seen, g_zd_inserts;  /* pairs looked up in g_zd_tab (XBOX_ZDECAL_COST) */
+
+static void zd_free(ZdEntry *e) { free(e->order); free(e->plane); free(e->side); memset(e, 0, sizeof *e); }
+
+/* Can this draw pair with the previous one (same program and transform,
+ * drawn right after it)? Not a single card (two triangles) right after a
+ * card of the same texture: crowd and plant cards, thousands of pairs
+ * whose ties change nothing visible (Merqury's windows and facades are
+ * meshes, or another texture than their base). XBOX_ZDECAL_SEL=0
+ * (diagnostics): those cards too. */
+static int zd_pairable(const Nv2aVshDraw *d)
+{
+    static int sel = -1;
+    if (sel < 0) { const char *e = getenv("XBOX_ZDECAL_SEL"); sel = e && *e ? atoi(e) : 1; }
+    return g_zd_prev.ok && g_zd_prev.seq + 1u == g_vs.prog_draws && g_zd_prev.vgen == g_pg.vgen &&
+           g_zd_prev.prog == d->prog_hash &&
+           !(sel && g_zd_prev.nidx == 6u && d->nindices == 6u &&
+             g_zd_prev.t0 == (g_pg.tex[0].enabled ? g_pg.tex[0].offset : 0u));
+}
+
+static ZdEntry *zd_marked(const Nv2aVshDraw *d, uint64_t kb)
+{
+    static uint32_t budget_frame, budget;
+    uint64_t key;
+    uint32_t i, h, now = g_pg.frame_no, victim = 0, vage = 0;
+    static int mintri = -1;
+    if (mintri < 0) { const char *e = getenv("XBOX_ZDECAL_MINTRI"); mintri = e && *e ? atoi(e) : 1; }
+    /* XBOX_ZDECAL_MINTRI (diagnostics): decals of fewer triangles are left alone */
+    if (d->nindices / 3u < (uint32_t)mintri) return NULL;
+    if (!zd_pairable(d) || zd_prev_key() == kb) return NULL;
+    g_zd_probes++;                      /* XBOX_ZDECAL_COST */
+    key = (kb * 1099511628211ULL) ^ (g_zd_prev.key + 0x9E3779B97F4A7C15ULL + (kb << 6) + (kb >> 2));
+    if (!key) key = 1;
+    h = (uint32_t)(key ^ (key >> 29)) & (ZD_SLOTS - 1u);
+    for (i = 0; i < ZD_PROBE; i++) {
+        uint32_t s = (h + i) & (ZD_SLOTS - 1u);
+        ZdEntry *e = &g_zd_tab[s];
+        g_zd_slots_seen++;
+        if (e->key == key) {
+            e->used = now;
+            if (e->state == 0 && now - e->first >= ZD_STATIC) {
+                uint32_t nt = d->nindices / 3u, ninv, t, a = 0, b;
+                uint8_t *inv;
+                if (budget_frame != now) { budget_frame = now; budget = 0; }
+                if (budget >= 2u) return NULL;
+                budget++;
+                e->state = 1;
+                g_zd_seen++;
+                inv = (uint8_t *)malloc(nt ? nt : 1);
+                e->plane = (float (*)[4])malloc((nt ? nt : 1) * sizeof *e->plane);
+                e->side = (int8_t *)malloc(nt ? nt : 1);
+                ninv = inv && e->plane && e->side ? zd_analyse(d, inv, e->plane, e->side) : 0;
+                if (ninv) {
+                    uint32_t *o = (uint32_t *)malloc(d->nindices * sizeof *o);
+                    if (o) {
+                        b = ninv * 3u;
+                        for (t = 0; t < nt; t++) {
+                            uint32_t *dst = inv[t] ? o + 3u * a++ : o + b + 3u * (t - a);
+                            memcpy(dst, d->indices + 3u * t, 12);
+                        }
+                        e->order = o;
+                        e->nsub = ninv * 3u;
+                        e->nflat = g_zd_flat;
+                        g_zd_marked++;
+                        fprintf(stderr, "[ZDECAL] decal marked: %u of %u triangles on the previous draw (%u triangles), program %016llX, t0 %08X on %08X, zfunc %X atest %d, off %.4f, flat %u, offsets %u/%u/%u/%u (%u pairs looked at, %u marked)\n",
+                                ninv, nt, g_zd_prev.nidx / 3u, (unsigned long long)d->prog_hash,
+                                g_pg.tex[0].enabled ? g_pg.tex[0].offset : 0, g_zd_prev.t0, g_pg.depth_func, g_pg.alpha_test,
+                                g_zd_off, g_zd_flat, g_zd_hist[0], g_zd_hist[1], g_zd_hist[2], g_zd_hist[3],
+                                g_zd_seen, g_zd_marked);
+                    }
+                }
+                free(inv);
+                if (!e->nsub) { free(e->plane); free(e->side); e->plane = NULL; e->side = NULL; }
+            }
+            return e->nsub ? e : NULL;
+        }
+        if (!e->key) { victim = s; vage = 0xFFFFFFFFu; break; }
+        {
+            uint32_t age = now - e->used;
+            if (e->state == 0) age = age > 0x7FFFFFFFu ? 0xFFFFFFFEu : age + 0x80000000u;
+            if (age >= vage) { victim = s; vage = age; }
+        }
+    }
+    g_zd_inserts++;
+    zd_free(&g_zd_tab[victim]);
+    g_zd_tab[victim].key = key;
+    g_zd_tab[victim].first = g_zd_tab[victim].used = now;
+    return NULL;
+}
+
+/* This image's order for a marked draw: first the triangles that win their
+ * ties now -- exactly coplanar ones, and those a hair off their base on the
+ * camera's side of it -- then all the others; their index count returned. A
+ * decal a hair behind its base (camera on the other side) stays as the title
+ * draws it. */
+static unsigned long long g_zd_won, g_zd_kept, g_zd_cams;   /* g_zd_cams: camera worked out (XBOX_ZDECAL_COST) */
+
+/* Does marked triangle t win its ties in this image? A plane facing the
+ * screen squarely has one depth all over: its ties are fixed (the base
+ * always wins with LESS), not a flicker -- left alone. Otherwise an exactly
+ * coplanar one does; one a hair off its base does when the camera is on its
+ * side. Without the camera: none. */
+static int zd_wins(const ZdEntry *e, uint32_t t, int cam, const double c[3], const double fwd[3])
+{
+    const float *n = e->plane[t];
+    double s;
+    if (!cam) return 0;
+    if (fabs(n[0] * fwd[0] + n[1] * fwd[1] + n[2] * fwd[2]) > 0.99999) return 0;   /* within ~0.26 deg of square-on */
+    if (e->side[t] == 0) return 1;
+    s = n[0] * c[0] + n[1] * c[1] + n[2] * c[2] - n[3];
+    return (s > 0.0) == (e->side[t] > 0);
+}
+static uint32_t zd_order(const Nv2aVshDraw *d, const ZdEntry *e, const uint32_t **order)
+{
+    static uint32_t *buf, cap;
+    uint32_t nm = e->nsub / 3u, t, a = 0, b, n = d->nindices;
+    static uint32_t cframe = 0xFFFFFFFFu, cvgen;
+    static uint64_t cprog;
+    static double c[3], fwd[3];
+    static int cam;
+    float p0[3];
+    if (n > cap) {
+        uint32_t *nb = (uint32_t *)realloc(buf, n * sizeof *nb);
+        if (!nb) return 0;
+        buf = nb; cap = n;
+    }
+    if (cframe != g_pg.frame_no || cvgen != g_pg.vgen || cprog != d->prog_hash) {   /* once per image and transform */
+        cframe = g_pg.frame_no; cvgen = g_pg.vgen; cprog = d->prog_hash;
+        g_zd_cams++;
+        cam = zd_pos(d->attr[0].base, d->attr[0].stride, d->attr[0].bytes, e->order[0], p0) &&
+              zd_camera(e->order[0], p0, c, fwd);
+    } else {
+        p0[0] = p0[1] = p0[2] = 0.0f;
+    }
+    {
+        static unsigned logged;
+        if (logged < 6 && (g_pg.frame_no & 255u) == 0u) {
+            logged++;
+            fprintf(stderr, "[ZDECAL] camera in model space %s: %.1f %.1f %.1f (decal corner %.1f %.1f %.1f)\n",
+                    cam ? "found" : "NOT found", cam ? c[0] : 0.0, cam ? c[1] : 0.0, cam ? c[2] : 0.0, p0[0], p0[1], p0[2]);
+        }
+    }
+    for (t = 0; t < nm; t++) {
+        if (zd_wins(e, t, cam, c, fwd)) memcpy(buf + 3u * a++, e->order + 3u * t, 12);
+    }
+    for (t = 0, b = 3u * a; t < nm; t++) {
+        if (!zd_wins(e, t, cam, c, fwd)) { memcpy(buf + b, e->order + 3u * t, 12); b += 3u; }
+    }
+    memcpy(buf + e->nsub, e->order + e->nsub, (n - e->nsub) * sizeof *buf);
+    g_zd_won += a; g_zd_kept += nm - a;
+    *order = buf;
+    return 3u * a;
+}
+
+/* ── Soft-edged cut-outs: depth written only where alpha >= 0.5 (XBOX_SOFTCUT) ──
+ * Scenery drawn blended (SRC_ALPHA, INV_SRC_ALPHA) with alpha test and depth
+ * write, with a texture whose alpha has soft steps (Garibaldi's speaker
+ * towers: DXT3 lattice): the half-transparent edge texels are blended with
+ * whatever is already drawn behind them and also write depth, hiding what is
+ * drawn there later. The title's order of such objects changes from one
+ * image to the next, so their edges show the sky (light) in one image and the
+ * stands (dark) in the next. Drawn in two passes: the texels with alpha >= 0.5
+ * as the title draws them (depth written), then the softer edge texels
+ * blended without writing depth (depth LESS: the texels of the first pass,
+ * at the very same depth, fail it -- nothing is blended twice). An edge then
+ * never hides what is drawn after it. On by default (a fix of a defect);
+ * XBOX_SOFTCUT=0 or `set softcut 0` (diagnostics) draws as the title does. */
+static int g_softcut = -1;
+static unsigned long long g_sc_draws, g_sc_frames0;
+static unsigned g_sc_logged;
+
+static void softcut_init(void)
+{
+    const char *e;
+    if (g_softcut >= 0) return;
+    e = getenv("XBOX_SOFTCUT");
+    g_softcut = !(e && e[0] == '0');
+    if (!g_softcut) fprintf(stderr, "[SOFTCUT] off: soft-edged cut-outs as the title draws them\n");
+}
+
+/* Diagnostics port `set softcut 0|1` (same frame, both ways). */
+void pgraph_d3d11_set_softcut(int on) { softcut_init(); g_softcut = on ? 1 : 0; }
+
+/* Texture formats whose alpha has more than one bit (A4R4G4B4, A8R8G8B8,
+ * DXT3, DXT5, their linear forms, A8). */
+static int softcut_alpha_fmt(uint32_t color)
+{
+    switch (color) {
+    case 0x04: case 0x06: case 0x0E: case 0x0F: case 0x12: case 0x1D: case 0x19: return 1;
+    default: return 0;
+    }
+}
+
+/* Alpha of texel i of a level (DXT3, DXT5, A8R8G8B8, A4R4G4B4, A8). */
+static uint32_t softcut_alpha(const uint8_t *p, uint32_t color, uint32_t i)
+{
+    if (color == 0x0E) {                          /* DXT3: 4-bit alpha, 8 bytes per block of 16 */
+        const uint8_t *b = p + (i / 16u) * 16u;
+        return ((b[(i % 16u) / 2u] >> (4u * (i & 1u))) & 15u) * 17u;
+    }
+    if (color == 0x0F) {                          /* DXT5: two endpoints, 3-bit indices */
+        const uint8_t *b = p + (i / 16u) * 16u;
+        uint32_t a0 = b[0], a1 = b[1], bit = 3u * (i % 16u), idx;
+        uint64_t bits = 0;
+        int k;
+        for (k = 0; k < 6; k++) bits |= (uint64_t)b[2 + k] << (8 * k);
+        idx = (uint32_t)(bits >> bit) & 7u;
+        if (idx == 0) return a0;
+        if (idx == 1) return a1;
+        if (a0 > a1) return ((8u - idx) * a0 + (idx - 1u) * a1) / 7u;
+        return idx == 6 ? 0u : idx == 7 ? 255u : ((6u - idx) * a0 + (idx - 1u) * a1) / 5u;
+    }
+    if (color == 0x06 || color == 0x12) return p[4u * i + 3u];
+    if (color == 0x04 || color == 0x1D) return (p[2u * i + 1u] >> 4) * 17u;
+    return p[i];
+}
+
+static uint32_t softcut_level_bytes(uint32_t color, uint32_t w, uint32_t h)
+{
+    if (color == 0x0E || color == 0x0F) return (w < 4u ? 4u : w) * (h < 4u ? 4u : h);   /* 16 bytes / 16 texels */
+    if (color == 0x06 || color == 0x12) return 4u * w * h;
+    if (color == 0x04 || color == 0x1D) return 2u * w * h;
+    return w * h;
+}
+
+/* Which soft-edged cut-outs get the two passes. XBOX_SOFTCUT_SEL (diagnostics):
+ *   0  every cut-out texture (at least 10 % empty texels, at most 45 % of the
+ *      visible half-transparent at its first level);
+ *   1  cut-outs whose thin parts fade out with distance: a mip
+ *      chain of 3 levels or more, and at the third level at least 40 % of the
+ *      visible texels half-transparent -- lattices, railings, branches seen from
+ *      afar, whose edges are most of what is drawn there. Not the crowd cards
+ *      (one level: their alpha stays sharp) nor solid sprites.
+ *   2  (default) thin bars only: as 1, and sharp at the first level (at most 20 % of
+ *      the visible texels half-transparent) -- bars a texel or two wide that
+ *      only fade out in the smaller levels.
+ * Garibaldi's speaker towers (01A59380): 51 % empty, 15 % half-transparent at
+ * the first level, 47 % at the third. */
+static int g_sc_sel = -1;
+
+static int softcut_tex_cutout(uint32_t offset, uint32_t fmt)
+{
+    static struct { uint32_t off, fmt, sig, frame; int8_t ok, thin, used; } tab[4096];
+    uint32_t color = TEXFMT_COLOR(fmt), w = 1u << TEXFMT_SIZE_U(fmt), h = 1u << TEXFMT_SIZE_V(fmt);
+    uint32_t mips = TEXFMT_MIPS(fmt), n = w * h, b0, b1, b2, i, sig, slot, k, empty = 0, mid = 0, e2 = 0, m2 = 0, n2;
+    const uint8_t *p;
+    if (g_sc_sel < 0) { const char *e = getenv("XBOX_SOFTCUT_SEL"); g_sc_sel = e && *e ? atoi(e) : 2; }
+    if (n > 1024u * 1024u) return 0;
+    b0 = softcut_level_bytes(color, w, h);
+    b1 = softcut_level_bytes(color, w > 1u ? w / 2u : 1u, h > 1u ? h / 2u : 1u);
+    n2 = (w >= 4u ? w / 4u : 1u) * (h >= 4u ? h / 4u : 1u);
+    b2 = softcut_level_bytes(color, w >= 4u ? w / 4u : 1u, h >= 4u ? h / 4u : 1u);
+    p = va_ptr(offset, mips >= 3u ? b0 + b1 + b2 : b0);
+    if (!p) return 0;
+    sig = 2166136261u;
+    for (i = 0; i < 64u && i < b0; i++) sig = (sig ^ p[i]) * 16777619u;
+    /* by address and format (8 slots probed); a texture whose first bytes changed
+     * (another one loaded there) is looked at again, at most every 600 images */
+    slot = ((offset >> 4) * 2654435761u ^ fmt) & 4095u;
+    for (k = 0; k < 8u; k++) {
+        uint32_t s2 = (slot + k) & 4095u;
+        if (!tab[s2].used) { slot = s2; break; }
+        if (tab[s2].off == offset && tab[s2].fmt == fmt) {
+            if (tab[s2].sig == sig || g_pg.frame_no - tab[s2].frame < 600u)
+                return g_sc_sel == 0 ? tab[s2].ok : tab[s2].ok && tab[s2].thin;
+            slot = s2; break;
+        }
+        if (k == 7u) slot = (slot + (g_pg.frame_no & 7u)) & 4095u;    /* all 8 taken: replace one */
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t a = softcut_alpha(p, color, i);
+        if (a < 16u) empty++;
+        else if (a <= 239u) mid++;
+    }
+    if (mips >= 3u && n2 >= 16u)
+        for (i = 0; i < n2; i++) {
+            uint32_t a = softcut_alpha(p + b0 + b1, color, i);
+            if (a < 16u) e2++;
+            else if (a <= 239u) m2++;
+        }
+    tab[slot].off = offset; tab[slot].fmt = fmt; tab[slot].sig = sig; tab[slot].frame = g_pg.frame_no; tab[slot].used = 1;
+    tab[slot].ok = (int8_t)(empty * 10u >= n && mid * 100u <= 45u * (n - empty));
+    tab[slot].thin = (int8_t)(mips >= 3u && n2 > e2 && m2 * 100u >= 40u * (n2 - e2) &&
+                              (g_sc_sel != 2 || mid * 100u <= 20u * (n - empty)));
+    fprintf(stderr, "[SOFTCUT] texture %08X colour %02X %ux%u, %u levels: empty %u%%, half-transparent %u%% of the visible, third level %u%% -> %s\n",
+            offset, (unsigned)color, w, h, mips, empty * 100u / n, n > empty ? mid * 100u / (n - empty) : 0u,
+            n2 > e2 ? m2 * 100u / (n2 - e2) : 0u,
+            !tab[slot].ok ? "see-through, left alone" : tab[slot].thin ? "thin cut-out" : "cut-out");
+    return g_sc_sel == 0 ? tab[slot].ok : tab[slot].ok && tab[slot].thin;
+}
+
+static int softcut_class(void)
+{
+    return g_pg.blend_enable && g_pg.blend_sfactor == 0x302 && g_pg.blend_dfactor == 0x303 &&
+           g_pg.alpha_test && (g_pg.alpha_func == 0x204 || g_pg.alpha_func == 0x206) && (g_pg.alpha_ref & 0xFFu) < 127u &&
+           g_pg.depth_test && g_pg.depth_mask && g_pg.depth_func == 0x201 && !g_pg.stencil_test &&
+           g_pg.tex[0].enabled && softcut_alpha_fmt(TEXFMT_COLOR(g_pg.tex[0].format)) &&
+           softcut_tex_cutout(g_pg.tex[0].offset, g_pg.tex[0].format);
+}
+
+static int lines_wide(void)
+{
+    float sx, sy;
+    if (g_lines_scale < 0) { const char *e = getenv("XBOX_LINES_SCALE"); g_lines_scale = !(e && e[0] == '0'); }
+    if (!g_lines_scale) return 0;
+    d3d8_GetGuestScale(&sx, &sy);
+    return sy > 1.001f;
+}
+
+/* The quads of a line list (mode 2) or strip (3, 4: a loop is drawn as a
+ * strip, as the D3D11 path does) over `count` vertices, six vertices per
+ * segment into dst; a segment with an unplaceable end is dropped, as a
+ * point is. */
+static uint32_t lines_quads(uint32_t mode, const ProgVertex *vb, const uint8_t *okb,
+                            uint32_t count, ProgVertex *tb)
+{
+    uint32_t i, o = 0, step = mode == 2 ? 2u : 1u;
+    float kx = points_kx();
+    static int keepw = -1;              /* XBOX_VSH_KEEPW=1 (diagnostic), as in assemble() */
+    if (keepw < 0) { const char *e = getenv("XBOX_VSH_KEEPW"); keepw = e && e[0] == '1'; }
+    for (i = 0; i + 1 < count; i += step) {
+        const ProgVertex *a = &vb[i], *b = &vb[i + 1];
+        float ox = 0.0f, oy = 0.0f, dx = b->x - a->x, dy = b->y - a->y;
+        ProgVertex q[4];
+        if (!keepw && !(okb[i] && okb[i + 1])) { g_vs.culled_w++; continue; }
+        if (fabsf(dx) >= fabsf(dy)) oy = 0.5f;
+        else                        ox = 0.5f * kx;
+        q[0] = *a; q[0].x -= ox; q[0].y -= oy;
+        q[1] = *a; q[1].x += ox; q[1].y += oy;
+        q[2] = *b; q[2].x -= ox; q[2].y -= oy;
+        q[3] = *b; q[3].x += ox; q[3].y += oy;
+        tb[o++] = q[0]; tb[o++] = q[1]; tb[o++] = q[2];
+        tb[o++] = q[2]; tb[o++] = q[1]; tb[o++] = q[3];
+    }
+    return o;
+}
+
+/* XBOX_NV2A_PRIMLOG: program line draws widened (lines_wide), fixed-mode
+ * point and line draws (draw_arrays), since the last 5 s report. */
+static unsigned g_primlog_wide, g_primlog_ff[2];
 
 /* The scale of the current HUD element, in the draw's pixels; 0 when
  * the draw is not part of one. */
@@ -3038,6 +4186,485 @@ static int draw_is_perspective(const uint32_t *indices, uint32_t start, uint32_t
     return fabsf(1.0f / v.rhw - 1.0f) > 1e-3f;
 }
 
+/* XBOX_SNOW_RELIEF=0..100 (default 100, the original): strength of the
+ * snow's per-pixel relief, the dot3 normal maps of the terrain (nv2a_psh.c).
+ * 0 = flat normal, the smooth lighting of the surface. Rendering only; 100
+ * generates the same shaders as before. Hidden (no launcher setting).
+ * XBOX_SNOW_RELIEF_SHOW=color|unlit|normal|lightmap (diagnostic): the
+ * terrain's raw textures (unlit = colour x lightmap); fade|depth|lit: the
+ * snow look's relief weight, the view depth (log2 w / 16), the lit colour
+ * before its clamp (colour x lightmap x (1 + v1), halved).
+ * XBOX_SNOW_LOOK=original|mixed|ps2 (default original here; the launcher's
+ * Snow look writes ps2 unless Original is picked, and never offers mixed):
+ * the terrain's snow lit without the clamp that burns it white (nv2a_psh.c),
+ * so the drawn trails of its colour show. mixed keeps some relief near the
+ * camera (XBOX_SNOW_LOOK_RELIEF, percent), faded to none between the view
+ * depths XBOX_SNOW_LOOK_FADE=near,far; ps2 has none. Brightness: the lit
+ * snow is left as it was below XBOX_SNOW_LOOK_PIVOT (percent of white; the
+ * night tracks), scaled by XBOX_SNOW_LOOK_EXPOSURE (percent) above it, and
+ * rolls off toward white from XBOX_SNOW_LOOK_KNEE (percent). Defaults
+ * matched by eye and by numbers to a PS2 capture (same mean brightness as
+ * the original on the day tracks). original = the shaders as before. */
+static int g_relief = -1, g_relief_show;
+static int g_snow_look, g_snow_relief, g_snow_expo, g_snow_pivot, g_snow_knee, g_snow_fade[2];
+
+static int env_int(const char *name, int def, int lo, int hi)
+{
+    const char *e = getenv(name);
+    int v = (e && *e) ? atoi(e) : def;
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+static void snow_relief_init(void)
+{
+    const char *e, *m;
+    if (g_relief >= 0) return;
+    e = getenv("XBOX_SNOW_RELIEF");
+    g_relief = (e && *e) ? atoi(e) : 100;
+    if (g_relief < 0) g_relief = 0;
+    if (g_relief > 100) g_relief = 100;
+    e = NULL;                                           /* the game's picture, never a debug view */
+    g_relief_show = !e ? 0 : !strcmp(e, "color") ? 1 : !strcmp(e, "unlit") ? 2
+                  : !strcmp(e, "normal") ? 3 : !strcmp(e, "lightmap") ? 4
+                  : !strcmp(e, "fade") ? 5 : !strcmp(e, "depth") ? 6 : !strcmp(e, "lit") ? 7 : 0;
+    m = getenv("XBOX_SNOW_LOOK");
+    g_snow_look = !m ? 0 : !strcmp(m, "mixed") ? 1 : !strcmp(m, "ps2") ? 2 : 0;
+    if (g_snow_look) {
+        const char *f = getenv("XBOX_SNOW_LOOK_FADE");
+        g_snow_relief = env_int("XBOX_SNOW_LOOK_RELIEF", 40, 0, 100);
+        g_snow_expo = env_int("XBOX_SNOW_LOOK_EXPOSURE", 70, 10, 250);
+        g_snow_pivot = env_int("XBOX_SNOW_LOOK_PIVOT", 45, 0, 99);
+        g_snow_knee = env_int("XBOX_SNOW_LOOK_KNEE", 85, 0, 99);
+        g_snow_fade[0] = 200; g_snow_fade[1] = 1500;
+        if (f && *f) {
+            int a = 0, b = 0;
+            if (sscanf(f, "%d,%d", &a, &b) == 2 && a >= 0 && b > a && b < 65536) {
+                g_snow_fade[0] = a; g_snow_fade[1] = b;
+            }
+        }
+        fprintf(stderr, "[NV2A-PSH] snow look %s: relief %d%% faded over w %d..%d, exposure %d%% above %d%%, knee %d%%\n",
+                m, g_snow_look == 1 ? g_snow_relief : 0, g_snow_fade[0], g_snow_fade[1], g_snow_expo,
+                g_snow_pivot, g_snow_knee);
+    }
+    if (g_relief != 100 || g_relief_show)
+        fprintf(stderr, "[NV2A-PSH] snow relief %d%%%s%s\n", g_relief,
+                g_relief_show ? ", show " : "", g_relief_show ? e : "");
+}
+
+/* -- Fork: distance veil (d3d8_veil.h) ---------------------------------
+ * The sky dome is the run of draws that open the 3D of an image with the
+ * depth test on, depth writes off and the compare ALWAYS (drawlogs of
+ * Garibaldi / Snowdream: 25 draws, program EBE8F53C). Its constant
+ * attributes v11-v14 are its whole transform (dome -> clip), and c58 / c59
+ * the title's viewport: together they give every scene pixel back in the
+ * dome's coordinates (z up, centred on the camera), its view depth (the
+ * clip w) and the projection's planes. The backdrop is copied at the first
+ * opaque draw after the dome; the pass runs at the first pass group 6
+ * (particles) of the dome's view, or at FRAME_END. One dome per image only:
+ * two (split screen) or none (weather, front end) and there is no pass.
+ * XBOX_VEIL_PROBE=1: a report every 300 images. Pump thread only. */
+static struct {
+    int frame_on, sky_run, sky_runs, opaque, done, view, probe_frame, objects;
+    unsigned sky_draws, draws;
+    float m[4][4], c58[4], c59[4], c98[4], c99[4];
+    int have_tm;
+    float tm[4][4];                     /* the terrain's transform (world -> clip), first terrain draw */
+    float sw, sh, clip_max, zclear;
+    unsigned long long passes, skipped_split, skipped_nosky, images;
+} g_vl;
+
+static int vl_inv4(const double a[16], double o[16])
+{
+    double inv[16], det;
+    int i;
+    inv[0] = a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15] + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
+    inv[4] = -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15] - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
+    inv[8] = a[4]*a[9]*a[15] - a[4]*a[11]*a[13] - a[8]*a[5]*a[15] + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
+    inv[12] = -a[4]*a[9]*a[14] + a[4]*a[10]*a[13] + a[8]*a[5]*a[14] - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
+    inv[1] = -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15] - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
+    inv[5] = a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15] + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
+    inv[9] = -a[0]*a[9]*a[15] + a[0]*a[11]*a[13] + a[8]*a[1]*a[15] - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
+    inv[13] = a[0]*a[9]*a[14] - a[0]*a[10]*a[13] - a[8]*a[1]*a[14] + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
+    inv[2] = a[1]*a[6]*a[15] - a[1]*a[7]*a[14] - a[5]*a[2]*a[15] + a[5]*a[3]*a[14] + a[13]*a[2]*a[7] - a[13]*a[3]*a[6];
+    inv[6] = -a[0]*a[6]*a[15] + a[0]*a[7]*a[14] + a[4]*a[2]*a[15] - a[4]*a[3]*a[14] - a[12]*a[2]*a[7] + a[12]*a[3]*a[6];
+    inv[10] = a[0]*a[5]*a[15] - a[0]*a[7]*a[13] - a[4]*a[1]*a[15] + a[4]*a[3]*a[13] + a[12]*a[1]*a[7] - a[12]*a[3]*a[5];
+    inv[14] = -a[0]*a[5]*a[14] + a[0]*a[6]*a[13] + a[4]*a[1]*a[14] - a[4]*a[2]*a[13] - a[12]*a[1]*a[6] + a[12]*a[2]*a[5];
+    inv[3] = -a[1]*a[6]*a[11] + a[1]*a[7]*a[10] + a[5]*a[2]*a[11] - a[5]*a[3]*a[10] - a[9]*a[2]*a[7] + a[9]*a[3]*a[6];
+    inv[7] = a[0]*a[6]*a[11] - a[0]*a[7]*a[10] - a[4]*a[2]*a[11] + a[4]*a[3]*a[10] + a[8]*a[2]*a[7] - a[8]*a[3]*a[6];
+    inv[11] = -a[0]*a[5]*a[11] + a[0]*a[7]*a[9] + a[4]*a[1]*a[11] - a[4]*a[3]*a[9] - a[8]*a[1]*a[7] + a[8]*a[3]*a[5];
+    inv[15] = a[0]*a[5]*a[10] - a[0]*a[6]*a[9] - a[4]*a[1]*a[10] + a[4]*a[2]*a[9] + a[8]*a[1]*a[6] - a[8]*a[2]*a[5];
+    det = a[0]*inv[0] + a[1]*inv[4] + a[2]*inv[8] + a[3]*inv[12];
+    if (det == 0.0 || det != det) return 0;
+    for (i = 0; i < 16; i++) o[i] = inv[i] / det;
+    return 1;
+}
+
+static void vl_frame_begin(void)
+{
+    static int prepared;
+    if (!prepared) { prepared = 1; d3d8_VeilPrepare(); }   /* no compile at a race's first pass */
+    g_vl.frame_on = 1;
+    g_vl.sky_run = g_vl.sky_runs = g_vl.opaque = g_vl.done = g_vl.have_tm = g_vl.objects = 0;
+    g_vl.view = -1;
+    g_vl.sky_draws = g_vl.draws = 0;
+    g_vl.images++;
+    g_vl.probe_frame = d3d8_VeilProbe() && (g_vl.images % 300u) == 150u;
+}
+
+/* Every draw (before it is issued). */
+static void vl_draw_seen(const uint32_t *indices, uint32_t start, int cur_view)
+{
+    int sky;
+    if (!g_vl.frame_on) return;
+    g_vl.draws++;
+    sky = g_vl_cur_grp == 0 && g_pg.depth_test && !g_pg.depth_mask && g_pg.depth_func == 0x207 &&
+          !g_vl.opaque && (g_pg.prog_inputs & 0x7800u) == 0x7800u;
+    if (sky) {
+        if (!g_vl.sky_run) {
+            int a, c;
+            uint32_t i0 = indices ? indices[0] : start;
+            g_vl.sky_run = 1;
+            g_vl.sky_runs++;
+            g_vl.view = cur_view;
+            for (a = 0; a < 4; a++) va_fetch4(11 + a, i0, g_vl.m[a]);
+            for (c = 0; c < 4; c++) {
+                g_vl.c58[c] = g_pg.vconst[58][c]; g_vl.c59[c] = g_pg.vconst[59][c];
+                g_vl.c98[c] = g_pg.vconst[98][c]; g_vl.c99[c] = g_pg.vconst[99][c];
+            }
+            g_vl.sw = (float)d3d8_GetBackbufferWidth();
+            g_vl.sh = (float)d3d8_GetBackbufferHeight();
+            if (g_vl.sw <= 0.0f) g_vl.sw = 640.0f;
+            if (g_vl.sh <= 0.0f) g_vl.sh = 480.0f;
+            g_vl.clip_max = g_pg.clip_max;
+            g_vl.zclear = (float)(g_pg.zstencil_clear >> 8) / 16777215.0f;
+        }
+        g_vl.sky_draws++;
+        return;
+    }
+    if (g_vl.sky_runs && g_pg.depth_mask && !g_vl.opaque) {
+        g_vl.opaque = 1;                /* the backdrop is complete: keep a copy */
+        d3d8_VeilSnapshot();            /* if the veil or the haze wants it */
+    }
+    /* The first object (pass group 2 on) of the dome's view: the depth of
+     * the terrain alone is kept (d3d8_veil_terrain_depth). */
+    if (g_vl.sky_runs == 1 && !g_vl.objects && !g_vl.done && g_vl_cur_grp >= 2 && cur_view == g_vl.view) {
+        g_vl.objects = 1;
+        d3d8_VeilTerrainDepth();
+    }
+    /* The terrain (final combiner 1B080B00, positions in world space):
+     * its constant attributes v11-v14 are world -> clip, for the haze. */
+    if (g_vl.sky_runs && !g_vl.have_tm && g_pg.depth_mask && g_pg.spec_fog_cw0 == 0x1B080B00u &&
+        (g_pg.prog_inputs & 0x7800u) == 0x7800u) {
+        int a;
+        uint32_t i0 = indices ? indices[0] : start;
+        for (a = 0; a < 4; a++) va_fetch4(11 + a, i0, g_vl.tm[a]);
+        g_vl.have_tm = 1;
+    }
+    g_vl.sky_run = 0;
+}
+
+/* K = M^-1 S: scene pixel (x + 0.5, y + 0.5, depth, 1) -> the space M maps
+ * to clip; and that space's eye (clip (0, 0, 1, 0)). 0 if M is singular. */
+static int vl_unproject(const float m[4][4], const double S[16], double K[16], float eye[3])
+{
+    double M[16], Mi[16];
+    int i, j, l;
+    for (i = 0; i < 4; i++) for (j = 0; j < 4; j++) M[i * 4 + j] = m[i][j];
+    if (!vl_inv4(M, Mi) || Mi[14] == 0.0) return 0;
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++) {
+            double s = 0.0;
+            for (l = 0; l < 4; l++) s += Mi[i * 4 + l] * S[l * 4 + j];
+            K[i * 4 + j] = s;
+        }
+    for (i = 0; i < 3; i++) eye[i] = (float)(Mi[i * 4 + 2] / Mi[14]);
+    return 1;
+}
+
+/* Pass group 6 of a view (end = 0) or FRAME_END (end = 1). */
+static void vl_point(int view, int end)
+{
+    double S[16], K[16], KW[16];
+    float k[16], kw[16], eye[3], eye_w[3] = { 0.0f, 0.0f, 0.0f }, r = 0.0f, cell = 0.0f, nz, fz;
+    unsigned W = 0, H = 0;
+    int i, have_w = 0;
+    if (!g_vl.frame_on || g_vl.done) return;
+    if (!end && view != g_vl.view) return;
+    g_vl.done = 1;
+    if (end) g_vl.frame_on = 0;
+    if (g_vl.sky_runs != 1 || !d3d8_SceneSize(&W, &H) || !W || !H) {
+        if (!g_vl.sky_runs) g_vl.skipped_nosky++;
+        else if (g_vl.sky_runs > 1) g_vl.skipped_split++;
+        if (g_vl.probe_frame)
+            fprintf(stderr, "[VEIL-PROBE] img %llu skipped: %d dome run(s)\n", g_vl.images, g_vl.sky_runs);
+        return;
+    }
+    if (g_vl.c58[0] == 0.0f || g_vl.c58[1] == 0.0f || g_vl.c58[2] == 0.0f) return;
+    memset(S, 0, sizeof S);
+    S[0] = (double)g_vl.sw / W / g_vl.c58[0];  S[3] = -(double)g_vl.c59[0] / g_vl.c58[0];
+    S[5] = (double)g_vl.sh / H / g_vl.c58[1];  S[7] = -(double)g_vl.c59[1] / g_vl.c58[1];
+    S[10] = (double)(g_vl.clip_max > 0.0f ? g_vl.clip_max : 1.0f) / g_vl.c58[2];
+    S[11] = -(double)g_vl.c59[2] / g_vl.c58[2];
+    S[15] = 1.0;
+    if (!vl_unproject(g_vl.m, S, K, eye)) return;
+    for (i = 0; i < 16; i++) k[i] = (float)K[i];
+    if (g_vl.have_tm && vl_unproject(g_vl.tm, S, KW, eye_w)) {
+        for (i = 0; i < 16; i++) kw[i] = (float)KW[i];
+        have_w = 1;
+    } else {
+        memset(kw, 0, sizeof kw);
+    }
+    {
+        /* the planes: the view depth (clip w = 1 / h.w) at depth 0 and 1, screen centre */
+        double cx = W * 0.5, cy = H * 0.5;
+        double h0 = K[12] * cx + K[13] * cy + K[15], h1 = h0 + K[14];
+        nz = h0 != 0.0 ? (float)(1.0 / h0) : 0.0f;
+        fz = h1 != 0.0 ? (float)(1.0 / h1) : 0.0f;
+    }
+    if ((d3d8_VeilOn() || d3d8_VeilAmbOn()) &&
+        d3d8_VeilDraw(k, eye, g_vl.zclear - 0.5f / 16777215.0f, nz, fz, g_vl.c98, g_vl.c99[3],
+                      have_w ? kw : NULL, eye_w))
+        g_vl.passes++;
+    if (g_vl.probe_frame) {
+        d3d8_VeilLimit(&r, &cell);
+        if (have_w) {
+            /* the dome's axes against the world's: one pixel at three
+             * depths, relative to each eye, by both transforms */
+            double worst = 0.0, z3[3] = { 0.9, 0.999, 0.99995 };
+            int t, c;
+            for (t = 0; t < 3; t++) {
+                double q[4] = { W * 0.3, H * 0.6, z3[t], 1.0 }, a[4], b[4];
+                for (c = 0; c < 4; c++) {
+                    a[c] = K[c * 4] * q[0] + K[c * 4 + 1] * q[1] + K[c * 4 + 2] * q[2] + K[c * 4 + 3];
+                    b[c] = KW[c * 4] * q[0] + KW[c * 4 + 1] * q[1] + KW[c * 4 + 2] * q[2] + KW[c * 4 + 3];
+                }
+                for (c = 0; c < 3; c++) {
+                    double e = fabs((a[c] / a[3] - eye[c]) - (b[c] / b[3] - eye_w[c]));
+                    if (e > worst) worst = e;
+                }
+            }
+            fprintf(stderr, "[VEIL-PROBE] img %llu world: eye %.1f %.1f %.1f; dome vs world axes, worst gap %.2f units\n",
+                    g_vl.images, eye_w[0], eye_w[1], eye_w[2], worst);
+        } else {
+            fprintf(stderr, "[VEIL-PROBE] img %llu world: no terrain draw seen before the pass\n", g_vl.images);
+        }
+        fprintf(stderr, "[VEIL-PROBE] img %llu %s view %d: planes %.2f / %.1f, z mode %s, cell window limit %.0f "
+                "cell %.0f; fog c98 %.3f %.3f %.3f density c99.w %g; sky %u draws of %u; eye %.1f %.1f %.1f; "
+                "scene %ux%u; passes %llu, skipped no dome %llu, split %llu\n",
+                g_vl.images, end ? "FRAME_END" : "group 6", g_vl.view, nz, fz,
+                ((g_pg.zmin_max_control >> 4) & 0xFu) ? "clamp" : "cull", r, cell,
+                g_vl.c98[0], g_vl.c98[1], g_vl.c98[2], g_vl.c99[3], g_vl.sky_draws, g_vl.draws,
+                eye[0], eye[1], eye[2], W, H, g_vl.passes, g_vl.skipped_nosky, g_vl.skipped_split);
+        fflush(stderr);
+    }
+}
+
+/* Fork: the temporal inputs (d3d8_temporal.h, XBOX_TEMPORAL=1). Is the
+ * program draw about to be issued, in the 3D groups 0-6,
+ *   2, a rider draw: its program is one of XBOX_TEMPORAL_RIDER_PROGS (hex,
+ *     comma separated; default A09F1173, the riders' body, limbs and board,
+ *     CPU-skinned in world space). The centroid of its world positions
+ *     (32 vertices spread over its indices, the same ones every image) is
+ *     matched with the nearest draw of the previous image with the same
+ *     program, textures and vertex count, within 300 units:
+ *     g_d3d8_temporal_delta = { centroid - previous centroid, 1 }, or
+ *     { 0, 0, 0, 0.5 } without a match (a first image, a respawn);
+ *   1, an additive draw (dfactor ONE, sfactor ONE or SRC_ALPHA, as the
+ *     lights) of a group of XBOX_TEMPORAL_REACTIVE_GROUPS (hex, bit g = group
+ *     g; default 0x44: group 2, the board's spray and trail, and group 6,
+ *     sparks and pick-ups -- CPU-written vertices with no motion of their
+ *     own): the reactive mask. Alpha-blended draws are not taken: those
+ *     groups also hold blended scenery (banners, foliage) that has the
+ *     camera's motion like the rest;
+ *   0 otherwise. The group comes from the markers: none, nothing. */
+#define TMP_MAXD     192
+#define TMP_MATCH    300.0f
+#define TMP_SAMPLES  32u
+typedef struct { uint32_t prog, t0, t1, n; float c[3]; } TmpDraw;
+static struct {
+    int      on, nriders, ncur, nprev;
+    uint32_t groups, riders[8], last_h32;
+    uint64_t last_hash;
+    unsigned seq;
+    TmpDraw  cur[TMP_MAXD], prev[TMP_MAXD];
+} g_tmp = { .on = -1 };
+
+static int temporal_draw(const uint32_t *indices, uint32_t start, uint32_t count)
+{
+    unsigned seq;
+    if (g_tmp.on < 0) {
+        const char *e = getenv("XBOX_TEMPORAL_REACTIVE_GROUPS");
+        g_tmp.groups = e && *e ? (uint32_t)strtoul(e, NULL, 16) : 0x44u;
+        e = getenv("XBOX_TEMPORAL_RIDER_PROGS");
+        if (e && *e) {
+            const char *p = e;
+            while (*p && g_tmp.nriders < 8) {
+                char *q;
+                uint32_t v = (uint32_t)strtoul(p, &q, 16);
+                if (q == p) break;
+                g_tmp.riders[g_tmp.nriders++] = v;
+                p = *q == ',' ? q + 1 : q;
+            }
+        } else g_tmp.riders[g_tmp.nriders++] = 0xA09F1173u;
+        g_tmp.on = d3d8_temporal_wanted();
+    }
+    if (!g_tmp.on || !d3d8_temporal_active() || !count) return 0;
+    if (g_ph.phase != PGRAPH_PHASE_3D || g_ph.group < 0 || g_ph.group > 6) return 0;
+    if (!(g_pg.color_mask & 0x00010101u)) return 0;
+    seq = d3d8_PresentSeq();
+    if (seq != g_tmp.seq) {             /* a new image: this one's draws become the previous */
+        if (seq == g_tmp.seq + 1u) {
+            memcpy(g_tmp.prev, g_tmp.cur, (size_t)g_tmp.ncur * sizeof g_tmp.cur[0]);
+            g_tmp.nprev = g_tmp.ncur;
+        } else g_tmp.nprev = 0;
+        g_tmp.ncur = 0;
+        g_tmp.seq = seq;
+    }
+    if (g_pg.prog_hash != g_tmp.last_hash) {    /* the program's hash (FNV-1a of its slots) */
+        uint32_t h = 2166136261u;
+        int k;
+        for (k = 0; k < g_pg.prog_len; k++) {
+            h = (h ^ g_pg.prog[(g_pg.prog_start + k) % VSHCPU_SLOTS][1]) * 16777619u;
+            h = (h ^ g_pg.prog[(g_pg.prog_start + k) % VSHCPU_SLOTS][2]) * 16777619u;
+            h = (h ^ g_pg.prog[(g_pg.prog_start + k) % VSHCPU_SLOTS][3]) * 16777619u;
+        }
+        g_tmp.last_hash = g_pg.prog_hash;
+        g_tmp.last_h32 = h;
+    }
+    {
+        int r;
+        for (r = 0; r < g_tmp.nriders && g_tmp.riders[r] != g_tmp.last_h32; r++) ;
+        if (r < g_tmp.nriders) {
+            TmpDraw d;
+            double m[3] = { 0.0, 0.0, 0.0 };
+            uint32_t k, ns = count < TMP_SAMPLES ? count : TMP_SAMPLES;
+            float p[4], best = TMP_MATCH * TMP_MATCH;
+            int i, bi = -1;
+            for (k = 0; k < ns; k++) {
+                uint32_t j = ns > 1u ? (uint32_t)((uint64_t)k * (count - 1u) / (ns - 1u)) : 0u;
+                va_fetch4(0, indices ? indices[j] : start + j, p);
+                m[0] += p[0]; m[1] += p[1]; m[2] += p[2];
+            }
+            d.prog = g_tmp.last_h32;
+            d.t0 = g_pg.tex[0].enabled ? g_pg.tex[0].offset : 0u;
+            d.t1 = g_pg.tex[1].enabled ? g_pg.tex[1].offset : 0u;
+            d.n = count;
+            for (k = 0; k < 3u; k++) d.c[k] = (float)(m[k] / (double)ns);
+            if (!(d.c[0] == d.c[0] && d.c[1] == d.c[1] && d.c[2] == d.c[2])) return 0;
+            for (i = 0; i < g_tmp.nprev; i++) {
+                const TmpDraw *q = &g_tmp.prev[i];
+                float dx, dy, dz, d2;
+                if (q->prog != d.prog || q->t0 != d.t0 || q->t1 != d.t1 || q->n != d.n) continue;
+                dx = d.c[0] - q->c[0]; dy = d.c[1] - q->c[1]; dz = d.c[2] - q->c[2];
+                d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < best) { best = d2; bi = i; }
+            }
+            if (bi >= 0) {
+                g_d3d8_temporal_delta[0] = d.c[0] - g_tmp.prev[bi].c[0];
+                g_d3d8_temporal_delta[1] = d.c[1] - g_tmp.prev[bi].c[1];
+                g_d3d8_temporal_delta[2] = d.c[2] - g_tmp.prev[bi].c[2];
+                g_d3d8_temporal_delta[3] = 1.0f;
+            } else {
+                g_d3d8_temporal_delta[0] = g_d3d8_temporal_delta[1] = g_d3d8_temporal_delta[2] = 0.0f;
+                g_d3d8_temporal_delta[3] = 0.5f;
+            }
+            if (g_tmp.ncur < TMP_MAXD) g_tmp.cur[g_tmp.ncur++] = d;
+            return 2;
+        }
+    }
+    if (g_pg.blend_enable && g_pg.blend_dfactor == 1 && (g_pg.blend_sfactor == 1 || g_pg.blend_sfactor == 0x302) &&
+        ((g_tmp.groups >> g_ph.group) & 1u))
+        return 1;
+    {
+        /* XBOX_TEMPORAL_LOG: a draw of another program within 60 units of a
+         * rider draw of this image (a board, a part the riders' program does
+         * not draw), once per kind, up to 32 */
+        static int log = -1, nseen;
+        static uint32_t seen[32][3];
+        int i;
+        if (log < 0) { const char *e = getenv("XBOX_TEMPORAL_LOG"); log = e && e[0] == '1'; }
+        if (log && nseen < 32 && (g_tmp.ncur || g_tmp.nprev) && count < 4000u &&
+            !(g_pg.blend_enable && g_pg.blend_sfactor == 0 && g_pg.blend_dfactor == 1)) {    /* not the colourless ones */
+            double m[3] = { 0.0, 0.0, 0.0 };
+            float p[4];
+            uint32_t k, ns = count < 8u ? count : 8u;
+            for (k = 0; k < ns; k++) {
+                uint32_t j = ns > 1u ? (uint32_t)((uint64_t)k * (count - 1u) / (ns - 1u)) : 0u;
+                va_fetch4(0, indices ? indices[j] : start + j, p);
+                m[0] += p[0]; m[1] += p[1]; m[2] += p[2];
+            }
+            for (k = 0; k < 3u; k++) m[k] /= (double)ns;
+            for (i = 0; i < g_tmp.ncur + g_tmp.nprev; i++) {
+                const TmpDraw *q = i < g_tmp.ncur ? &g_tmp.cur[i] : &g_tmp.prev[i - g_tmp.ncur];
+                double dx = m[0] - q->c[0], dy = m[1] - q->c[1], dz = m[2] - q->c[2];
+                if (dx * dx + dy * dy + dz * dz < 3600.0) break;
+            }
+            if (i < g_tmp.ncur + g_tmp.nprev) {
+                uint32_t key[3] = { g_tmp.last_h32, g_pg.tex[0].enabled ? g_pg.tex[0].offset : 0u, count };
+                for (i = 0; i < nseen && memcmp(seen[i], key, 2 * sizeof key[0]); i++) ;
+                if (i == nseen) {
+                    memcpy(seen[nseen++], key, sizeof key);
+                    fprintf(stderr, "[TEMPORAL] near a rider: program %08X, group %d, %u vertices, tex0 %08X, blend %d %X/%X\n",
+                            key[0], g_ph.group, (unsigned)count, key[1], g_pg.blend_enable, g_pg.blend_sfactor,
+                            g_pg.blend_dfactor);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Fork, temporal (XBOX_TEMPORAL_LOG=1): the fixed-function draws (RwIm2D,
+ * pre-transformed, drawn by d3d8_shaders.c) of the 3D groups 0-6 are not
+ * jittered; each distinct kind (path, group, vertex count, texture, blend)
+ * is printed once, up to 64 of them, so they can be listed. */
+static void temporal_ffp_note(const char *path, uint32_t n)
+{
+    static int log = -1, nseen;
+    static uint32_t seen[64][5];
+    uint32_t key[5];
+    int i;
+    if (log < 0) { const char *e = getenv("XBOX_TEMPORAL_LOG"); log = e && e[0] == '1'; }
+    if (!log || g_tmp.on <= 0 || g_ph.phase != PGRAPH_PHASE_3D || g_ph.group < 0 || g_ph.group > 6) return;
+    key[0] = path[0]; key[1] = (uint32_t)g_ph.group; key[2] = n;
+    key[3] = g_pg.tex[0].enabled ? g_pg.tex[0].offset : 0u;
+    key[4] = g_pg.blend_enable ? (g_pg.blend_sfactor << 16 | g_pg.blend_dfactor) : 0u;
+    for (i = 0; i < nseen; i++) if (!memcmp(seen[i], key, sizeof key)) return;
+    if (nseen >= 64) return;
+    memcpy(seen[nseen++], key, sizeof key);
+    fprintf(stderr, "[TEMPORAL] not jittered: %s draw, group %d, %u vertices, tex0 %08X, blend %X/%X, image %u\n",
+            path, g_ph.group, (unsigned)n, key[3], g_pg.blend_enable ? g_pg.blend_sfactor : 0u,
+            g_pg.blend_enable ? g_pg.blend_dfactor : 0u, d3d8_PresentSeq());
+}
+
+/* XBOX_LIGHTMAP_FILTER=off|catmull|bspline|bspline-ref (hidden, default off): see
+ * pgraph_d3d11_set_lightmap_filter. -1 = not read yet. */
+static volatile int g_lm_filter = -1;
+
+static int lightmap_filter_mode(void)
+{
+    if (g_lm_filter < 0) {
+        const char *e = getenv("XBOX_LIGHTMAP_FILTER");
+        int m = !e ? 0 : !strcmp(e, "catmull") ? 1 : !strcmp(e, "bspline") ? 2
+                : !strcmp(e, "bspline-ref") ? 5 : 0;
+        if (m)
+            fprintf(stderr, "[NV2A-PSH] lightmap filter %s\n", e);
+        g_lm_filter = m;
+    }
+    return g_lm_filter;
+}
+
+int pgraph_d3d11_set_lightmap_filter(int mode)
+{
+    g_lm_filter = mode == 1 || mode == 2 || mode == 5 ? mode : 0;   /* 5: diagnostic (nv2a_psh.c) */
+    return g_lm_filter;
+}
+
+int pgraph_d3d11_lightmap_filter(void)
+{
+    return lightmap_filter_mode();
+}
+
 static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count)
 {
     static ProgVertex *vb = NULL, *tb = NULL;
@@ -3048,12 +4675,15 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
     uint32_t i, n;
     int prim = D3DPT_TRIANGLELIST;
     int points = g_pg.draw_mode == 1;
+    int wide = 0;                           /* lines drawn as quads (lines_wide) */
     Nv2aVshDraw gd;
     int gpu = 0;
     double pt0 = g_perf_on ? perf_now() : 0.0;
 
     if (count == 0)
         return;
+    if (g_vl_on > 0) vl_draw_seen(indices, start, g_vl_cur_view);     /* fork: distance veil */
+    wide = g_pg.draw_mode >= 2 && g_pg.draw_mode <= 4 && lines_wide();
     if (count > cap) {
         uint32_t c = count < 4096 ? 4096 : count;
         ProgVertex *a = (ProgVertex *)realloc(vb, c * sizeof *a);
@@ -3085,6 +4715,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         if (pick_cpu < 0) pick_cpu = getenv("XBOX_NV2A_PICK") != NULL;
         gpu = !(pick_cpu && g_drawlog_lo >= 0 && f >= g_drawlog_lo && f < g_drawlog_lo + g_drawlog_n)
               && !(g_panel.on && !g_panel.scale_only && g_ph.phase == PGRAPH_PHASE_HUD)  /* panel ends: CPU */
+              && !wide                                  /* quads built on the CPU (few draws) */
               && gpu_prepare(&gd, indices, start, count);
     }
     if (gpu) {
@@ -3215,6 +4846,9 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
          * 0..1 from the top-left corner (xemu: gl_PointCoord). */
         n = points_squares(vb, okb, psb, count, tb);
         prim = D3DPT_TRIANGLELIST;
+    } else if (wide) {
+        n = lines_quads(g_pg.draw_mode, vb, okb, count, tb);
+        prim = D3DPT_TRIANGLELIST;
     } else {
         n = assemble(g_pg.draw_mode, vb, okb, count, tb, &prim);
     }
@@ -3228,6 +4862,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         if (on < 0) { const char *e = getenv("XBOX_NV2A_PRIMLOG"); on = e && e[0] == '1'; }
         if (on && g_pg.draw_mode >= 1 && g_pg.draw_mode <= 4) {
             uint32_t key[4];
+            g_primlog_wide += wide ? 1u : 0u;
             int k;
             key[0] = g_pg.draw_mode | (g_pg.point_params_enable << 8) | (g_pg.point_smooth << 9);
             key[1] = g_pg.tex[3].enabled ? g_pg.tex[3].offset : g_pg.tex[0].enabled ? g_pg.tex[0].offset : 0;
@@ -3255,7 +4890,10 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         if (on && GetTickCount() - last > 5000) {
             int k;
             last = GetTickCount();
-            fprintf(stderr, "[PRIMLOG] present %u, %d groups\n", d3d8_PresentSeq(), ng);
+            fprintf(stderr, "[PRIMLOG] present %u, %d groups, line width %u/8, lines widened %u, "
+                    "fixed-mode points %u lines %u\n", d3d8_PresentSeq(), ng, g_pg.line_width,
+                    g_primlog_wide, g_primlog_ff[0], g_primlog_ff[1]);
+            g_primlog_wide = g_primlog_ff[0] = g_primlog_ff[1] = 0;
             for (k = 0; k < ng; k++)
                 fprintf(stderr, "[PRIMLOG]   mode %u params %u smooth %u tex %08X fmt %08X blend %08X: %u draws %u verts size %.2f..%.2f\n",
                         g[k].key[0] & 0xFF, (g[k].key[0] >> 8) & 1, (g[k].key[0] >> 9) & 1, g[k].key[1], g[k].key[2],
@@ -3449,6 +5087,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             ps.alpha_in[st] = g_pg.comb_alpha_icw[st];
             ps.alpha_out[st] = g_pg.comb_alpha_ocw[st];
         }
+        snow_relief_init();
         for (st = 0; st < 4; st++) {
             uint32_t f = g_pg.tex[st].format, color = TEXFMT_COLOR(f), xf, bb;
             IDirect3DTexture8 *t = g_pg.tex[st].enabled ? tex_upload(dev, st) : NULL;
@@ -3496,6 +5135,23 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                 /* Linear images: IMAGE_RECT width 31:16, height 15:0. */
                 pc.tex_size[st][0] = (float)(g_pg.tex[st].image_rect >> 16);
                 pc.tex_size[st][1] = (float)(g_pg.tex[st].image_rect & 0xFFFF);
+            }
+            if (st == 1 && lightmap_filter_mode()) {
+                /* XBOX_LIGHTMAP_FILTER: offered to a 2D 128 x 128 texture
+                 * read bilinear when magnified (the terrain's lightmap
+                 * atlas); nv2a_psh.c then keeps it for the terrain program
+                 * only. */
+                static int logged;
+                uint32_t mag = (g_pg.tex[1].filter >> 24) & 0xF;
+                if (mag != 1 && !btnicons_point(t) && TEXFMT_SIZE_U(f) == 7 && TEXFMT_SIZE_V(f) == 7
+                    && ps.tex_dim[1] == 2 && !ps.tex_cube[1] && !ps.tex_rect[1]) {
+                    ps.lm_filter = (uint8_t)lightmap_filter_mode();
+                    if (!logged) {
+                        logged = 1;
+                        fprintf(stderr, "[NV2A-PSH] lightmap filter: first t1 format 0x%08X filter 0x%08X address 0x%08X\n",
+                                f, g_pg.tex[1].filter, g_pg.tex[1].address);
+                    }
+                }
             }
         }
         {
@@ -3637,6 +5293,17 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         }
         ps.flat = (uint8_t)(g_flat_on != 0);
         ps.alpha_t0z = (uint8_t)(g_alpha_t0z != 0);
+        ps.relief_off = (uint8_t)(100 - g_relief);
+        ps.relief_show = (uint8_t)g_relief_show;
+        if (g_snow_look) {
+            ps.snow_look = (uint8_t)g_snow_look;
+            ps.snow_relief = (uint8_t)g_snow_relief;
+            ps.snow_expo = (uint8_t)g_snow_expo;
+            ps.snow_pivot = (uint8_t)g_snow_pivot;
+            ps.snow_knee = (uint8_t)g_snow_knee;
+            ps.snow_fade[0] = (uint16_t)g_snow_fade[0];
+            ps.snow_fade[1] = (uint16_t)g_snow_fade[1];
+        }
         {
             /* XBOX_NV2A_WCLIP=0 (diagnostic) ignores the window clip. */
             static int wclip_on = -1;
@@ -3728,7 +5395,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             static int cull_on = -1;
             int raster = ((g_pg.zmin_max_control >> 4) & 0xF) == 0 ? 1 : 0;
             if (cull_on < 0) { const char *e = getenv("XBOX_NV2A_CULL"); cull_on = !(e && e[0] == '0'); }
-            if (cull_on && g_pg.cull_enable && !points && prim == D3DPT_TRIANGLELIST) {
+            if (cull_on && g_pg.cull_enable && !points && !wide && prim == D3DPT_TRIANGLELIST) {
                 if (g_pg.cull_face == 0x408) {                    /* FRONT_AND_BACK */
                     dev->lpVtbl->EndScene(dev);
                     return;
@@ -3754,7 +5421,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                 if (hud_element(&kx, &ax, &ky, &ay) &&
                     !(fix_hud3d() && draw_is_perspective(indices, start, count))) {
                     if (gpu) { gd.hud_kx = kx; gd.hud_ax = ax; gd.hud_ky = ky; gd.hud_ay = ay; }
-                    else if (kx < 0.0f && prim == D3DPT_TRIANGLELIST && !points)
+                    else if (kx < 0.0f && prim == D3DPT_TRIANGLELIST && !points && !wide)
                         g_panel.moved += (unsigned long long)panel_snap_list(tb, n, -kx, ax, ky, ay);
                     else for (i = 0; i < n; i++)
                         hud_vertex(&tb[i].x, &tb[i].y, kx, ax, ky, ay);
@@ -3762,17 +5429,154 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             }
             if (gpu && !points) cullstat_draw(indices, start, count, gd.screen_w, gd.screen_h);
             if (gpu && g_plag.bad && !points) plag_draw(indices, start, count, gd.screen_w, gd.screen_h);
+            g_d3d8_light_mark = light_draw();       /* fork: the lights (d3d8_lights.h) */
+            g_d3d8_temporal_mark = temporal_draw(indices, start, count);   /* fork: temporal */
             if (gpu) {
                 gd.ps_key = key;
                 gd.ps_consts = &pc;
                 gd.ps_consts_size = sizeof pc;
                 gd.raster = raster;
+                ztie_init();
+                zdecal_init();
+                gd.ztie_nsub = 0;
+                LARGE_INTEGER zq0 = {{0}}, zq1;
+                static LARGE_INTEGER zqf;
+                static unsigned long long zq_sum, zq_tie, zq_draws, zq_elig, zq_tdraws, zq_ddraws, zc0[4], zp0, zk0, zq_tkey, zq_tk, zi0, zs0, zq_mk, zq_ord, zcam0, zx[3];
+                static unsigned zq_frame0;
+                static int zcost = -1;
+                if (zcost < 0) { const char *e = getenv("XBOX_ZDECAL_COST"); zcost = e && e[0] == '1'; g_d3d8_zcost = zcost; }
+                if (zcost) {
+                    /* XBOX_ZDECAL_COST=1 (diagnostics): the time the ZTIE and ZDECAL blocks take, per image, every 2400 images,
+                     * and the time of the final DrawIndexed calls (d3d8_nv2a.c), split draws apart. */
+                    if (!zqf.QuadPart) { QueryPerformanceFrequency(&zqf); zq_frame0 = g_pg.frame_no; }
+                    if (g_pg.frame_no - zq_frame0 >= 2400u) {
+                        unsigned nf = g_pg.frame_no - zq_frame0;
+                        double us = 1e6 / (double)zqf.QuadPart / nf;
+                        unsigned long long dz[4];
+                        int k;
+                        for (k = 0; k < 4; k++) { dz[k] = g_d3d8_zc[k] - zc0[k]; zc0[k] = g_d3d8_zc[k]; }
+                        fprintf(stderr, "[ZDECAL] cost: %.1f us per image (%.0f draws, %.0f looked at per image); %u pairs looked at, %u marked; decal triangles winning %.1f, kept %.1f per image\n",
+                                us * (double)zq_sum, (double)zq_draws / nf, (double)zq_elig / nf,
+                                g_zd_seen, g_zd_marked, (double)g_zd_won / nf, (double)g_zd_kept / nf);
+                        fprintf(stderr, "[ZCOST] per image: ZTIE block %.1f us (keys %.1f us for %.1f, new keys %.1f, looked at %.2f), ZDECAL block %.1f us (pair lookups %.1f us, orders %.1f us, %.1f cameras); mesh keys %.1f, pair lookups %.1f; draws with ties %.1f, with decals %.1f; "
+                                        "slots looked at: ZTIE %.1f, pairs %.1f; new pairs %.1f; DrawIndexed: %.1f whole draws %.1f us (%.3f us each), %.1f split draws %.1f us (%.3f us each)\n",
+                                us * (double)zq_tie, us * (double)zq_tkey, (double)zq_tk / nf, (double)(g_ztie_inserts - zi0) / nf, (double)(g_ztie_seen - zs0) / nf, us * (double)zq_sum, us * (double)zq_mk, us * (double)zq_ord, (double)(g_zd_cams - zcam0) / nf, (double)(g_zd_nkeys - zk0) / nf, (double)(g_zd_probes - zp0) / nf, (double)zq_tdraws / nf, (double)zq_ddraws / nf, (double)(g_ztie_slots_seen - zx[0]) / nf, (double)(g_zd_slots_seen - zx[1]) / nf, (double)(g_zd_inserts - zx[2]) / nf,
+                                (double)dz[1] / nf, us * (double)dz[0], dz[1] ? us * nf * (double)dz[0] / (double)dz[1] : 0.0,
+                                (double)dz[3] / nf, us * (double)dz[2], dz[3] ? us * nf * (double)dz[2] / (double)dz[3] : 0.0);
+                        g_zd_won = g_zd_kept = 0; zp0 = g_zd_probes; zk0 = g_zd_nkeys; zi0 = g_ztie_inserts; zs0 = g_ztie_seen; zcam0 = g_zd_cams; zx[0] = g_ztie_slots_seen; zx[1] = g_zd_slots_seen; zx[2] = g_zd_inserts;
+                        zq_sum = zq_tie = zq_tkey = zq_tk = zq_mk = zq_ord = zq_draws = zq_elig = zq_tdraws = zq_ddraws = 0; zq_frame0 = g_pg.frame_no;
+                    }
+                    QueryPerformanceCounter(&zq0);
+                }
+                uint64_t kshare = 0;        /* the draw's mesh key, computed once (ZTIE and ZDECAL) */
+                static int ztie_sel = -1;   /* cut-out meshes only (alpha test: the stand trusses); XBOX_ZTIE_SEL=0 (diagnostics): all meshes */
+                if (ztie_sel < 0) { const char *e = getenv("XBOX_ZTIE_SEL"); ztie_sel = e && *e ? atoi(e) : 1; }
+                static int ztie_mintri = -1;   /* not a single card (two triangles side by side: no overlap); XBOX_ZTIE_MINTRI=2 (diagnostics): cards too */
+                if (ztie_mintri < 0) { const char *e = getenv("XBOX_ZTIE_MINTRI"); ztie_mintri = e && *e ? atoi(e) : 3; }
+                if (g_ztie && !points && prim == D3DPT_TRIANGLELIST && g_pg.depth_test && g_pg.depth_mask &&
+                    !g_pg.stencil_test && (!ztie_sel || g_pg.alpha_test) && gd.nindices >= 3u * (uint32_t)ztie_mintri) {
+                    const uint32_t *zo = NULL;
+                    kshare = zd_key(&gd);
+                    if (zcost) { QueryPerformanceCounter(&zq1); zq_tkey += (unsigned long long)(zq1.QuadPart - zq0.QuadPart); zq_tk++; }
+                    gd.ztie_nsub = ztie_marked(&gd, &zo, kshare);
+                    if (gd.ztie_nsub) gd.indices = zo;       /* the overlapping triangles first */
+                }
+                if (gd.ztie_nsub) {
+                    gd.raster |= 0x40;                  /* stable ties (d3d8_nv2a.c) */
+                    g_ztie_draws++;
+                    if (zcost) zq_tdraws++;
+                    if (g_ztie_draws % 20000u == 1u && (g_ztie_draws == 1u || xbox_log_stats()))
+                        fprintf(stderr, "[ZTIE] %u draws with stable ties; %u meshes looked at, %u marked, %u slots reused\n",
+                                g_ztie_draws, g_ztie_seen, g_ztie_marked, g_ztie_evicted);
+                }
+                if (zcost) { QueryPerformanceCounter(&zq1); zq_tie += (unsigned long long)(zq1.QuadPart - zq0.QuadPart); }
+                {   /* stable decals over the previous draw (XBOX_ZDECAL) */
+                    int el = !points && prim == D3DPT_TRIANGLELIST && g_pg.depth_test && g_pg.depth_mask &&
+                             !g_pg.stencil_test && !g_pg.prog_writes_c &&
+                             (g_pg.depth_func == 0x201 || g_pg.depth_func == 0x203);
+                    uint64_t kb = 0;
+                    if (g_zdecal && zcost) {
+                        QueryPerformanceCounter(&zq0);
+                        zq_draws++; zq_elig += el;
+                    }
+                    gd.zdecal_nsub = 0;
+                    {
+                        int remembered = 0;
+                        if (g_zdecal && el) {
+                            /* The key only for a draw that can pair with the previous one (else
+                             * worked out later, if the next draw pairs with this one). */
+                            int pair = !gd.ztie_nsub && g_pg.depth_func == 0x201 && zd_pairable(&gd);   /* LESS: a LESS_EQUAL decal already wins its ties */
+                            kb = kshare;
+                            if (pair && !kb) kb = zd_key(&gd);
+                            if (pair && kb) {
+                                ZdEntry *ze;
+                                if (zcost) QueryPerformanceCounter(&zq1);
+                                ze = zd_marked(&gd, kb);
+                                if (zcost) { LARGE_INTEGER q; QueryPerformanceCounter(&q); zq_mk += (unsigned long long)(q.QuadPart - zq1.QuadPart); }
+                                if (ze) {
+                                    const uint32_t *zo = NULL;
+                                    uint32_t nw;
+                                    zd_remember(&gd, kb, el);   /* the title's triangles, any order */
+                                    remembered = 1;
+                                    if (zcost) QueryPerformanceCounter(&zq1);
+                                    nw = zd_order(&gd, ze, &zo);
+                                    if (zcost) { LARGE_INTEGER q; QueryPerformanceCounter(&q); zq_ord += (unsigned long long)(q.QuadPart - zq1.QuadPart); }
+                                    if (nw && zo) {
+                                        gd.indices = zo;        /* the triangles winning their ties first */
+                                        gd.zdecal_nsub = nw;
+                                        gd.raster |= 0x80;
+                                        if (zcost) zq_ddraws++;
+                                        if (++g_zd_draws % 20000u == 1u && (g_zd_draws == 1u || xbox_log_stats()))
+                                            fprintf(stderr, "[ZDECAL] %u draws with stable decals; %u pairs looked at, %u marked\n",
+                                                    g_zd_draws, g_zd_seen, g_zd_marked);
+                                    }
+                                }
+                            }
+                        }
+                        if (!remembered) zd_remember(&gd, kb, g_zdecal && el);
+                    }
+                    if (g_zdecal && zcost) { QueryPerformanceCounter(&zq1); zq_sum += (unsigned long long)(zq1.QuadPart - zq0.QuadPart); }
+                }
                 if (points && d3d8_points_check_on()) {
                     /* XBOX_POINTS_CHECK: the CPU squares, as reference. */
                     for (i = 0; i < count; i++)
                         okb[i] = (uint8_t)vsh_vertex(indices ? indices[i] : start + i, &vb[i], &psb[i]);
                     d3d8_nv2a_points_expect(tb, points_squares(vb, okb, psb, count, tb), sizeof(ProgVertex));
                 }
+                softcut_init();
+                if (g_softcut && !points && prim == D3DPT_TRIANGLELIST && softcut_class()) {
+                    /* Soft-edged cut-out, two passes (see softcut_class) */
+                    float ref0 = pc.alpha_ref[0];
+                    int lm = g_d3d8_light_mark, tm = g_d3d8_temporal_mark;
+                    g_sc_draws++;
+                    {   /* census: each texture once (at most 256) */
+                        static uint32_t seen[256];
+                        uint32_t k, t0 = g_pg.tex[0].offset;
+                        for (k = 0; k < g_sc_logged && seen[k] != t0; k++) {}
+                        if (k == g_sc_logged && g_sc_logged < 256u) seen[g_sc_logged++] = t0;
+                        else k = 0xFFFFFFFFu;
+                        if (k != 0xFFFFFFFFu)
+                        fprintf(stderr, "[SOFTCUT] draw: t0 %08X colour %02X, ref %u, %u indices, program %016llX\n",
+                                g_pg.tex[0].offset, (unsigned)TEXFMT_COLOR(g_pg.tex[0].format), (unsigned)(g_pg.alpha_ref & 0xFF),
+                                gd.nindices, (unsigned long long)gd.prog_hash);
+                    }
+                    if (g_pg.frame_no - (unsigned)g_sc_frames0 >= 2400u && xbox_log_stats()) {
+                        fprintf(stderr, "[SOFTCUT] %.1f soft-edged draws per image\n",
+                                (double)g_sc_draws / (double)(g_pg.frame_no - (unsigned)g_sc_frames0));
+                        g_sc_draws = 0; g_sc_frames0 = g_pg.frame_no;
+                    }
+                    pc.alpha_ref[0] = 127.0f;               /* alpha >= 128 (GREATER) / >= 127 (GEQUAL): as the title, depth written */
+                    if (d3d8_nv2a_draw_program_gpu(&gd)) {
+                        pc.alpha_ref[0] = ref0;              /* the softer edges, blended, depth not written */
+                        g_d3d8_light_mark = 0; g_d3d8_temporal_mark = 0;
+                        dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, FALSE);
+                        d3d8_nv2a_draw_program_gpu(&gd);
+                        dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, TRUE);
+                        g_d3d8_light_mark = lm; g_d3d8_temporal_mark = tm;
+                        g_vs.prog_tris += n / 3;
+                    }
+                    pc.alpha_ref[0] = ref0;
+                } else
                 if (d3d8_nv2a_draw_program_gpu(&gd) && prim == D3DPT_TRIANGLELIST)
                     g_vs.prog_tris += n / 3;
             } else {
@@ -3794,6 +5598,8 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             }
         }
     }
+    g_d3d8_light_mark = 0;
+    g_d3d8_temporal_mark = 0;
     peek_after("program draw");
     if (g_perf_on) {
         perf_add(gpu ? PZ_PROGGPU : PZ_PROGCPU, perf_now() - pt0);
@@ -3803,7 +5609,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
     g_pg.stats.vertices_submitted += count;
     g_pg.draws_since_present++;
 
-    if ((g_vs.prog_draws % 5000) == 1) {
+    if ((g_vs.prog_draws % 5000) == 1 && (g_vs.prog_draws == 1 || xbox_log_stats())) {
         fprintf(stderr, "[VSH] %u program draws, %u verts, %u tris, %u tris behind the eye, "
                 "%u programs decoded, %u fixed-mode indexed draws; last v0=(%.1f, %.1f, %.4f, rhw %.4g)\n",
                 g_vs.prog_draws, g_vs.prog_verts, g_vs.prog_tris, g_vs.culled_w,
@@ -3866,6 +5672,12 @@ static void draw_arrays(uint32_t start, uint32_t count)
     }
     if (prim_count == 0)
         return;
+    {
+        static int primlog = -1;        /* XBOX_NV2A_PRIMLOG: fixed-mode points / lines */
+        if (primlog < 0) { const char *e = getenv("XBOX_NV2A_PRIMLOG"); primlog = e && e[0] == '1'; }
+        if (primlog && prim == D3DPT_POINTLIST) g_primlog_ff[0]++;
+        if (primlog && (prim == D3DPT_LINELIST || prim == D3DPT_LINESTRIP)) g_primlog_ff[1]++;
+    }
 
     dev = xbox_GetD3DDevice();
     if (!dev)
@@ -3963,8 +5775,11 @@ static void draw_arrays(uint32_t start, uint32_t count)
 
     hud_scale_out(out, count);
     dev->lpVtbl->BeginScene(dev);
+    temporal_ffp_note("arrays", count);         /* fork: temporal diagnostic */
+    g_d3d8_light_mark = light_draw();           /* fork: the lights (d3d8_lights.h) */
     dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)prim, prim_count,
                                  out, sizeof(OutputVertex));
+    g_d3d8_light_mark = 0;
 
     g_pg.stats.draw_calls++;
     g_pg.stats.vertices_submitted += count;
@@ -4048,10 +5863,12 @@ static int subst_draw(void)
 {
     PgraphDrawSubst sub;
     uint32_t saved[16], saved_addr[4], a, k;
-    if (!g_subst_fn) return 0;
+    if (!g_subst_fn && !g_observe_fn) return 0;
     {
         uint32_t offs[16], fmts[16];
         for (a = 0; a < 16; a++) { offs[a] = g_pg.vattr[a].offset; fmts[a] = g_pg.vattr[a].format; }
+        if (g_observe_fn) g_observe_fn(g_pg.draw_mode, g_pg.idx, g_pg.idx_count, offs, fmts);   /* fork */
+        if (!g_subst_fn) return 0;
         memset(&sub, 0, sizeof sub);
         if (!g_subst_fn(g_pg.draw_mode, g_pg.idx, g_pg.idx_count, offs, fmts, &sub)) return 0;
     }
@@ -4187,6 +6004,13 @@ static void submit_draw(void)
     }
     if (prim_count == 0)
         return;
+    {
+        static int primlog = -1;        /* XBOX_NV2A_PRIMLOG: fixed-mode points / lines */
+        if (primlog < 0) { const char *e = getenv("XBOX_NV2A_PRIMLOG"); primlog = e && e[0] == '1'; }
+        if (primlog && actual_prim_type == D3DPT_POINTLIST) g_primlog_ff[0]++;
+        if (primlog && (actual_prim_type == D3DPT_LINELIST || actual_prim_type == D3DPT_LINESTRIP))
+            g_primlog_ff[1]++;
+    }
 
     /* Convert inline vertices to OutputVertex (28 bytes) */
     OutputVertex *out = (OutputVertex *)_alloca(out_vert_count * sizeof(OutputVertex));
@@ -4416,8 +6240,11 @@ static void submit_draw(void)
 
     /* Draw */
     hud_scale_out(out, out_vert_count);
+    temporal_ffp_note("inline", out_vert_count);   /* fork: temporal diagnostic */
+    g_d3d8_light_mark = light_draw();           /* fork: the lights (d3d8_lights.h) */
     dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)g_pg.d3d_prim_type,
                                   prim_count, out, sizeof(OutputVertex));
+    g_d3d8_light_mark = 0;
 
     g_pg.stats.draw_calls++;
     g_pg.stats.vertices_submitted += num_verts;
@@ -4573,7 +6400,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     case NV097_SET_TRANSFORM_CONSTANT ... NV097_SET_TRANSFORM_CONSTANT + 0x7C: {
         uint32_t slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
         if (g_pg.const_load < VSHCPU_CONSTANTS) {
-            g_pg.vconst[g_pg.const_load][slot % 4] = u2f(param);
+            vc_set(&g_pg.vconst[g_pg.const_load][slot % 4], param);
             if (slot % 4 == 3)
                 g_pg.const_load++;
         }
@@ -4705,6 +6532,9 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     case NV097_SET_POINT_SIZE:
         if (param <= 0x1FF) g_pg.point_size = param;
         return 1;
+    case NV097_SET_LINE_WIDTH:
+        g_pg.line_width = param & 0x1FFu;
+        return 1;
     case NV097_SET_POINT_PARAMS + 0x00: case NV097_SET_POINT_PARAMS + 0x04:
     case NV097_SET_POINT_PARAMS + 0x08: case NV097_SET_POINT_PARAMS + 0x0C:
     case NV097_SET_POINT_PARAMS + 0x10: case NV097_SET_POINT_PARAMS + 0x14:
@@ -4794,6 +6624,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
                 pass_phase_image_done();
                 box_image_done();
                 hud_image_done();
+                if (g_image_end_cb) g_image_end_cb();
                 d3d8_PresentFrame();
             }
         }
@@ -4858,6 +6689,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             pass_phase_image_done();
             box_image_done();
             hud_image_done();
+            if (g_image_end_cb) g_image_end_cb();
             d3d8_PresentFrame();
         }
         if (dev) {
@@ -5013,7 +6845,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         /* The hardware keeps the viewport in transform-constant memory
          * (XFCTX_VPOFF = c[0x3B], D3D's c[-37]); the screen-space tail the
          * Xbox D3D runtime appends to every vertex program reads it there. */
-        g_pg.vconst[0x3B][idx] = u2f(param);
+        vc_set(&g_pg.vconst[0x3B][idx], param);
         return 1;
     }
 
@@ -5024,7 +6856,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     {
         int idx = (method - NV097_SET_VIEWPORT_SCALE) / 4;
         g_pg.vp_scale[idx] = u2f(param);
-        g_pg.vconst[0x3A][idx] = u2f(param);   /* XFCTX_VPSCL, D3D's c[-38] */
+        vc_set(&g_pg.vconst[0x3A][idx], param);   /* XFCTX_VPSCL, D3D's c[-38] */
         return 1;
     }
 
@@ -5033,22 +6865,22 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
      * c[4..7], model-view n at c[8 + 8n], its inverse at c[12 + 8n]. */
     case NV097_SET_COMPOSITE_MATRIX ... NV097_SET_COMPOSITE_MATRIX + 0x3C: {
         uint32_t slot = (method - NV097_SET_COMPOSITE_MATRIX) / 4;
-        g_pg.vconst[0x00 + slot / 4][slot % 4] = u2f(param);
+        vc_set(&g_pg.vconst[0x00 + slot / 4][slot % 4], param);
         return 1;
     }
     case NV097_SET_PROJECTION_MATRIX ... NV097_SET_PROJECTION_MATRIX + 0x3C: {
         uint32_t slot = (method - NV097_SET_PROJECTION_MATRIX) / 4;
-        g_pg.vconst[0x04 + slot / 4][slot % 4] = u2f(param);
+        vc_set(&g_pg.vconst[0x04 + slot / 4][slot % 4], param);
         return 1;
     }
     case NV097_SET_MODEL_VIEW_MATRIX ... NV097_SET_MODEL_VIEW_MATRIX + 0xFC: {
         uint32_t slot = (method - NV097_SET_MODEL_VIEW_MATRIX) / 4;
-        g_pg.vconst[0x08 + (slot / 16) * 8 + (slot % 16) / 4][slot % 4] = u2f(param);
+        vc_set(&g_pg.vconst[0x08 + (slot / 16) * 8 + (slot % 16) / 4][slot % 4], param);
         return 1;
     }
     case NV097_SET_INVERSE_MODEL_VIEW_MATRIX ... NV097_SET_INVERSE_MODEL_VIEW_MATRIX + 0xFC: {
         uint32_t slot = (method - NV097_SET_INVERSE_MODEL_VIEW_MATRIX) / 4;
-        g_pg.vconst[0x0C + (slot / 16) * 8 + (slot % 16) / 4][slot % 4] = u2f(param);
+        vc_set(&g_pg.vconst[0x0C + (slot / 16) * 8 + (slot % 16) / 4][slot % 4], param);
         return 1;
     }
 

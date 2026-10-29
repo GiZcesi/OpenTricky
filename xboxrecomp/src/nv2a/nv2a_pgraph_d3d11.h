@@ -86,6 +86,12 @@ typedef int (*pgraph_draw_subst_fn)(uint32_t mode, const uint32_t *indices, uint
                                     const uint32_t offset[16], const uint32_t format[16],
                                     PgraphDrawSubst *out);
 void pgraph_d3d11_set_draw_subst(pgraph_draw_subst_fn fn);
+/* Fork: an observer of every program draw (pump thread), called before
+ * the substitution filter with the same arguments; it changes nothing.
+ * NULL (the default): not called. */
+typedef void (*pgraph_draw_observe_fn)(uint32_t mode, const uint32_t *indices, uint32_t count,
+                                       const uint32_t offset[16], const uint32_t format[16]);
+void pgraph_d3d11_set_draw_observe(pgraph_draw_observe_fn fn);
 /* The texture bound to stage 0..3 (offset and format registers), for a
  * substitution filter on the pump thread. */
 void pgraph_d3d11_tex_binding(int stage, uint32_t *offset, uint32_t *format);
@@ -148,6 +154,13 @@ typedef void (*pgraph_pass_phase_fn)(int old_phase, int new_phase, uint32_t tag)
 void pgraph_d3d11_set_pass_phase_callback(pgraph_pass_phase_fn fn);
 int  pgraph_d3d11_pass_phase(void);
 
+/* Image end (fork, online waiting banner): called on the pump thread at each
+ * presented image, after the title's last draw of that image and before the
+ * present, so what it draws on the default render target lies over the HUD
+ * and the menus. NULL (the default) = nothing called. */
+typedef void (*pgraph_image_end_fn)(void);
+void pgraph_d3d11_set_image_end_callback(pgraph_image_end_fn fn);
+
 /* Race HUD in its own proportions (the title side is
  * port/src/hud_anchor.c, which groups the HUD into elements and picks an
  * anchor for each). With the pass markers on, the title writes two HUD tags
@@ -185,6 +198,12 @@ void pgraph_d3d11_set_hud_scale(float kx, float ky);
 #define PGRAPH_PANEL_TAG_MAGIC   0x4858u
 #define PGRAPH_PANEL_TAG_MAGIC_R 0x4859u
 void pgraph_d3d11_set_box(float k);
+
+/* The HD HUD's gate of an image (fork; the title side is port/src/hud_anchor.c
+ * hud_anchor_hd_gate): PGRAPH_HDGATE_TAG_MAGIC in the 16 high bits, bits 0-1
+ * = the HDTEX_GATE_* bits (nv2a_hdtex.h), written at the start of each image;
+ * they hold for the draws that follow, up to the next such marker. */
+#define PGRAPH_HDGATE_TAG_MAGIC  0x485Au
 /* The race's own 2D outside the race HUD (finish banner, pause, end
  * screens) at the title's 4:3 proportions: the framed records of a wide
  * image are scaled by k2d = (4/3) / screen shape about the centre instead
@@ -197,6 +216,17 @@ void pgraph_d3d11_set_box_race2d(float k2d);
  * 0.75 for the 16:9 frame (default), 1 for the 4:3 frame (the menus at
  * 4:3: the image is already at the title's proportions). */
 void pgraph_d3d11_set_box_frame(float kboxed);
+/* How the terrain reads its lightmap (t1, an atlas of 8 x 8-texel tiles, one
+ * texel per patch vertex): 0 the title's bilinear read, 1 bounded Catmull-
+ * Rom (passes through the texels: the lighting is unchanged, only how finely
+ * it is interpolated), 2 cubic B-spline (hidden: it does not pass through the
+ * texels, so it moves the light on contrasted tiles), 5 the same B-spline
+ * from exact texel loads (diagnostic). All kept inside the patch's tile.
+ * Rendering only. Starts from XBOX_LIGHTMAP_FILTER=off|catmull|bspline|
+ * bspline-ref (default off);
+ * returns the mode now in use. */
+int  pgraph_d3d11_set_lightmap_filter(int mode);
+int  pgraph_d3d11_lightmap_filter(void);
 
 #endif /* NV2A_PGRAPH_D3D11_H */
 void pgraph_d3d11_present_guest_fb(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h);

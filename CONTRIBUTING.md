@@ -5,7 +5,7 @@ Thanks for helping! Bug reports, tests on different PCs, fixes and ideas are all
 ## Ground rules
 
 - **No game content, ever.** Never commit, attach or link a disc image (ISO), the game's executable (`default.xbe`), game data, music, video, or code generated from the game (`port/src/recomp/gen/`). Never ask for or offer these in issues or pull requests. Anything like that is removed, and the account may be blocked.
-- **Xbox fidelity first.** With every option at its default, the game must look and play like the original Xbox. New visual or gameplay extras must be optional, and off by default.
+- **The original game first.** OpenTricky must stay true to it: new visual or gameplay extras must be optional, and off in the *Original Xbox* preset.
 - **Test before you send.** Build with `build.bat` from your own disc image, then play the part of the game you changed. Say what you tested in the pull request.
 - **One change per pull request**, with a clear description. For a bug, link the issue.
 

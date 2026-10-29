@@ -60,6 +60,8 @@ void controls_get_current(ControlMap *m);
 BOOL controls_read_pad(DWORD port, ControlsPad *out);
 /* OR the keyboard's held bindings into `io` (port 0). */
 void controls_read_keyboard(ControlsPad *io);
+int  controls_fake_enabled(void);                      /* XBOX_INPUT_FAKEPAD=1 (test only) */
+int  controls_fake_press(const char *name, int ms);     /* "PAD:LB" / "KEY:Space"; 0 = unknown */
 
 /* Game input off while one of our own windows (menu, dialog) is in use. */
 void controls_set_suspended(BOOL on);

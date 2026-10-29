@@ -1,0 +1,19 @@
+<!-- The sidebar of the pages (home, settings), a template put in by name
+     ("side"); no tag of that name in a comment before the real one (RmlUi
+     reads the first). The icon of the page shown is "on" (page, set by the
+     launcher). -->
+<template name="side">
+<head></head>
+<body>
+    <div class="side">
+        <img class="emblem" data-if="have_disc" src="ot:emblem/$track$"/>
+        <div class="otb" data-if="!have_disc"><img src="ot:otbadge"/><span>OT</span></div>
+        <div class="nav n1" id="nav-home" data-class-on="page == 'home'" data-event-click="go('home')"><div class="bar"></div><img src="ot:icon/home"/></div>
+        <!-- Right of the gear: the page's main action at its left (PLAY, or the disc panel without a disc image). -->
+        <div class="nav n2" id="nav-settings" data-class-on="page == 'settings'" data-event-click="go('settings')"
+             data-style-nav-right="have_disc ? '#play' : '#drop'"><div class="bar"></div><img src="ot:icon/gear"/></div>
+        <div class="nav n3 soon"><img src="ot:icon/online"/></div>
+        <div class="nav nbug" id="nav-bug" data-event-click="bug"><img src="ot:icon/bug"/></div>
+    </div>
+</body>
+</template>

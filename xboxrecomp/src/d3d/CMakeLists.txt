@@ -7,6 +7,9 @@ if(WIN32)
         d3d8_device.c
         d3d8_post.c
         d3d8_softshadow.c
+        d3d8_extras_off.c   # the extras' calls when they are not built (port/extras.cmake)
+        d3d8_temporal.c
+        d3d8_rscale.c
         d3d8_gpuprof.c
         d3d8_sync.c
         d3d8_resources.c
@@ -16,6 +19,7 @@ if(WIN32)
         d3d8_combiners.c
         d3d8_nv2a.c
         d3d8_shcache.c
+        d3d8_shcompile.c
         d3d8_nv2a_vsh.c
         d3d8_vsh.c
     )
@@ -36,7 +40,7 @@ target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(MSVC)
     target_compile_options(xbox_d3d8 PRIVATE /W4 /O2)
 else()
-    target_compile_options(xbox_d3d8 PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+    target_compile_options(xbox_d3d8 PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 # Host test of the shader disk cache (no game, no D3D):

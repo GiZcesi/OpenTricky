@@ -252,6 +252,76 @@ static BYTE pad_value(const XINPUT_GAMEPAD *g, int src)
     return 0;
 }
 
+/* Test only: XBOX_INPUT_FAKEPAD=1 -- a virtual controller and keyboard on port 0, pressed from the
+ * diagnostic port (`press PAD:LB 700`, `press KEY:Space 300`). It stands where the physical XInput
+ * controller and the keyboard stand: its buttons go through the player's bindings (settings.ini
+ * [Controls]), then the game's own reading, PS2 button order included, exactly like a real one -- so a
+ * test sees what a player would get. The physical controllers and the keyboard are then ignored (also
+ * with XBOX_INPUT_HOST=0). Off by default. */
+static const struct { const char *name; WORD bit; int trig; } k_fake[] = {
+    { "A", XINPUT_GAMEPAD_A, 0 }, { "B", XINPUT_GAMEPAD_B, 0 }, { "X", XINPUT_GAMEPAD_X, 0 },
+    { "Y", XINPUT_GAMEPAD_Y, 0 }, { "LB", XINPUT_GAMEPAD_LEFT_SHOULDER, 0 },
+    { "RB", XINPUT_GAMEPAD_RIGHT_SHOULDER, 0 }, { "LT", 0, 1 }, { "RT", 0, 2 },
+    { "Start", XINPUT_GAMEPAD_START, 0 }, { "Back", XINPUT_GAMEPAD_BACK, 0 },
+    { "LS", XINPUT_GAMEPAD_LEFT_THUMB, 0 }, { "RS", XINPUT_GAMEPAD_RIGHT_THUMB, 0 },
+    { "DpadUp", XINPUT_GAMEPAD_DPAD_UP, 0 }, { "DpadDown", XINPUT_GAMEPAD_DPAD_DOWN, 0 },
+    { "DpadLeft", XINPUT_GAMEPAD_DPAD_LEFT, 0 }, { "DpadRight", XINPUT_GAMEPAD_DPAD_RIGHT, 0 },
+    /* sticks pushed all the way: trig 10..17 = left stick left, right, up, down, right stick the same */
+    { "LSLeft", 0, 10 }, { "LSRight", 0, 11 }, { "LSUp", 0, 12 }, { "LSDown", 0, 13 },
+    { "RSLeft", 0, 14 }, { "RSRight", 0, 15 }, { "RSUp", 0, 16 }, { "RSDown", 0, 17 },
+};
+#define NFAKE (sizeof k_fake / sizeof k_fake[0])
+static volatile DWORD s_fake_until[NFAKE];
+static volatile DWORD s_fake_key_until[256];
+
+int controls_fake_enabled(void)
+{
+    static int v = -1;
+    v = 0;                                      /* the real controllers, always */
+    return v;
+}
+
+int controls_fake_press(const char *name, int ms)
+{
+    DWORD until = GetTickCount() + (DWORD)(ms > 0 ? ms : 150);
+    size_t i;
+    if (!controls_fake_enabled()) return 0;
+    if (!_strnicmp(name, "PAD:", 4)) {
+        for (i = 0; i < NFAKE; i++)
+            if (!_stricmp(name + 4, k_fake[i].name)) { s_fake_until[i] = until; return 1; }
+        return 0;
+    }
+    if (!_strnicmp(name, "KEY:", 4)) {
+        BYTE vk = key_parse(name + 4);
+        if (!vk) return 0;
+        s_fake_key_until[vk] = until;
+        return 1;
+    }
+    return 0;
+}
+
+static void fake_state(XINPUT_STATE *st)
+{
+    DWORD now = GetTickCount();
+    size_t i;
+    for (i = 0; i < NFAKE; i++) {
+        if ((LONG)(s_fake_until[i] - now) <= 0) continue;
+        st->Gamepad.wButtons |= k_fake[i].bit;
+        switch (k_fake[i].trig) {
+        case 1: st->Gamepad.bLeftTrigger = 255; break;
+        case 2: st->Gamepad.bRightTrigger = 255; break;
+        case 10: st->Gamepad.sThumbLX = -32767; break;
+        case 11: st->Gamepad.sThumbLX = 32767; break;
+        case 12: st->Gamepad.sThumbLY = 32767; break;
+        case 13: st->Gamepad.sThumbLY = -32767; break;
+        case 14: st->Gamepad.sThumbRX = -32767; break;
+        case 15: st->Gamepad.sThumbRX = 32767; break;
+        case 16: st->Gamepad.sThumbRY = 32767; break;
+        case 17: st->Gamepad.sThumbRY = -32767; break;
+        }
+    }
+}
+
 BOOL controls_read_pad(DWORD port, ControlsPad *out)
 {
     XINPUT_STATE st;
@@ -260,7 +330,10 @@ BOOL controls_read_pad(DWORD port, ControlsPad *out)
 
     memset(out, 0, sizeof *out);
     memset(&st, 0, sizeof st);
-    if (port >= 4 || XInputGetState(port, &st) != ERROR_SUCCESS) return FALSE;
+    if (controls_fake_enabled()) {
+        if (port != 0) return FALSE;
+        fake_state(&st);
+    } else if (port >= 4 || XInputGetState(port, &st) != ERROR_SUCCESS) return FALSE;
     if (s_suspended) return TRUE;               /* connected, but idle for now */
     controls_get_current(&m);
     for (i = 0; i < CTL_PAD_COUNT; i++) {
@@ -322,9 +395,11 @@ void controls_read_keyboard(ControlsPad *io)
      * never a binding, and Alt+Enter (full screen) or Alt+Tab must not also
      * press what Enter or Tab is bound to (Start, Select). */
     front = GetForegroundWindow() == game && !(GetAsyncKeyState(VK_MENU) & 0x8000);
+    if (controls_fake_enabled()) front = FALSE;     /* test keyboard only */
     controls_get_current(&m);
     for (i = 0; i < CTL_COUNT; i++)
-        if (m.key[i] && ((front && (GetAsyncKeyState(m.key[i]) & 0x8000)) || autokey_held(m.key[i])))
+        if (m.key[i] && ((front && (GetAsyncKeyState(m.key[i]) & 0x8000)) || autokey_held(m.key[i])
+                         || (controls_fake_enabled() && (LONG)(s_fake_key_until[m.key[i]] - GetTickCount()) > 0)))
             apply(io, i, 255);
 }
 

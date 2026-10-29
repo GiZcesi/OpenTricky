@@ -71,30 +71,46 @@ static uint32_t mix(uint32_t a, uint32_t b, float t)
     return out;
 }
 
-static float luma(uint32_t c) { return 0.2126f * CH(c, 16) + 0.7152f * CH(c, 8) + 0.0722f * CH(c, 0); }
+/* WCAG 2: relative luminance of an sRGB colour, contrast ratio of two. */
+static float lin(float v) { return v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f); }
+static float rel_lum(uint32_t c) { return 0.2126f * lin(CH(c, 16)) + 0.7152f * lin(CH(c, 8)) + 0.0722f * lin(CH(c, 0)); }
+static float contrast(uint32_t a, uint32_t b)
+{
+    float la = rel_lum(a), lb = rel_lum(b);
+    return la > lb ? (la + 0.05f) / (lb + 0.05f) : (lb + 0.05f) / (la + 0.05f);
+}
+
+uint32_t ot_theme_ink(uint32_t acc)
+{
+    float h, l, s;
+    uint32_t dark;
+    to_hls(acc, &h, &l, &s);
+    dark = from_hls(h, 0.07f, 0.6f);
+    return contrast(acc, 0xFFFFFFFFu) >= contrast(acc, dark) ? 0xFFFFFFFFu : dark;
+}
 
 static const float s_track_pos[5] = { 0.0f, 0.30f, 0.62f, 0.88f, 1.0f };
 
 /* ── The tuned palette ───────────────────────────────────────────────
  * The colours of the approved mock-ups: accent (from the emblem), its dark
- * and light ends, PLAY's lettering, and the five stops of the background
- * (two main hues of the card). */
+ * and light ends, and the five stops of the background (two main hues of
+ * the card). The lettering on the accent follows from it (ot_theme_ink). */
 typedef struct {
-    uint32_t acc, dark, light, text;
+    uint32_t acc, dark, light;
     uint32_t grad[5];
 } Tuned;
 
 static const Tuned s_tuned[OT_TRACK_COUNT] = {
-    /* alas */ { 0xff6a1a, 0xc43d00, 0xff9a52, 0xffffff, { 0x030515, 0x090c34, 0x131b70, 0x00b5cb, 0x0be4fe } },
-    /* aloh */ { 0x2fc9d0, 0x0f7f8a, 0x7fe9ee, 0x06262a, { 0x03150a, 0x093319, 0x146f37, 0x2e479d, 0x425fc6 } },
-    /* elys */ { 0xd63a9c, 0x8f1866, 0xf07cc4, 0xffffff, { 0x140805, 0x30150c, 0x692d1a, 0xad1f72, 0xd92f94 } },
-    /* gari */ { 0x2a9dff, 0x1450b8, 0x5fd0ff, 0xffffff, { 0x001219, 0x012c3c, 0x026082, 0x2753a4, 0x396ecf } },
-    /* merq */ { 0x8fa3c4, 0x4a5d80, 0xc6d3ea, 0x0b0f18, { 0x030e16, 0x072335, 0x104d74, 0x1e37ad, 0x2f4cda } },
-    /* mesa */ { 0xff8c1a, 0xc45a00, 0xffb45e, 0x1f1004, { 0x180d01, 0x3a1f02, 0x7f4405, 0xb78014, 0xe6a422 } },
-    /* pipe */ { 0x6cc62e, 0x3a7f12, 0xa5e86e, 0x0b1805, { 0x0e1107, 0x222a13, 0x495b29, 0x4b9338, 0x64bb4d } },
-    /* snow */ { 0xe8222e, 0x9c0d16, 0xff6a6f, 0xffffff, { 0x170102, 0x380405, 0x7a090b, 0x9d5d2e, 0xc77a42 } },
-    /* toky */ { 0x7a4cff, 0x4120b8, 0xa98bff, 0xffffff, { 0x18000a, 0x3b0119, 0x800336, 0xaa4922, 0xd66233 } },
-    /* untr */ { 0xffc21a, 0xc48a00, 0xffdb6b, 0x1c1504, { 0x140412, 0x320a2d, 0x6c1761, 0x9e682d, 0xc88741 } },
+    /* alas */ { 0xff6a1a, 0xc43d00, 0xff9a52, { 0x030515, 0x090c34, 0x131b70, 0x00b5cb, 0x0be4fe } },
+    /* aloh */ { 0x2fc9d0, 0x0f7f8a, 0x7fe9ee, { 0x03150a, 0x093319, 0x146f37, 0x2e479d, 0x425fc6 } },
+    /* elys */ { 0xd63a9c, 0x8f1866, 0xf07cc4, { 0x140805, 0x30150c, 0x692d1a, 0xad1f72, 0xd92f94 } },
+    /* gari */ { 0x2a9dff, 0x1450b8, 0x5fd0ff, { 0x001219, 0x012c3c, 0x026082, 0x2753a4, 0x396ecf } },
+    /* merq */ { 0x8fa3c4, 0x4a5d80, 0xc6d3ea, { 0x030e16, 0x072335, 0x104d74, 0x1e37ad, 0x2f4cda } },
+    /* mesa */ { 0xff8c1a, 0xc45a00, 0xffb45e, { 0x180d01, 0x3a1f02, 0x7f4405, 0xb78014, 0xe6a422 } },
+    /* pipe */ { 0x6cc62e, 0x3a7f12, 0xa5e86e, { 0x0e1107, 0x222a13, 0x495b29, 0x4b9338, 0x64bb4d } },
+    /* snow */ { 0xe8222e, 0x9c0d16, 0xff6a6f, { 0x170102, 0x380405, 0x7a090b, 0x9d5d2e, 0xc77a42 } },
+    /* toky */ { 0x7a4cff, 0x4120b8, 0xa98bff, { 0x18000a, 0x3b0119, 0x800336, 0xaa4922, 0xd66233 } },
+    /* untr */ { 0xffc21a, 0xc48a00, 0xffdb6b, { 0x140412, 0x320a2d, 0x6c1761, 0x9e682d, 0xc88741 } },
 };
 
 void ot_theme_default(OtTheme *t)
@@ -106,7 +122,7 @@ void ot_theme_default(OtTheme *t)
     t->acc_dark = 0xFF1450B8;
     t->acc_light = 0xFF5FD0FF;
     t->glow = 0x592F8CFF;
-    t->play_text = 0xFFFFFFFF;
+    t->play_text = ot_theme_ink(t->acc);
     memcpy(t->grad, g, sizeof g);
     memcpy(t->grad_pos, pos, sizeof pos);
     t->grad_angle = 135.0f;
@@ -159,11 +175,7 @@ static void measure_accent(const OtImage *em, OtTheme *t)
         t->acc_light = from_hls(h, 0.85f, 0.45f);
     }
     t->glow = (t->acc & 0xFFFFFFu) | 0x66000000u;
-    {
-        float h, l, s;
-        to_hls(t->acc, &h, &l, &s);
-        t->play_text = luma(t->acc) > 0.45f ? from_hls(h, 0.07f, 0.6f) : 0xFFFFFFFFu;
-    }
+    t->play_text = ot_theme_ink(t->acc);
 }
 
 /* Median cut to `k` colours (largest box first, split at the median of its
@@ -285,7 +297,7 @@ void ot_theme_for_track(const OtDiscAssets *a, int track, bool tuned, OtTheme *t
         t->acc_dark = 0xFF000000u | u->dark;
         t->acc_light = 0xFF000000u | u->light;
         t->glow = 0x66000000u | u->acc;
-        t->play_text = 0xFF000000u | u->text;
+        t->play_text = ot_theme_ink(t->acc);
         for (i = 0; i < 5; i++) t->grad[i] = 0xFF000000u | u->grad[i];
         memcpy(t->grad_pos, s_track_pos, sizeof s_track_pos);
         t->grad_angle = 120.0f;

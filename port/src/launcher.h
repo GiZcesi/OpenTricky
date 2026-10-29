@@ -16,6 +16,9 @@
 
 #include "controls.h"
 
+/* HdTextures (settings.c k_hd_textures order): off, on (the pack, but the race HUD: HdHud). */
+enum { LAUNCHER_HD_OFF, LAUNCHER_HD_ON };
+
 typedef struct LauncherConfig {
     char iso[MAX_PATH];   /* disc image; empty until the player chooses one */
     char hdd[MAX_PATH * 3]; /* emulated hard disk folder, UTF-8 as in settings.ini: relative
@@ -36,7 +39,7 @@ typedef struct LauncherConfig {
      * launcher_fork_apply() as the XBOX_* variables the code already reads;
      * a variable already set in the environment wins. */
     int  smaa;            /* 0 off, 1..4 = low, medium, high, ultra (XBOX_SMAA, _PRESET) */
-    int  fidelity;        /* 1 = the Xbox fidelity fixes below (default); 0 = all off */
+    int  fidelity;        /* 1 = the Xbox fidelity fixes below (always, from settings.ini); 0 = all off */
     int  fix_cullwind;    /* XBOX_FIX_CULLWIND, .ini only, default 1 */
     int  fix_occlusion;   /* XBOX_FIX_OCCLUSION */
     int  fix_texpassthru; /* XBOX_FIX_TEXPASSTHRU */
@@ -49,11 +52,18 @@ typedef struct LauncherConfig {
                            * -2 = the monitor's refresh rate (XBOX_FPS_CAP=monitor) */
     int  sync;            /* XBOX_SYNC: 0 legacy (.ini only), 1 off, 2 vsync, 3 adaptive */
     int  soft_shadows;    /* XBOX_SOFT_SHADOWS: 0 = hard, as on Xbox (default), 1 = soft edges */
+    int  shadow_width;    /* XBOX_SOFT_SHADOW_WIDTH: the soft edge's width in percent, 40..150, 100 (default) */
     int  menu_sounds;     /* the game's menu sounds in the launcher: 0 off, 1 low (default), 2 medium
                            * ([Launcher] MenuSounds; an old 1 = "on" becomes low) */
     int  launcher_music;  /* the game's title music, quietly, in the launcher ([Launcher] LauncherMusic, 1) */
     int  draw_dist;       /* XBOX_DRAW_DISTANCE: 0 Original (default), 1 Far, 2 Max */
-    int  hd_textures;     /* XBOX_HD_TEXTURES: 0 = the game's textures (default), 1 = the pack's */
+    int  snow_look;       /* XBOX_SNOW_LOOK: 0 Original, 1 Soft = "ps2" (default) */
+    int  lightmap_smooth; /* XBOX_LIGHTMAP_FILTER: 0 off (default), 1 = catmull (terrain lightmap) */
+    int  render_scale;    /* XBOX_RENDER_SCALE: the 3D in percent, 50..200, 100 (default) = off */
+    int  hd_hud;          /* XBOX_HD_HUD: 1 = the race HUD from the HD HUD files the game ships
+                           * (hd-hud beside it; default), 0 = the game's own */
+    int  hd_textures;     /* XBOX_HD_TEXTURES: LAUNCHER_HD_OFF (default), _ON (the pack, all
+                           * but the race HUD, which is HdHud's: XBOX_HD_TEXTURES_HUD=0) */
     int  hd_menus;        /* XBOX_HD_TEXTURES_MENUS: 1 = menu pictures too (.ini only, default 0) */
     char hd_path[MAX_PATH]; /* the player's HD texture pack folder (absolute); empty = none chosen */
     int  menus;           /* XBOX_WIDE_MENUS: ASPECT_MENUS_169 or _43, default ASPECT_MENUS_DEFAULT;
@@ -65,7 +75,9 @@ typedef struct LauncherConfig {
     int  smooth_motion;   /* XBOX_FPS_INTERP: 1 = frames in between interpolated above 60 (default);
                            * a hidden setting, for troubleshooting */
     int  smooth_legs;     /* XBOX_FPS_SMOOTH_LEGS: 1 = legs and board smoothed in a carve (display only;
-                           * ADVANCED > EXPERIMENTAL "Smoother legs in turns", default 0, 0 in every preset) */
+                           * ADVANCED > SMOOTHING "Smoother legs in turns", default 1, 0 in Original Xbox) */
+    int  smooth_seams;    /* XBOX_TERRAIN_BLEND=2 + _WIDTH=0.75 + XBOX_TERRAIN_CLAMP=2 (terrain_seams.c): 1 = softer lines between
+                           * terrain pieces (display only; hidden SmoothTerrainSeams, default 1, 0 in Original Xbox) */
     int  unlock_all;      /* XBOX_UNLOCK_ALL: 1 = SaveProfile=unlockall, the game's own unlock-everything
                            * cheat on and the saves in <save folder>\UnlockAll (default 0, My save) */
 } LauncherConfig;
@@ -115,6 +127,10 @@ void launcher_resolve_path(const char *path, char *out, size_t out_sz);
 /* The install root, wide, without a trailing separator: where the game keeps
  * what it writes (CrashReports\, Screenshots\) and finds OpenTricky.exe. */
 BOOL launcher_install_root_w(WCHAR *out, size_t n);
+/* A player's game of this install is running (a named mutex, settings.h
+ * settings_instance_name): the launcher's PLAY says so instead of starting a
+ * second one. Only a mark, kept until the game ends: never a reason to stop. */
+void launcher_mark_running(void);
 /* Open a folder (created if missing) or a file in Explorer / its program. */
 void launcher_open_path(HWND owner, const char *path, BOOL folder);
 /* Display shapes. 21:9, 32:9 and Auto show the frame at the

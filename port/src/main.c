@@ -1,5 +1,5 @@
 /**
- * YOUR_GAME_NAME - Recompiled Game Entry Point
+ * OpenTricky - Recompiled Game Entry Point
  *
  * This is the Windows executable that hosts the recompiled game code.
  * It performs the following initialization sequence:
@@ -13,25 +13,24 @@
  * 7. Install VEH crash handler for diagnostics
  * 8. Call the game's original entry point (recompiled)
  *
- * Customize this file for your game:
- *   - Set YOUR_GAME_ENTRY_POINT to the XBE entry point address
- *   - Set YOUR_GAME_XBE_PATH to where the XBE file lives
- *   - Set YOUR_GAME_DIR to the game data directory
- *   - Add any CRT global pre-initialization your game needs
- *   - Customize the VEH handler for game-specific crash diagnosis
+ * The game's own values are the YOUR_GAME_* constants below (names kept
+ * from the template this file started from):
+ *   - YOUR_GAME_ENTRY_POINT: the XBE's entry point
+ *   - YOUR_GAME_XBE_PATH: the XBE among the extracted files
+ *   - YOUR_GAME_DIR: the folder of the extracted files
+ *   - YOUR_GAME_SAVE_DIR: the emulated Xbox hard disk (TDATA, UDATA)
+ *   - YOUR_GAME_ISO: the name of the default disc image
  *
- * XBE Details (fill in from xbe_parser output):
- *   Title:       YOUR_GAME_NAME
- *   Title ID:    0x00000000
+ * The XBE of SSX Tricky (USA):
+ *   Title:       SSX Tricky
+ *   Title ID:    0x45410004
  *   Base addr:   0x00010000
- *   Entry point: 0x00000000
- *   Code size:   ~??? KB (.text)
- *   Sections:    ?? (list them)
- *   Kernel imports: ??
+ *   Entry point: 0x00154218
+ *   Sections and kernel imports: in the output of xbe_parser
+ *   (xboxrecomp/tools/xbe_parser)
  */
 
 #include "apu/aci_mmio.h"
-#include "kernel/xbox_diag.h"
 #include "apu/apu.h"
 #include <windows.h>
 #include <mmsystem.h>   /* timeBeginPeriod/timeEndPeriod -- see the note in WinMain */
@@ -42,6 +41,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <io.h>         /* _open_osfhandle, _dup2: the log file's one handle */
+#include <fcntl.h>
+#include "kernel/xbox_logstats.h"
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
@@ -56,15 +58,14 @@
 bool nv2a_dac_trap_install(unsigned char *mem_base);
 bool nv2a_dac_handle_mmio(PCONTEXT ctx, unsigned int fault_xbox_va, int is_write);
 #include "pass_tags.h"
-#include "netplay/np_cmdlog.h"
-#include "netplay/np_ghost.h"
 #include "netplay/np_net.h"
-#include "netplay/np_racebench.h"
 /* Fork: read by the generated code (fix_deadflags.py), set in main(). One bit per
  * revived branch: 0x1 sub_00019468, 0x2 sub_000BE680, 0x4 sub_001281DB. */
 int g_fix_deadflags = 0x7;
 /* Read by the generated code (fix_kickwait.py), set in main(). */
 int g_fix_kickwait = 1;
+/* Fork: read by the generated code (fix_getwait.py), set in main(). */
+int g_fix_getwait = 1;
 /* Read by the generated code (fix_riderlist.py), set in main(). */
 int g_fix_riderlist = 1;
 /* Fork: read by the generated code (fix_speechhold.py), set in main(). */
@@ -97,21 +98,25 @@ void fork_riderlist_note(uint32_t kind, uint32_t race, uint32_t tick, uint32_t r
     fprintf(stderr, "[RIDERLIST] %s: ai=%u/%u players=%u/%u riders=%u at=%u tick=%u race=0x%08X (hits=%u)\n",
             what[kind], (unsigned)g_riderlist_ai_n, (unsigned)ai_exp, (unsigned)g_riderlist_pl_n,
             (unsigned)pl_exp, (unsigned)riders, (unsigned)at, (unsigned)tick, (unsigned)race, (unsigned)hits);
-    fflush(stderr);
+    xbox_log_flush();
 }
 #include "fps_cap.h"
+#include "frame_clock.h"
 #include "aspect.h"
 #include "drawdist.h"
 #include "terrain_seams.h"
+#include "lightmap_map.h"
 #include "ctlscheme.h"
+#include "smooth_stick.h"
 #include "ps2legend.h"
+#include "speedfx.h"
 #include "fullfade.h"
-#include "pumplag.h"
 #include "strmwalk.h"
 #include "chantfix.h"
+#include "riderlod.h"
 #include "hud_anchor.h"
 #include "nv2a/nv2a_hdtex.h"
-#include "ticktrace.h"
+#include "pumplag.h"
 
 /* Host display and EEPROM hooks; see d3d8_device.c and
  * kernel_bridge.c. */
@@ -122,26 +127,68 @@ void xbox_SetVideoFlags(uint32_t eeprom_video_flags);
 void d3d8_SetMsaa(int samples);
 /* Split 3D / overlay -- the translator's phase callback. */
 int  d3d8_post_split_wanted(void);
+int  d3d8_post_wanted(void);        /* fork: the phase callback is wanted (d3d8_post.c) */
+int  d3d8_rscale_wanted(void);      /* fork: render scale of the 3D (d3d8_rscale.h) */
 void d3d8_PassPhaseChanged(int old_phase, int new_phase, unsigned tag);
 void pgraph_d3d11_set_pass_phase_callback(void (*fn)(int, int, unsigned));
+void pgraph_d3d11_set_image_end_callback(void (*fn)(void));
 void d3d8_SetAnisotropy(int n);
 void d3d8_SetShowFps(int on);
-void d3d8_RequestScreenshot(const wchar_t *path);
-extern void (*g_diag_shot_hook)(const wchar_t *path);   /* xbox_diag.c `shot` */
-extern int (*g_diag_press_hook)(const char *name, int ms); /* xbox_diag.c `press` */
-int xinput_hle_press(const char *name, int ms);            /* xapi_input_hle.c */
-extern void (*g_diag_drawlog_hook)(int frames);            /* xbox_diag.c `drawlog` */
-void nv2a_drawlog_arm(int frames);                         /* nv2a_pgraph_d3d11.c */
-extern void (*g_diag_skipprog_hook)(uint32_t hash);        /* xbox_diag.c `skipprog` */
-void nv2a_skipprog_set(uint32_t h);                        /* nv2a_pgraph_d3d11.c */
-extern void (*g_diag_ignored_hook)(void);                  /* xbox_diag.c `ignored` */
-void nv2a_ignored_dump(void);                              /* nv2a_pgraph_d3d11.c */
+int  d3d8_bloom_wanted(void);
+int  d3d8_temporal_wanted(void);       /* fork: d3d8_temporal.h */
 
 /* Where this run's log goes (empty: no log), and whether a crash should be
  * explained in a message box -- only for the player, never in a test run,
  * where a dialog would hang the harness. */
 static char s_log_path[MAX_PATH];
 static BOOL s_crash_dialog = FALSE;
+
+/* The log file's buffers (stdout and stderr, 16 KB each), emptied every
+ * second by this thread. While it runs, xbox_log_flush (xbox_logstats.h)
+ * does nothing: the lines printed during play that flushed (input, file
+ * opens, fades, draw distance guards, video and present lines, audio) call
+ * it in place of fflush. A buffer is written on the printing thread when
+ * it is full, and at a plain fflush: start-up lines, lines not moved to
+ * xbox_log_flush, diagnostics turned on by their own variables, the crash
+ * and exit paths. A write holds the stream's lock: a thread that prints to
+ * that stream meanwhile waits for it (for good if a frozen thread holds
+ * the lock). */
+#define LOG_BUFFER (16 * 1024)
+
+static DWORD WINAPI log_flush_thread(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        Sleep(1000);
+        fflush(stdout);
+        fflush(stderr);
+    }
+    return 0;
+}
+
+/* stdout and stderr on the log file through one handle opened to append
+ * only: every write of either stream goes to the end of the file, done by
+ * the file system. Opened twice ("a" each), they were two handles with a
+ * file position each, and the runtime appends by moving to the end, then
+ * writing: two streams written at the same moment could land at the same
+ * place, one over the other (about a tenth of the bytes lost in a load test
+ * of both streams; none this way). The pattern of crashreport_set_output. */
+static BOOL log_open_shared(const char *path)
+{
+    HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    int fd;
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_TEXT);
+    if (fd < 0) { CloseHandle(h); return FALSE; }
+    if (!freopen("NUL", "w", stdout) || _dup2(fd, _fileno(stdout)) ||
+        !freopen("NUL", "w", stderr) || _dup2(fd, _fileno(stderr))) {
+        _close(fd);
+        return FALSE;
+    }
+    _close(fd);                         /* the two duplicates stay open */
+    return TRUE;
+}
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -168,8 +215,8 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* ── XBE Constants ─────────────────────────────────────────── */
 
 /*
- * TODO: Set these from your xbe_parser output.
- * Run: py -3 -m tools.xbe_parser game/default.xbe
+ * The game's values: its XBE's entry point (xbe_parser, in xboxrecomp/tools,
+ * gives it) and where its files are.
  */
 #define YOUR_GAME_ENTRY_POINT   0x00154218  /* SSX Tricky XBE entry point VA */
 #define YOUR_GAME_XBE_PATH      "game\\default.xbe"
@@ -462,11 +509,6 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    /* Live write-watches (xbox_diag) get first refusal on faults: a guarded
-     * page raises an access violation that is ours, not the title's, and the
-     * matching single-step is how the guard is re-armed. */
-    if (xbox_diag_handle_fault(ep))
-        return EXCEPTION_CONTINUE_EXECUTION;
 
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
@@ -730,6 +772,7 @@ static void boothang_hook(void)
     busy = 0;
 }
 
+
 /* ── WinMain ───────────────────────────────────────────────── */
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -747,7 +790,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("=== YOUR_GAME_NAME - Static Recompilation ===\n");
+    printf("=== OpenTricky - Static Recompilation ===\n");
     printf("OpenTricky %s\n", OT_VERSION);
     printf("Loading XBE...\n");
 
@@ -758,30 +801,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Install VEH handler (first handler in chain) */
     AddVectoredExceptionHandler(1, veh_handler);
 
-    /* Rider command log (XBOX_NETLOG=1). Off by default, and then
-     * recomp_lookup_manual() hands out none of its hooks. */
-    np_cmdlog_init();
 
-    /* Local ghost (XBOX_GHOST=<file.npcl>). Off by default. */
-    np_ghost_init();
-
-    /* Two instances over UDP (XBOX_NET=host | join:IP:port). Off
-     * by default; exclusive with the ghost (which is switched off). */
+    /* Online multiplayer (netplay/np_net.h). Off by default, and
+     * empty stubs in a build without it; exclusive with the ghost (which is
+     * switched off). */
     np_net_init();
-    if (g_np_net_on && g_np_ghost_on) {
-        fprintf(stderr, "[NET] XBOX_GHOST ignored: exclusive with XBOX_NET\n");
-        g_np_ghost_on = 0;
-    }
-
-    /* Replayed race for benchmarks (XBOX_RACEBENCH=<file.npcl>). Off by
-     * default; exclusive with the ghost and the network (both switched off). */
-    np_rb_init();
-    np_stuck_init();
-    if (g_np_rb_on && (g_np_ghost_on || g_np_net_on)) {
-        fprintf(stderr, "[RACEBENCH] XBOX_GHOST / XBOX_NET ignored: exclusive with XBOX_RACEBENCH\n");
-        g_np_ghost_on = 0;
-        g_np_net_on = 0;
-    }
+    /* Name tags over the other players' riders (online mode only; nothing offline). */
+    np_tags_init();
 
     /* Ask for a 1 ms scheduler tick.
      *
@@ -835,6 +861,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         use_config = !direct;
 
         if (use_config) {
+            launcher_mark_running();    /* a player's game (never a test run): PLAY in the launcher sees it */
             /* A relative DiscImage is relative to the install root, as in the
              * launcher: not to the working folder (bin\ on a double-click). */
             char why[512], iso[MAX_PATH];
@@ -894,14 +921,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         launcher_log_path(s_log_path, sizeof s_log_path);
         t = fopen(s_log_path, "w");
         if (t) fclose(t);
-        if (freopen(s_log_path, "a", stdout) && freopen(s_log_path, "a", stderr)) {
+        if (log_open_shared(s_log_path)) {
             SYSTEMTIME st;
-            setvbuf(stdout, NULL, _IONBF, 0);
-            setvbuf(stderr, NULL, _IONBF, 0);
+            HANDLE ft;
+            /* Buffered: unbuffered, the runtime wrote the file a character
+             * at a time, a system call each, partly on the pump thread
+             * (~0.8 ms per [VSH] report). The buffers reach the file every
+             * second (log_flush_thread), on exit and ExitProcess (the
+             * runtime), before the window closes the process (d3d8_HostExit)
+             * and before a crash or freeze report reads the log
+             * (crashreport.c). A kill from outside loses the last second. */
+            setvbuf(stdout, NULL, _IOFBF, LOG_BUFFER);
+            setvbuf(stderr, NULL, _IOFBF, LOG_BUFFER);
+            ft = CreateThread(NULL, 64 * 1024, log_flush_thread, NULL, 0, NULL);
+            if (ft) {
+                CloseHandle(ft);
+                g_xbox_log_flusher = 1;     /* xbox_log_flush: leave it to that thread */
+            } else {                    /* nothing would empty them: as before */
+                setvbuf(stdout, NULL, _IONBF, 0);
+                setvbuf(stderr, NULL, _IONBF, 0);
+            }
             GetLocalTime(&st);
             printf("SSX Tricky log, %04u-%02u-%02u %02u:%02u:%02u, OpenTricky %s\n",
                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, OT_VERSION);
             launcher_config_log();      /* the settings lines printed before the log opened, again */
+            /* The version, then the settings: the file's first lines (the FAQ
+             * says so). stderr's buffer can reach the file before the flush
+             * thread's first turn (a plain fflush, a full buffer). */
+            fflush(stdout);
         } else {
             s_log_path[0] = '\0';
         }
@@ -1004,12 +1051,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * through the launcher just above). 60 by default, and then
      * recomp_lookup_manual() hands out none of its hooks. */
     fps_cap_init();
+    /* The title's frame timer on an exact 60 Hz grid (frame_clock.h);
+     * XBOX_FRAME_CLOCK=0: the title's whole-millisecond expiries. */
+    frame_clock_init();
     /* Draw distance (XBOX_DRAW_DISTANCE, or DrawDistance in the
      * .ini through the launcher above). Original by default: no hook. */
     drawdist_init();
     /* Texture seams between terrain patches (terrain_seams.h): PC options,
      * off by default, and then nothing is hooked. */
     terrain_seams_init();
+    /* The lighting map seen from above for the ground mist (lightmap_map.h):
+     * off unless the veil / panel may ask for it; nothing of the title changes. */
+    lightmap_map_init();
     /* Control scheme: the button maps are served in the PS2 layout, lessons
      * included (ctlscheme.h); XBOX_CONTROL_SCHEME=xbox (debug only, never set
      * by the launcher) keeps the original files, nothing hooked. */
@@ -1017,11 +1070,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* and the loading screens' pad legend in the same layout (ps2legend.h);
      * the Basic Controls splash is always skipped. */
     ps2legend_init();
+    /* Stick dead zone (smooth_stick.h): Original by default, the reader as the
+     * game has it; Smooth only touches the Player's steering. */
+    smooth_stick_init();
     /* Full-screen fades (the respawn flash) reach the screen edges instead of
      * the TV safe area (XBOX_FULLSCREEN_FADES, on by default; see fullfade.h). */
     fullfade_init();
-    /* Mesh parts drawn after their constant block was rewritten
-     * (XBOX_PUMPLAG, diagnostic, off by default; see pumplag.h). */
+    /* Constant blocks rewritten before the pump draws them: the fix
+     * (XBOX_FIX_CONSTWAIT, on by default) and its diagnostic (see pumplag.h). */
     pumplag_init();
     /* EA stream reader: block search bounded to the ring (XBOX_FIX_STRMWALK,
      * on by default; see strmwalk.h). */
@@ -1029,6 +1085,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Crowd chant names: no pick past the end of a list (XBOX_FIX_CHANT,
      * on by default; see chantfix.h). */
     chantfix_init();
+    /* Riders always drawn with their most detailed model set
+     * (XBOX_RIDER_LOD_MAX, on by default; see riderlod.h). */
+    riderlod_init();
     /* HD textures (XBOX_HD_TEXTURES, or HdTextures + HdTexturesPath
      * in the .ini through the launcher above). Off by default: the translator
      * never looks at the index. The index the game carries is a resource. */
@@ -1037,6 +1096,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         HGLOBAL g = r ? LoadResource(NULL, r) : NULL;
         const char *text = g ? (const char *)LockResource(g) : NULL;
         if (text) hdtex_set_builtin_index(text, SizeofResource(NULL, r));
+        /* The HUD's font HD in the race only, nothing of the HD HUD in the
+         * pause: a gate per image (pass_tags_init above, hud_anchor_hd_gate). */
     }
     /* Fork: three branches the lifter cut from their flags, never taken until the
      * generated code got the condition back (fork pass fix_deadflags.py).
@@ -1068,6 +1129,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         const char *e = getenv("XBOX_FIX_KICKWAIT");
         g_fix_kickwait = !(e && e[0] == '0');
+    }
+    /* Fork: the push-buffer space wait (sub_0016B590) spins with `pause`, then sleeps
+     * until the pump publishes GET (XBOX_FIX_GETWAIT, default 1; 0 = the original bare
+     * loop). The call is in the generated code (fork pass fix_getwait.py), the wait in
+     * xbox_pfifo_get_wait (xbox_memory_layout.c). */
+    {
+        const char *e = getenv("XBOX_FIX_GETWAIT");
+        g_fix_getwait = !(e && e[0] == '0');
     }
     /* Bounded walk of the AI and Player lists in sub_0002F800
      * (XBOX_FIX_RIDERLIST, default 1). The guards are in the generated code (fork pass
@@ -1119,13 +1188,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         extern void gpuprof_init(void);
         gpuprof_init();
     }
-    /* Per-tick trace (XBOX_TICKTRACE), off by default. */
-    ticktrace_init();
     /* Post on the 3D only (XBOX_POST_SPLIT / XBOX_POST_CYCLE):
      * the translator calls back at each pass phase change, FRAME_END runs
-     * the post (see d3d8_post.h). Not registered otherwise. */
-    if (d3d8_post_split_wanted())
+     * the post (see d3d8_post.h). Not registered otherwise.
+     * The render scale of the 3D uses it too: the first HUD group of an
+     * image brings the 3D to the render size (d3d8_rscale.h); 100 % = not
+     * registered for it. The bloom and the temporal inputs too: one
+     * condition, d3d8_post_wanted(); every post effect off = no callback.
+     * The online name tags take the callback first: np_tags_phase runs the
+     * post at FRAME_END itself, then draws the tags. */
+    if (g_np_tags_on) {     /* online name tags: drawn at FRAME_END, after the post (np_tags_phase calls it) */
+        pgraph_d3d11_set_pass_phase_callback(np_tags_phase);
+        pgraph_d3d11_set_image_end_callback(np_tags_image_end);    /* the waiting banner, over the HUD */
+    }
+    else if (d3d8_post_wanted())
         pgraph_d3d11_set_pass_phase_callback(d3d8_PassPhaseChanged);
+    fprintf(stderr, "[POST] phase callback %s (split %d, render scale %d %%, bloom %d, temporal %d)\n",
+            d3d8_post_wanted() ? "on" : "off", d3d8_post_split_wanted(), d3d8_rscale_wanted(),
+            d3d8_bloom_wanted(), d3d8_temporal_wanted());
+    /* The speed effect's source (speedfx.h); the effect itself is off
+     * unless XBOX_SPEED_FX asks for it. */
+    speedfx_init();
 
     /* Step 1: Load the XBE -- from the mounted disc if there is one,
      * otherwise from the extracted game directory. Paths are resolved from
@@ -1220,8 +1303,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             nv2a_dac_trap_install((uint8_t *)(uintptr_t)g_xbox_mem_offset);
     }
 
-    /* Live diagnostics, if XBOX_DIAG_PORT is set. Started here so the guest
-     * address space and the pool table are already resolvable. */
     /*
      * Zero the guest's low page.
      *
@@ -1283,12 +1364,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         }
     }
 
-    g_diag_shot_hook = d3d8_RequestScreenshot;
-    g_diag_press_hook = xinput_hle_press;
-    g_diag_drawlog_hook = nv2a_drawlog_arm;
-    g_diag_skipprog_hook = nv2a_skipprog_set;
-    g_diag_ignored_hook = nv2a_ignored_dump;
-    xbox_diag_start();
     {   /* XBOX_PROFILE=START,SECONDS: see xboxrecomp/src/kernel/xbox_profile.c */
         extern void xbox_profile_start_from_env(void);
         xbox_profile_start_from_env();
@@ -1336,6 +1411,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
         xbox_path_init(game_dir, save_dir);
     }
+
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
     printf("Initializing kernel bridge...\n");
@@ -1527,7 +1603,9 @@ extern volatile unsigned g_last_loc;
 
 static LONG WINAPI recomp_crash_filter(EXCEPTION_POINTERS *ep)
 {
+    extern void d3d8_test_display_hz_restore(void);   /* d3d8_sync.h: test mode, no-op if unused */
     const EXCEPTION_RECORD *r = ep->ExceptionRecord;
+    d3d8_test_display_hz_restore();
     /* Report the module-relative address, which addr2line resolves exactly.
      *
      * g_last_loc is printed only as a hint, and it is deliberately *not*
@@ -1548,6 +1626,7 @@ static LONG WINAPI recomp_crash_filter(EXCEPTION_POINTERS *ep)
                 r->ExceptionInformation[0] ? "write to" : "read from",
                 (void *)r->ExceptionInformation[1]);
     }
+    fflush(stdout);                     /* the log file is buffered: all of it before the report reads it */
     fflush(stderr);
     {
         /* The report folder (crashreport.h). What only this thread can see
@@ -1569,6 +1648,7 @@ static LONG WINAPI recomp_crash_filter(EXCEPTION_POINTERS *ep)
                             g_icall_trace[(g_icall_trace_idx - 16 + k) & 15]);
         if (len > 0 && len < (int)sizeof details - 2) { details[len++] = '\n'; details[len] = 0; }
         if (crashreport_on_crash(ep, details, dir, MAX_PATH)) {
+            fflush(stderr);             /* its last line; the process ends without the runtime's exit */
             if (s_crash_dialog)
                 crashreport_crash_dialog(r->ExceptionCode, dir);
             return EXCEPTION_EXECUTE_HANDLER;

@@ -4,6 +4,7 @@
 #include "ot_render.h"
 
 #include <SDL3/SDL.h>
+#include "RmlUi_Include_GL3.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -17,6 +18,28 @@
 
 /* ── Textures ──────────────────────────────────────────────────────── */
 
+/* A picture (not a glyph page): RmlUi's GL3 renderer makes every texture
+ * with GL_LINEAR and GL_REPEAT, no mipmaps. A picture drawn smaller than it
+ * is (a 128 px button icon at 26 dp, the chamfer's 4x mask at 1x, a card in
+ * a rotated, blurred carpet) then skips texels: stair-stepped edges. Its
+ * mipmaps (built from the premultiplied texels, so no dark fringe) and
+ * trilinear filtering give each pixel the average it covers; edges clamp, so
+ * the linear filter never brings the opposite edge in (a picture is drawn
+ * once, never tiled). The pictures the launcher makes are made at their
+ * drawn size (make_texture): level 0, sampled 1:1. */
+static Rml::TextureHandle picture(Rml::TextureHandle h)
+{
+    if (!h) return h;
+    glBindTexture(GL_TEXTURE_2D, (GLuint)h);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return h;
+}
+
 static Rml::TextureHandle upload(RenderInterface_GL3 *ri, OtPixels &p, Rml::Vector2i &dim)
 {
     /* RmlUi composites with premultiplied alpha. */
@@ -25,7 +48,7 @@ static Rml::TextureHandle upload(RenderInterface_GL3 *ri, OtPixels &p, Rml::Vect
         for (int c = 0; c < 3; c++) p.rgba[i + c] = (unsigned char)((p.rgba[i + c] * a + 127) / 255);
     }
     dim = { p.w, p.h };
-    return ri->RenderInterface_GL3::GenerateTexture({ p.rgba.data(), p.rgba.size() }, dim);
+    return picture(ri->RenderInterface_GL3::GenerateTexture({ p.rgba.data(), p.rgba.size() }, dim));
 }
 
 /* Text: FreeType's glyph coverage is blended in the screen's (sRGB) space,
@@ -119,6 +142,14 @@ Rml::FileHandle OtFileInterface::Open(const Rml::String &path)
         size_t n = strlen(e);
         return path.size() > n && path.compare(path.size() - n, n, e) == 0;
     };
+    if (ends("launcher.rcss")) {
+        Rml::String tok = path.substr(0, path.size() - strlen("launcher.rcss")) + "tokens.rcss";
+        size_t tn = 0;
+        if (void *t = SDL_LoadFile(tok.c_str(), &tn)) {
+            f->data.insert(0, std::string((const char *)t, tn) + "\n");
+            SDL_free(t);
+        }
+    }
     if (ends(".rcss") || ends(".rml")) {
         for (const auto &kv : tokens) {
             size_t at = 0;
@@ -182,7 +213,11 @@ float shape_cover(const Shape &s, V p)
     float nx = (p.x - s.a.x) / s.b.x, ny = (p.y - s.a.y) / (s.kind == 2 ? s.b.x : s.b.y);
     float r = std::sqrt(nx * nx + ny * ny);
     if (s.kind == 2) return r <= 1.0f ? 1.0f : 0.0f;
-    float d = std::fabs(r - 1.0f) * std::min(s.b.x, s.b.y);
+    /* The distance to the ellipse, |r - 1| over the gradient of r: the same stroke
+     * width all around (|r - 1| times the smaller radius thickened the ends of a
+     * narrow ellipse, the globe's meridian, into points over its outline). */
+    float gx = nx / s.b.x, gy = ny / s.b.y, g = std::sqrt(gx * gx + gy * gy);
+    float d = r > 0 && g > 0 ? std::fabs(r - 1.0f) * r / g : std::min(s.b.x, s.b.y);
     return d <= half ? 1.0f : 0.0f;
 }
 
@@ -209,6 +244,15 @@ bool ot_draw_icon(const std::string &name, int size, OtPixels &out)
             float a = i * 3.14159265f / 4;
             sh.push_back({ 0, { 12 + 7.2f * std::cos(a), 12 + 7.2f * std::sin(a) },
                               { 12 + 9.2f * std::cos(a), 12 + 9.2f * std::sin(a) } });
+        }
+    } else if (name == "gear") {              /* Settings: a ring with eight square teeth on it, and its hole */
+        sh.push_back({ 1, { 12, 12 }, { 6.6f, 6.6f } });
+        sh.push_back({ 1, { 12, 12 }, { 2.6f, 2.6f } });
+        for (int i = 0; i < 8; i++) {          /* a tooth: two strokes side by side, as wide as long */
+            float a = i * 3.14159265f / 4, c = std::cos(a), s = std::sin(a);
+            for (float o : { -0.75f, 0.75f })
+                sh.push_back({ 0, { 12 + 7.0f * c - o * s, 12 + 7.0f * s + o * c },
+                                  { 12 + 9.2f * c - o * s, 12 + 9.2f * s + o * c } });
         }
     } else if (name == "update") {
         poly(sh, { { 12, 3.5f }, { 12, 15 } });
@@ -245,6 +289,29 @@ bool ot_draw_icon(const std::string &name, int size, OtPixels &out)
             unsigned char *o = &out.rgba[((size_t)y * size + x) * 4];
             o[0] = o[1] = o[2] = 255;
             o[3] = (unsigned char)(hit * 255 / (ss * ss));
+        }
+    return true;
+}
+
+/* The panels' chamfer (launcher.rcss, @spritesheet chamfer): a white mask of
+ * 192 x 192 texels, 4 per dp, its top-right and bottom-left corners cut at
+ * 45 degrees over 64 texels (16 dp), 4 x 4 samples per texel at the cut. The
+ * panels tint it with image-color; a ninepatch keeps the corners' size. */
+bool ot_draw_chamfer(OtPixels &out)
+{
+    const int n = 192, c = 64;
+    out.w = out.h = n;
+    out.rgba.assign((size_t)n * n * 4, 255);
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++) {
+            int in = 0;
+            for (int sy = 0; sy < 4; sy++)
+                for (int sx = 0; sx < 4; sx++) {
+                    float px = x + (sx + 0.5f) / 4, py = y + (sy + 0.5f) / 4;
+                    bool cut = (px - (n - c) > py) || (py - (n - c) > px);
+                    in += cut ? 0 : 1;
+                }
+            out.rgba[((size_t)y * n + x) * 4 + 3] = (unsigned char)((in * 255 + 8) / 16);
         }
     return true;
 }

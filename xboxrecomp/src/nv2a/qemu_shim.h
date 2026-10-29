@@ -21,6 +21,7 @@
 /* The QEMU shim uses Win32-style threading primitives. On Windows this comes
  * from <windows.h>; on POSIX it comes from win32_compat (via xbox_winnt.h). */
 #include "platform/xbox_winnt.h"
+#include "host_clock.h"
 
 /* ============================================================
  * Basic QEMU types
@@ -374,7 +375,7 @@ static inline int64_t qemu_clock_get_ns(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000000LL / freq.QuadPart);
+    return host_ticks_to_units(count.QuadPart, freq.QuadPart, 1000000000LL);
 }
 #define QEMU_CLOCK_VIRTUAL 0
 

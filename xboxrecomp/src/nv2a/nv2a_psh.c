@@ -49,6 +49,9 @@ typedef struct {
     Out rgb_out[8], alpha_out[8];
     In fin[7];
     int final_enabled, clamp_sum, inv_v1, inv_r0;
+    int relief_mask, in_dot;         /* textures read as a normal map by a dot product; reading a dot input now */
+    int snow;                        /* XBOX_SNOW_LOOK applies to this program (the terrain's) */
+    int lm;                          /* XBOX_LIGHTMAP_FILTER applies to t1: 1 Catmull-Rom, 2 B-spline */
     char varE[2304], varF[2304];
 } Ps;
 
@@ -111,6 +114,22 @@ static void get_input_var(const Ps *ps, In in, int is_alpha, char *out, size_t n
 {
     char reg[4800];
     get_var(ps, in.reg, 0, reg, sizeof reg);
+    if (!is_alpha && ps->in_dot && !in.chan && in.mod == 0x40 && in.reg >= 0x8 && in.reg <= 0xB
+        && (ps->relief_mask & (1 << (in.reg - 8)))) {
+        /* XBOX_SNOW_RELIEF: the normal map pulled toward the flat normal
+         * (0.5, 0.5, 1.0) -> (0, 0, 1) once expanded. The dot is linear, so
+         * this scales the relief term of N.L and leaves its flat part (the
+         * lighting of the smooth surface) as it was. */
+        char t[64], f[32];
+        snprintf(t, sizeof t, "%s", reg);
+        if (ps->snow)                     /* XBOX_SNOW_LOOK: the weight fades with depth (snow_rf) */
+            snprintf(f, sizeof f, "snow_rf");
+        else
+            snprintf(f, sizeof f, "%.2f", (100 - ps->st->relief_off) / 100.0);
+        snprintf(reg, sizeof reg, "lerp(float3(0.5, 0.5, 1.0), %s.rgb, %s)", t, f);
+        snprintf(out, n, "(2.0 * max(%s, 0.0) - 1.0)", reg);   /* mod 0x40, as below */
+        return;
+    }
     if (!is_alpha)
         strncat(reg, in.chan ? ".aaa" : ".rgb", sizeof reg - strlen(reg) - 1);
     else
@@ -141,6 +160,41 @@ static void get_output(const char *e, int mapping, char *out, size_t n)
 
 /* One channel of one general combiner stage: computations go to `code`, the
  * register writes to `assign` (emitted after both channels have read). */
+static int stage_samples(int mode);
+
+/* XBOX_SNOW_RELIEF: the dot3 relief of the terrain -- an RGB dot product of a
+ * sampled texture read with EXPAND_NORMAL (the normal map) and v0, the light
+ * vector the title packs into the vertex colour. Returns that texture stage,
+ * or -1. The riders' and boards' dots (normal map with r0 / v1, or a PASSTHRU
+ * stage that samples nothing) do not match and are left alone. */
+static int relief_dot(const Ps *ps, In a, In b)
+{
+    int k;
+    for (k = 0; k < 2; k++) {
+        In nm = k ? b : a, lv = k ? a : b;
+        if (!nm.chan && nm.mod == 0x40 && nm.reg >= 0x8 && nm.reg <= 0xB
+            && stage_samples(ps->tex_modes[nm.reg - 8]) && lv.reg == 0x4 && !lv.chan)
+            return nm.reg - 8;
+    }
+    return -1;
+}
+
+/* The texture stages that the general combiners read as a dot3 relief
+ * (relief_dot), as a bit mask. */
+static int relief_stages(const Ps *ps)
+{
+    In io[4];
+    Out oo;
+    int i, k, mask = 0;
+    for (i = 0; i < ps->num_stages; i++) {
+        parse_inputs(ps->st->rgb_in[i], io);
+        parse_output(ps->st->rgb_out[i], &oo);
+        if (oo.ab_op && (k = relief_dot(ps, io[0], io[1])) >= 0) mask |= 1 << k;
+        if (oo.cd_op && (k = relief_dot(ps, io[2], io[3])) >= 0) mask |= 1 << k;
+    }
+    return mask;
+}
+
 static void stage_code(Ps *ps, const In *in, const Out *o, int is_alpha, SB *code, SB *assign)
 {
     static char a[5000], b[5000], c[5000], d[5000], ab[10100], cd[10100], abm[10200], cdm[10200];
@@ -149,10 +203,13 @@ static void stage_code(Ps *ps, const In *in, const Out *o, int is_alpha, SB *cod
     const char *wm = is_alpha ? "a" : "rgb";
     const char *cast = is_alpha ? "" : "(float3)";
 
+    ps->in_dot = ps->relief_mask && o->ab_op && relief_dot(ps, in[0], in[1]) >= 0;
     get_input_var(ps, in[0], is_alpha, a, sizeof a);
     get_input_var(ps, in[1], is_alpha, b, sizeof b);
+    ps->in_dot = ps->relief_mask && o->cd_op && relief_dot(ps, in[2], in[3]) >= 0;
     get_input_var(ps, in[2], is_alpha, c, sizeof c);
     get_input_var(ps, in[3], is_alpha, d, sizeof d);
+    ps->in_dot = 0;
     snprintf(ab, sizeof ab, o->ab_op ? "dot(%s, %s)" : "(%s * %s)", a, b);
     snprintf(cd, sizeof cd, o->cd_op ? "dot(%s, %s)" : "(%s * %s)", c, d);
     get_output(ab, o->mapping, abm, sizeof abm);
@@ -254,6 +311,69 @@ static int stage_samples(int mode)
     }
 }
 
+/* XBOX_LIGHTMAP_FILTER. The terrain's lightmap (t1) is a 128 x 128 atlas of
+ * 16 x 16 tiles, one 8 x 8-texel tile per patch, and the title puts patch
+ * vertex (i, j) on the centre of texel (i, j) of the tile: sub_000F8A30
+ * writes (uvOffset + 1/256) x 32768 at the first vertex and (uvOffset +
+ * 1/16 - 1/256) x 32768 at the last, sub_000F8920 steps 256 (one texel)
+ * between. So floor(uv x 16) names the patch's tile everywhere on the patch.
+ * Coordinates below are in texel centres (texel k at k). Every tap is
+ * clamped to the centres of that tile, which repeats its edge texels: no
+ * tap reads the next tile of the atlas (another patch). The cubics are
+ * built from bilinear taps at combined positions (Sigg and Hadwiger, GPU
+ * Gems 2 ch. 20); clamping a pair's position to an edge centre gives the
+ * repeated edge exactly. Catmull-Rom passes through the texels (the vertex
+ * values) and is bounded by the 2 x 2 texels around the point, so it adds
+ * no step at the patch edges and no overshoot; the B-spline (all weights
+ * positive) is smoother but does not pass through them. */
+#define LM_TAP \
+    "float3 lm_tap(float2 x, float2 lo) {\n" \
+    "    return tex1.SampleLevel(smp1, (clamp(x, lo, lo + 7.0) + 0.5) / 128.0, 0.0).rgb;\n" \
+    "}\n"
+static const char lm_catmull[] =
+    LM_TAP
+    "float3 lm_filter(float2 uv) {\n"
+    "    float2 lo = floor(uv * 16.0) * 8.0, p = uv * 128.0 - 0.5, f = floor(p), t = p - f;\n"
+    "    float2 t2 = t * t, t3 = t2 * t;\n"
+    "    float2 w0 = -0.5 * t3 + t2 - 0.5 * t, w3 = 0.5 * t3 - 0.5 * t2;\n"
+    "    float2 w2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t, w12 = 1.0 - w0 - w3;\n"
+    "    float2 a = f - 1.0, b = f + w2 / w12, c = f + 2.0;\n"
+    "    float3 r = (lm_tap(float2(a.x, a.y), lo) * w0.x + lm_tap(float2(b.x, a.y), lo) * w12.x\n"
+    "                + lm_tap(float2(c.x, a.y), lo) * w3.x) * w0.y\n"
+    "             + (lm_tap(float2(a.x, b.y), lo) * w0.x + lm_tap(float2(b.x, b.y), lo) * w12.x\n"
+    "                + lm_tap(float2(c.x, b.y), lo) * w3.x) * w12.y\n"
+    "             + (lm_tap(float2(a.x, c.y), lo) * w0.x + lm_tap(float2(b.x, c.y), lo) * w12.x\n"
+    "                + lm_tap(float2(c.x, c.y), lo) * w3.x) * w3.y;\n"
+    "    float3 q0 = lm_tap(f, lo), q1 = lm_tap(f + float2(1.0, 0.0), lo);\n"
+    "    float3 q2 = lm_tap(f + float2(0.0, 1.0), lo), q3 = lm_tap(f + 1.0, lo);\n"
+    "    return clamp(r, min(min(q0, q1), min(q2, q3)), max(max(q0, q1), max(q2, q3)));\n"
+    "}\n";
+static const char lm_bspline[] =
+    LM_TAP
+    "float3 lm_filter(float2 uv) {\n"
+    "    float2 lo = floor(uv * 16.0) * 8.0, p = uv * 128.0 - 0.5, f = floor(p), t = p - f;\n"
+    "    float2 s = 1.0 - t, t2 = t * t, t3 = t2 * t;\n"
+    "    float2 w0 = s * s * s / 6.0, w1 = (4.0 - 6.0 * t2 + 3.0 * t3) / 6.0, w3 = t3 / 6.0;\n"
+    "    float2 g0 = w0 + w1, g1 = 1.0 - g0;\n"
+    "    float2 a = f - 1.0 + w1 / g0, b = f + 1.0 + w3 / g1;\n"
+    "    return (lm_tap(float2(a.x, a.y), lo) * g0.x + lm_tap(float2(b.x, a.y), lo) * g1.x) * g0.y\n"
+    "         + (lm_tap(float2(a.x, b.y), lo) * g0.x + lm_tap(float2(b.x, b.y), lo) * g1.x) * g1.y;\n"
+    "}\n";
+
+/* XBOX_LIGHTMAP_FILTER=bspline-ref (diagnostic, mode 5): the B-spline from 16
+ * exact texel loads, the reference for the 4-tap version above. */
+static const char lm_debug_ref[] =
+    "float3 lm_ld(float2 x, float2 lo) { int2 k = (int2)clamp(x, lo, lo + 7.0); return tex1.Load(int3(k, 0)).rgb; }\n"
+    "float4 lm_w(float t) { float s = 1.0 - t; return float4(s * s * s, 4.0 - 6.0 * t * t + 3.0 * t * t * t, 1.0 + 3.0 * t + 3.0 * t * t - 3.0 * t * t * t, t * t * t) / 6.0; }\n"
+    "float3 lm_row(float y, float f, float4 wx, float2 lo) {\n"
+    "    return lm_ld(float2(f - 1.0, y), lo) * wx.x + lm_ld(float2(f, y), lo) * wx.y + lm_ld(float2(f + 1.0, y), lo) * wx.z + lm_ld(float2(f + 2.0, y), lo) * wx.w;\n"
+    "}\n"
+    "float3 lm_filter(float2 uv) {\n"
+    "    float2 lo = floor(uv * 16.0) * 8.0, p = uv * 128.0 - 0.5, f = floor(p), t = p - f;\n"
+    "    float4 wx = lm_w(t.x), wy = lm_w(t.y);\n"
+    "    return lm_row(f.y - 1.0, f.x, wx, lo) * wy.x + lm_row(f.y, f.x, wx, lo) * wy.y + lm_row(f.y + 1.0, f.x, wx, lo) * wy.z + lm_row(f.y + 2.0, f.x, wx, lo) * wy.w;\n"
+    "}\n";
+
 static void tex_code(Ps *ps, int i, SB *decl, SB *v)
 {
     const Nv2aPshState *st = ps->st;
@@ -278,6 +398,12 @@ static void tex_code(Ps *ps, int i, SB *decl, SB *v)
             snprintf(co, sizeof co, "pT%d.xy", i);
             norm2(ps, i, co, nrm, sizeof nrm);
             sbf(v, "float4 t%d = tex%d.Sample(smp%d, %s / pT%d.w);\n", i, i, i, nrm, i);
+            if (i == 1 && ps->lm) {
+                /* XBOX_LIGHTMAP_FILTER: the lightmap's colour read with a
+                 * cubic instead of the bilinear; its alpha as it was. */
+                sbf(decl, "%s", ps->lm == 2 ? lm_bspline : ps->lm == 5 ? lm_debug_ref : lm_catmull);
+                sbf(v, "t1.rgb = lm_filter(%s / pT1.w);\n", nrm);
+            }
         }
         break;
     case MODE_CUBEMAP:
@@ -358,7 +484,7 @@ uint64_t nv2a_psh_key(const Nv2aPshState *st)
 int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
 {
     static Ps ps;
-    static char declbuf[4096], varsbuf[16384], codebuf[65536], asgbuf[16384];
+    static char declbuf[8192], varsbuf[16384], codebuf[65536], asgbuf[16384];
     SB out = { buf, size, 0, 0 }, decl = { declbuf, sizeof declbuf, 0, 0 };
     SB vars = { varsbuf, sizeof varsbuf, 0, 0 }, code = { codebuf, sizeof codebuf, 0, 0 };
     int i;
@@ -401,8 +527,48 @@ int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
         tex_code(&ps, 0, &decl, &vars);
         sbf(&code, "float4 fragColor = %s;\n", st->tex_enabled[0] ? "t0 * v0" : "v0");
     } else {
+        if (st->relief_off || st->relief_show || st->snow_look) {
+            /* XBOX_SNOW_RELIEF: find the terrain's normal maps (relief_dot):
+             * in this title the Xbox-only relief maps in t2. */
+            ps.relief_mask = relief_stages(&ps);
+        }
+        /* XBOX_SNOW_LOOK: the terrain program only -- its dot3 relief and a
+         * final combiner of lerp(t3, t0, t3.a) (the fog over the lit snow). */
+        ps.snow = ps.relief_mask && (st->snow_look || st->relief_show >= 5)
+                  && st->final0 == 0x1B080B00u && ps.tex_modes[0] != MODE_NONE;
+        if (st->lm_filter) {
+            /* XBOX_LIGHTMAP_FILTER: the same terrain program (a dot3 relief
+             * other than t1, the fog's final combiner), its t1 read in 2D.
+             * relief_mask itself is left as the snow settings made it. */
+            int rm = relief_stages(&ps);
+            if (rm && !(rm & 2) && st->final0 == 0x1B080B00u && ps.tex_modes[0] != MODE_NONE
+                && (ps.tex_modes[1] == MODE_PROJECT2D || ps.tex_modes[1] == MODE_PROJECT3D)
+                && !st->tex_cube[1] && !st->tex_rect[1])
+                ps.lm = st->lm_filter;
+            /* once per new shader: which programs with a 128 x 128 t1 take it */
+            fprintf(stderr, "[NV2A-PSH] lightmap filter %s: stages %08X final %08X/%08X combiners %08X\n",
+                    ps.lm ? "applied" : "not applied", st->shader_stage_program, st->final0, st->final1,
+                    st->combiner_control);
+        }
         for (i = 0; i < 4; i++)
             tex_code(&ps, i, &decl, &vars);
+        if (ps.relief_mask && st->relief_show)
+            sbf(&vars, "float4 rt0 = t0, rt1 = t1, rt2 = t2, rt3 = t3;\n");
+        if (ps.snow) {
+            /* The title lights the snow as colour x lightmap x (1 + v1), then
+             * N.L between full light and the c0 shade. The register clamp at
+             * 1 after (1 + v1) burns much of the snow to flat white, and the
+             * drawn trails of the colour texture with it. Here the colour
+             * enters at half, so nothing reaches the clamp (every later step
+             * is linear in t0), and comes back x2 with the exposure and a soft
+             * shoulder just before the fog. The relief weight goes from
+             * snow_relief near the camera to 0 at fade[1] (view depth w). */
+            double k = st->snow_look == 1 ? st->snow_relief / 100.0 : 0.0;
+            double n0 = st->snow_fade[0];
+            double n1 = st->snow_fade[1] > st->snow_fade[0] ? st->snow_fade[1] : n0 + 1.0;
+            sbf(&vars, "float snow_rf = %.3f * saturate((%.1f - i.pos.w) / %.1f);\n", k, n1, n1 - n0);
+            sbf(&vars, "t0.rgb *= 0.5;\n");
+        }
         sbf(&vars, "float4 r0 = float4(0.0, 0.0, 0.0, %s);\n",
             ps.tex_modes[0] != MODE_NONE ? "t0.a" : "1.0");
         sbf(&vars, "float4 r1 = float4(0.0, 0.0, 0.0, 0.0);\n");
@@ -445,6 +611,19 @@ int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
             get_input_var(&ps, ps.fin[2], 0, c, sizeof c);
             get_input_var(&ps, ps.fin[3], 0, d, sizeof d);
             get_input_var(&ps, ps.fin[6], 1, g, sizeof g);
+            if (ps.snow) {
+                /* t0 x 2 = the lit snow unclamped. Left as it was below the pivot
+                 * (the night tracks), scaled by the exposure above it, then
+                 * linear up to the knee and 1 - exp toward white (slope 1 at
+                 * the knee) instead of the clamp. */
+                double e = st->snow_expo / 100.0, pv = st->snow_pivot / 100.0, kn = st->snow_knee / 100.0;
+                if (kn > 0.99) kn = 0.99;
+                sbf(&code, "// snow look: exposure above the pivot, soft shoulder\n"
+                           "{ float3 s = t0.rgb * 2.0;\n"
+                           "  s = min(s, %.3f) + max(s - %.3f, 0.0) * %.3f;\n"
+                           "  t0.rgb = min(s, %.3f) + %.3f * (1.0 - exp(-max(s - %.3f, 0.0) / %.3f)); }\n",
+                    pv, pv, e, kn, 1.0 - kn, kn, 1.0 - kn);
+            }
             sbf(&code, "// final combiner\nfloat4 fragColor;\n");
             sbf(&code, "fragColor.rgb = %s + lerp((float3)(%s), (float3)(%s), (float3)(%s));\n",
                 d, c, b, a);
@@ -462,6 +641,22 @@ int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
         if (k >= 0 && k < 9 && (k < 7 || !st->simple))
             sbf(&code, "fragColor = float4(%s.rgb, 1.0);\n", regs[k]);
     }
+    if (ps.relief_mask && st->relief_show) {
+        /* XBOX_SNOW_RELIEF_SHOW (diagnostic), on the normal-mapped draws only:
+         * the raw textures as sampled, before any combiner. t0 colour, t1
+         * lightmap, the normal map (lowest masked stage). */
+        int nm = 0;
+        while (nm < 3 && !(ps.relief_mask & (1 << nm))) nm++;
+        switch (st->relief_show) {
+        case 1: sbf(&code, "fragColor = float4(rt0.rgb, 1.0);\n"); break;
+        case 2: sbf(&code, "fragColor = float4(rt0.rgb * rt1.rgb, 1.0);\n"); break;
+        case 3: sbf(&code, "fragColor = float4(rt%d.rgb, 1.0);\n", nm); break;
+        case 5: sbf(&code, "fragColor = float4(%s.xxx, 1.0);\n", ps.snow ? "snow_rf" : "0.0"); break;
+        case 6: sbf(&code, "fragColor = float4(saturate(log2(i.pos.w) / 16.0), saturate(-log2(i.pos.w) / 16.0), 0.0, 1.0);\n"); break;
+        case 7: sbf(&code, "fragColor = float4(rt0.rgb * rt1.rgb * (1.0 + v1.rgb) * 0.5, 1.0);\n"); break;
+        default: sbf(&code, "fragColor = float4(rt1.rgb, 1.0);\n"); break;
+        }
+    }
     if (st->flat)
         sbf(&code, "fragColor = c0[8];\n");
     if (st->alpha_t0z && st->flat)       /* a line along a debug edge: the last eighth of the ramp */
@@ -476,6 +671,37 @@ int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
             sbf(&code, "if (!((int)round(saturate(fragColor.a) * 255.0) %s (int)alpha_ref.x)) discard;\n",
                 ops[st->alpha_func & 7]);
     }
+    /* the Time Challenge ghost, after the alpha test (which keeps the
+     * title's alpha) */
+    if ((st->ghost & 3) == 3) {
+        /* one skin: what lies behind the ghost's own nearest surface (its
+         * depth pre-pass, t12) is dropped. Its look (d3d8_nv2a.c, b5): a
+         * tint shaded by its own light; in the silhouette pass (drawn where
+         * the scenery is in front of it), flat, never over the Player (its
+         * depth, t13); its outer edge (2 pixels of t12) brighter. */
+        sbf(&decl, "Texture2D<float> ghost_z : register(t12);\nTexture2D<float> ghost_pz : register(t13);\n"
+                   "cbuffer GhostLook : register(b5) { float4 ghost_tint; float4 ghost_x; };\n");
+        sbf(&code, "{ int2 gp = int2(i.pos.xy); float gz = ghost_z.Load(int3(gp, 0));\n"
+                   "  if (i.pos.z > gz + 0.000002) discard;\n"
+                   "  if (ghost_x.x > 0.5) {\n"
+                   "    if (ghost_pz.Load(int3(gp, 0)) <= i.pos.z) discard;\n"
+                   "    fragColor = float4(ghost_tint.w > 0.0 ? ghost_tint.rgb : float3(0.85, 0.9, 1.0), saturate(fragColor.a) * ghost_x.y);\n"
+                   "  } else {\n"
+                   "    bool gb = gz < 0.9999999;\n"          /* its body (in its depth): not its snow or trail */
+                   "    float gl = dot(saturate(fragColor.rgb), float3(0.299, 0.587, 0.114));\n"
+                   "    if (gb) fragColor.rgb = lerp(fragColor.rgb, ghost_tint.rgb * (0.35 + 0.65 * gl), ghost_tint.w);\n"
+                   "    fragColor.a = saturate(fragColor.a) * %d.0 / 63.0;\n"
+                   "    if (gb && ghost_x.z > 0.5) {\n"
+                   "      float ge = max(max(ghost_z.Load(int3(gp + int2(2, 0), 0)), ghost_z.Load(int3(gp - int2(2, 0), 0))),\n"
+                   "                     max(ghost_z.Load(int3(gp + int2(0, 2), 0)), ghost_z.Load(int3(gp - int2(0, 2), 0))));\n"
+                   "      if (ge >= 0.9999999) { fragColor.rgb = ghost_tint.w > 0.0 ? ghost_tint.rgb : float3(0.85, 0.9, 1.0); fragColor.a = ghost_x.w; }\n"
+                   "    }\n"
+                   "  }\n"
+                   "}\n", st->ghost >> 2);
+    } else if ((st->ghost & 3) == 1)
+        sbf(&code, "fragColor.a = saturate(fragColor.a) * %d.0 / 63.0;\n", st->ghost >> 2);
+    else if ((st->ghost & 3) == 2)
+        sbf(&code, "fragColor.a = 1.0 - %d.0 / 63.0 * (1.0 - saturate(fragColor.a));\n", st->ghost >> 2);
 
     sbf(&out, "%s%s", preamble, declbuf);
     sbf(&out, "float4 main(PSIn i) : SV_TARGET {\n");

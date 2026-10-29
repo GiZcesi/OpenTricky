@@ -20,6 +20,7 @@
  */
 #include "d3d8_internal.h"
 #include "d3d8_nv2a_vsh.h"
+#include "d3d8_temporal.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -82,7 +83,10 @@ static void src_expr(const vshcpu_insn *i, int k, char *out, size_t n)
     snprintf(out, n, "%s(%s)%s", i->src[k].neg ? "-" : "", base, sw);
 }
 
-static const char g_prelude[] =
+/* The prelude, in two parts around the end of the Params block: with
+ * XBOX_TEMPORAL (d3d8_temporal.h) a jitter vector is declared there; without
+ * it the text is exactly the one before (same shaders, same disk cache). */
+static const char g_prelude_a[] =
     "cbuffer Consts : register(b0) { float4 c[192]; };\n"
     "cbuffer Params : register(b1) {\n"
     "    float4 screen;      /* width, height, CLIP_MAX, oPts scale */\n"
@@ -90,7 +94,10 @@ static const char g_prelude[] =
     "    float4 flags;       /* specular enable, alpha from specular */\n"
     "    float4 vattr[16];   /* attributes with no array */\n"
     "    float4 ptparm;       /* size from oPts, fixed size, smooth */\n"
-    "    float4 hud;          /* HUD element: x scale, x anchor, y scale, y anchor; x scale < 0: a panel's ends, z w = its edges */\n"
+    "    float4 hud;          /* HUD element: x scale, x anchor, y scale, y anchor; x scale < 0: a panel's ends, z w = its edges */\n";
+static const char g_prelude_jit[] =
+    "    float4 jit;          /* temporal jitter of the image, NDC (0 outside its 3D) */\n";
+static const char g_prelude_b[] =
     "};\n"
     "struct VSOut {\n"
     "    float4 pos : SV_POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n"
@@ -134,10 +141,12 @@ int nv2a_vsh_hlsl(const vshcpu_insn *p, int n, uint16_t inputs, const uint8_t ki
                   int points, char *buf, int cap)
 {
     Sb b = { buf, buf + cap, 0 };
-    int k, a;
+    int k, a, jit = d3d8_temporal_wanted();
 
     if (points) sb(&b, "#define NV_POINTS 1\n");
-    sb(&b, "%s", g_prelude);
+    sb(&b, "%s", g_prelude_a);
+    if (jit) sb(&b, "%s", g_prelude_jit);
+    sb(&b, "%s", g_prelude_b);
     sb(&b, "struct VSIn {\n");
     for (a = 0; a < 16; a++) {
         if (!(inputs & (1u << a)) || (kind[a] & 0x0F) == NV2A_VSH_IN_CONST) continue;
@@ -261,7 +270,11 @@ int nv2a_vsh_hlsl(const vshcpu_insn *p, int n, uint16_t inputs, const uint8_t ki
        "    if (w >= 0) w = clamp(w, 5.421011e-20, 1.8446744e19); else w = clamp(w, -1.8446744e19, -5.421011e-20);\n"
        "    float rhw = 1.0 / w, wc = 1.0 / rhw;\n"
        "    o.pos = float4((x / screen.x * 2.0 - 1.0) * wc, (1.0 - y / screen.y * 2.0) * wc, z * wc, wc);\n"
-       "    if (!(nv_isfinite(x) && nv_isfinite(y) && nv_isfinite(z) && nv_isfinite(rhw))) o.pos = asfloat(0x7FC00000).xxxx;\n"
+       "    if (!(nv_isfinite(x) && nv_isfinite(y) && nv_isfinite(z) && nv_isfinite(rhw))) o.pos = asfloat(0x7FC00000).xxxx;\n");
+    /* the image's sub-pixel jitter, in clip space, after the 1/16 pixel snap
+     * (a NaN position stays NaN) */
+    if (jit) sb(&b, "    o.pos.xy += jit.xy * o.pos.w;\n");
+    sb(&b,
        "    o.d0 = nan1(O3);\n"
        "    o.d1 = nan1(O4);\n"
        "    if (flags.x == 0) o.d1 = float4(0, 0, 0, 1);\n"

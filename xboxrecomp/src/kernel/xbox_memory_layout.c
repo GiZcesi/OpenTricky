@@ -428,6 +428,84 @@ static int occ_wait_on(void)
     return on && !d3d8_pump_alt_off();     /* XBOX_FIX_PUMP_ALT=1: every other frame (identity test) */
 }
 
+/*
+ * Fork: the title's "wait for push-buffer space" loop (sub_0016B590,
+ * loc_0016B644; item 2 of the comment at the top of this file) rereads GET
+ * until the pump has translated enough of the ring. As a bare loop it kept a
+ * whole core busy: at a 60 fps cap more than half of the game thread's time.
+ * The generated loop now calls xbox_pfifo_get_wait between two reads (fork
+ * pass fix_getwait.py, switch XBOX_FIX_GETWAIT): it spins with `pause` for a
+ * short while, then sleeps on the GET cell until the pump publishes a new
+ * value. The loop still rereads GET and exits on exactly the same condition;
+ * only the time it takes to notice changes.
+ *
+ * Lost wake-ups: the waiter publishes the cell it sleeps on (full barrier)
+ * and WaitOnAddress compares the cell after registering; the pump stores GET,
+ * then a full barrier, then reads the published cell. Either the pump sees
+ * the waiter and wakes it, or the waiter sees the new GET and does not sleep.
+ * The 1 ms timeout is a safety net only.
+ *
+ * XBOX_GETWAIT_SPINS: number of `pause` rounds before sleeping (default 2048,
+ * a few tens of microseconds).
+ */
+static volatile uint32_t *volatile g_getwait_addr = NULL;
+
+void xbox_pfifo_get_wait(volatile uint32_t *get, uint32_t seen, uint32_t spins)
+{
+    static uint32_t limit = 0xFFFFFFFFu;
+    if (limit == 0xFFFFFFFFu) {
+        const char *e = getenv("XBOX_GETWAIT_SPINS");
+        limit = (e && e[0]) ? (uint32_t)strtoul(e, NULL, 0) : 2048u;
+        if (limit == 0xFFFFFFFFu) limit--;
+    }
+    if (spins < limit) {
+        YieldProcessor();
+        return;
+    }
+    InterlockedExchangePointer((PVOID volatile *)&g_getwait_addr, (PVOID)get);
+    WaitOnAddress((volatile VOID *)get, &seen, sizeof seen, 1);
+    g_getwait_addr = NULL;
+}
+
+/* Pump side: GET was just stored. */
+static void getwait_wake(void)
+{
+    volatile uint32_t *a;
+    MemoryBarrier();
+    a = g_getwait_addr;
+    if (a)
+        WakeByAddressAll((PVOID)a);
+}
+
+/* The pump has gone idle (no new PUT for two passes): submit the
+ * draws translated since the last submission (d3d8_IdleFlush), once. Without
+ * it the scene of a frame waited in the driver until the next Present.
+ * XBOX_PUMP_IDLE_FLUSH=0: off (diagnostic comparison only). Returns 1 if a
+ * flush was made. */
+static int pump_idle_flush(void)
+{
+    extern unsigned pgraph_d3d11_draws_pending(void);
+    extern unsigned d3d8_PresentSeq(void);
+    extern void d3d8_IdleFlush(void);
+    static int on = -1;
+    static unsigned flushed_at, flushed_seq;
+    unsigned pend, seq;
+    if (on < 0) {
+        const char *e = getenv("XBOX_PUMP_IDLE_FLUSH");
+        on = !(e && e[0] == '0');
+        fprintf(stderr, "[PUMP] XBOX_PUMP_IDLE_FLUSH=%d (draws submitted to the GPU when the pump goes idle)\n", on);
+    }
+    if (!on) return 0;
+    /* draws since the last Present (reset by it), and that Present's number */
+    pend = pgraph_d3d11_draws_pending();
+    seq = d3d8_PresentSeq();
+    if (!pend || (pend == flushed_at && seq == flushed_seq)) return 0;
+    flushed_at = pend;
+    flushed_seq = seq;
+    d3d8_IdleFlush();
+    return 1;
+}
+
 static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
 {
     uint8_t *mem_base = (uint8_t *)param;
@@ -530,8 +608,13 @@ static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
                 perf_pb_tick(mem_base);
 
             if (context) {
-                if (get_va)
-                    *(volatile uint32_t *)(mem_base + get_va) = put;
+                if (get_va) {
+                    volatile uint32_t *get = (volatile uint32_t *)(mem_base + get_va);
+                    uint32_t was = *get;
+                    *get = put;
+                    if (was != put)
+                        getwait_wake();
+                }
                 if (fstruct) {
                     /* Same two targets xbox_pfifo_sync_fence syncs, but the
                      * values sampled before translating. */
@@ -573,7 +656,9 @@ static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
             last_put = seen_put;
             idle = 0;
             SwitchToThread();
-        } else if (++idle < 8) {
+        } else if (++idle == 2 && pump_idle_flush()) {
+            SwitchToThread();
+        } else if (idle < 8) {
             SwitchToThread();
         } else if (occ_wait_on() && pgraph_d3d11_reports_pending()) {
             /* Fork: the title spins on a visibility-test report (LensFX's

@@ -29,11 +29,16 @@
 #include <xmmintrin.h>
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "xbox_logstats.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <float.h>
 #include <setjmp.h>
 static void trap_nan_check_path(const char *path);   /* XBOX_TRAP_NAN_FILE, below */
+
+/* xbox_logstats.h: set to 1 by the port's main.c once the log file's flush
+ * thread runs; xbox_log_flush() then leaves the flushing to it. */
+volatile long g_xbox_log_flusher;
 
 /* Implemented in nv2a/nv2a_live_pb.c; declared here the same way
  * xbox_memory_layout.c declares nv2a_live_pb_tick. */
@@ -284,18 +289,48 @@ static DWORD WINAPI xbox_tick_count_thread(LPVOID param)
 {
     /* From the performance counter, not GetTickCount: GetTickCount
      * advances in 15.6 ms steps however high the timer resolution is set, so
-     * the title's frame limiter measured each frame as 0, 15 or 31 ms. */
+     * the title's frame limiter measured each frame as 0, 15 or 31 ms.
+     *
+     * On each millisecond boundary of that counter, as the
+     * console's clock interrupt advances it. A Sleep(1) loop woke 1 to 2 ms
+     * apart: the value read lagged the real time by 0 to ~2 ms at random, and
+     * every reader of the title's millisecond clock (timeGetTime, the only
+     * one: its frame limiter, the audio stream thread's 10 ms deadlines, the
+     * video player) measured intervals off by as much -- the frame limiter's
+     * accumulator turned that into frames 14 to 19 ms apart. Now a
+     * high-resolution waitable timer wakes the thread just past each boundary
+     * (lag ~0.1 ms). XBOX_TICKCOUNT_PRECISE=0: the old Sleep(1) loop. */
     LARGE_INTEGER f, q0, q;
     DWORD base = GetTickCount();
+    HANDLE wt = NULL;
+    const char *e = getenv("XBOX_TICKCOUNT_PRECISE");
     (void)param;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&q0);
-    while (g_tick_thread_running) {
-        QueryPerformanceCounter(&q);
-        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) =
-            base + (DWORD)((q.QuadPart - q0.QuadPart) * 1000 / f.QuadPart);
-        Sleep(1);
+    if (!(e && e[0] == '0')) {
+        wt = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+        if (wt) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
+    fprintf(stderr, "  [KERNEL] KeTickCount: %s\n", wt ? "advanced on each millisecond boundary (high-resolution timer)"
+                                                     : "advanced by a Sleep(1) loop");
+    while (g_tick_thread_running) {
+        LONGLONG el;
+        QueryPerformanceCounter(&q);
+        el = q.QuadPart - q0.QuadPart;
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = base + (DWORD)(el * 1000 / f.QuadPart);
+        if (wt) {
+            /* relative due time (100 ns) to just past the next boundary */
+            LONGLONG next = (el * 1000 / f.QuadPart + 1) * f.QuadPart / 1000 + f.QuadPart / 50000;   /* + 20 us */
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)((double)(next - el) * 1e7 / (double)f.QuadPart);
+            if (due.QuadPart == 0) due.QuadPart = -1;
+            if (SetWaitableTimer(wt, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(wt, 5);
+            else Sleep(1);
+        } else {
+            Sleep(1);
+        }
+    }
+    if (wt) CloseHandle(wt);
     return 0;
 }
 
@@ -409,8 +444,10 @@ static long kernel_call_log_limit(void)
  * bridges earlier in the file, like bridge_KeSetTimer, can read it too. */
 static __thread int g_kernel_dispatch_slot = -1;
 
-/* Log counter - limit output to avoid flooding */
-static int g_kernel_call_count = 0;
+/* Log counter - limit output to avoid flooding. 64 bits and incremented
+ * atomically by every guest thread: a 32-bit int went negative after 2^31
+ * calls (undefined behaviour) and turned the per-call log back on. */
+static volatile LONG64 g_kernel_call_count = 0;
 
 /* Read Xbox stack arg as uint32_t.
  * After kernel_thunk_dispatch pops the dummy return address (g_esp += 4),
@@ -681,7 +718,7 @@ static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
 
-    if ((long)g_kernel_call_count <= kernel_call_log_limit()) {
+    if (g_kernel_call_count <= kernel_call_log_limit()) {
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
@@ -863,7 +900,7 @@ static void bridge_NtAllocateVirtualMemory(void)
     /* Read the base address hint (0 = let kernel choose) */
     uint32_t base_hint = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
 
-    if ((long)g_kernel_call_count <= kernel_call_log_limit()) {
+    if (g_kernel_call_count <= kernel_call_log_limit()) {
         fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: base=0x%08X size=%u type=0x%X prot=0x%X\n",
                 base_hint, size, alloc_type, protect);
         fflush(stderr);
@@ -888,7 +925,7 @@ static void bridge_NtAllocateVirtualMemory(void)
         /* MEM_COMMIT only, on an already-reserved region.
          * The memory is already committed by our bump allocator.
          * Don't change the base address - just return success. */
-        if ((long)g_kernel_call_count <= kernel_call_log_limit()) {
+        if (g_kernel_call_count <= kernel_call_log_limit()) {
             fprintf(stderr, "  [KERNEL] → MEM_COMMIT on existing region 0x%08X, no-op\n", base_hint);
             fflush(stderr);
         }
@@ -935,7 +972,7 @@ static void bridge_ExAllocatePool(void)
     uint32_t size = STACK_ARG(0);
     uint32_t xbox_va = xbox_HeapAlloc(size, 16);
 
-    if ((long)g_kernel_call_count <= kernel_call_log_limit()) {
+    if (g_kernel_call_count <= kernel_call_log_limit()) {
         fprintf(stderr, "  [KERNEL] ExAllocatePool: size=%u → Xbox VA 0x%08X\n",
                 size, xbox_va);
         fflush(stderr);
@@ -950,7 +987,7 @@ static void bridge_ExAllocatePoolWithTag(void)
     uint32_t tag = STACK_ARG(1);
     uint32_t xbox_va = xbox_HeapAlloc(size, 16);
 
-    if ((long)g_kernel_call_count <= kernel_call_log_limit()) {
+    if (g_kernel_call_count <= kernel_call_log_limit()) {
         fprintf(stderr, "  [KERNEL] ExAllocatePoolWithTag: size=%u tag='%c%c%c%c' → Xbox VA 0x%08X\n",
                 size,
                 (char)(tag & 0xFF), (char)((tag >> 8) & 0xFF),
@@ -1934,9 +1971,21 @@ static void bridge_KeSetTimer(void)
     due.LowPart = due_lo;
     due.HighPart = (LONG)due_hi;
 
+    /* The port may place this expiry itself (the title's frame
+     * timer on an exact 60 Hz grid, frame_clock.c). One-shot, relative only. */
+    if (g_xbox_ktimer_due_filter && period == 0 && due.QuadPart < 0) {
+        LONGLONG q = g_xbox_ktimer_due_filter(timer_va, -due.QuadPart);
+        if (q > 0) {
+            g_eax = (uint32_t)xbox_KeSetTimerAtQpc(t, q);
+            ReleaseSRWLockExclusive(&g_ktimer_lock);
+            return;
+        }
+    }
     g_eax = (uint32_t)xbox_KeSetTimerEx(t, due, period, NULL);
     ReleaseSRWLockExclusive(&g_ktimer_lock);
 }
+
+LONGLONG (*g_xbox_ktimer_due_filter)(uint32_t timer_va, LONGLONG rel_100ns);
 
 /* ── ExQueryPoolBlockSize (ordinal 24) ────────────────────
  * ULONG ExQueryPoolBlockSize(PVOID PoolBlock)
@@ -2279,7 +2328,7 @@ static NTSTATUS bridge_create_file_impl(
             fprintf(stderr, "\n");
         }
     }
-    fflush(stderr);
+    xbox_log_flush();
     trap_nan_check_path(name.Buffer);
     memset(&ios, 0, sizeof(ios));
 
@@ -2288,7 +2337,7 @@ static NTSTATUS bridge_create_file_impl(
 
     fprintf(stderr, "  [FILE] create/open: path=\"%s\" -> status=0x%08X iso=%d\n", name.Buffer, (uint32_t)st,
             xbox_iso_handles_in_use());
-    fflush(stderr);
+    xbox_log_flush();
 
     if (NT_SUCCESS(st)) {
         if (xbox_dir_context_bound(h)) {
@@ -2452,13 +2501,8 @@ static void bridge_NtReadFile(void)
         if (stats < 0) { const char *e = getenv("XBOX_READ_STATS"); stats = e && e[0] == '1'; }
         if (stats) { if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a); }
         {
-            /* A diag write-watch on the destination would make ReadFile fail
-             * with ERROR_NOACCESS; lift it for the read (xbox_diag.c). */
-            extern int xbox_diag_watch_host_write(uint32_t va, uint32_t len, int begin);
-            int wl = xbox_diag_watch_host_write(buffer_va, length, 1);
             g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                         XBOX_TO_NATIVE(buffer_va), length, poff);
-            if (wl) xbox_diag_watch_host_write(buffer_va, length, 0);
         }
         if (stats) {
             double t;
@@ -4461,12 +4505,12 @@ static void kernel_thunk_dispatch(void)
         }
     }
 
-    g_kernel_call_count++;
+    InterlockedIncrement64(&g_kernel_call_count);
     if ((unsigned)ordinal < KERNEL_ORD_SLOTS) g_ord_hist[ordinal]++;
 
-    if ((long)g_kernel_call_count <= kernel_call_log_limit()) {
-        fprintf(stderr, "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X\n",
-                g_kernel_call_count, ordinal, slot, g_esp);
+    if (g_kernel_call_count <= kernel_call_log_limit()) {
+        fprintf(stderr, "  [KERNEL] #%lld: ordinal %u (slot %d) esp=0x%08X\n",
+                (long long)g_kernel_call_count, ordinal, slot, g_esp);
         fflush(stderr);
     }
 
@@ -4474,9 +4518,9 @@ static void kernel_thunk_dispatch(void)
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
-        if (now - last_summary_tick >= 3000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %d total calls, guest esp=0x%08X\n",
-                    g_kernel_call_count, g_esp);
+        if (now - last_summary_tick >= 3000 && g_kernel_call_count > 200 && xbox_log_stats()) {
+            fprintf(stderr, "  [KERNEL] summary: %lld total calls, guest esp=0x%08X\n",
+                    (long long)g_kernel_call_count, g_esp);
             bridge_report_ordinals();
             {   /* The simulated x87 top is now shared between lifted fragments.
                  * Real code keeps it inside an eight-register window; unbounded
@@ -4526,7 +4570,7 @@ static void kernel_thunk_dispatch(void)
      * above; now pop the args. */
     g_esp += g_slot_arg_bytes[slot];
 
-    if ((long)g_kernel_call_count <= kernel_call_log_limit()) {
+    if (g_kernel_call_count <= kernel_call_log_limit()) {
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
         fflush(stderr);
     }

@@ -22,12 +22,16 @@
 #include "recomp/recomp_types.h"
 #include "pass_tags.h"
 #include "hud_anchor.h"
+#include "nv2a/nv2a_hdtex.h"
+#include "netplay/np_net.h"
+#include "../../xboxrecomp/src/kernel/xbox_logstats.h"
 
 extern void sub_00105CE0(void);     /* SceneRenderer_RenderFrame */
 extern void sub_000FAAE0(void);     /* GfxContext_ApplyStateBlock */
 extern void sub_000FE940(void);     /* GfxContext_SetOrthographicViewAndApply */
 
 int g_pass_tags_mode = PASS_TAGS_OFF;
+static int s_hd_gate;               /* the HD HUD on: a gate marker at each image (hud_anchor_hd_gate) */
 
 /* ── Noyau ───────────────────────────────────────────────────── */
 
@@ -73,6 +77,16 @@ int pass_tags_add_sink(const pass_tags_sink *s)
 {
     if (s_nsinks >= PT_MAX_SINKS) return 0;
     s_sinks[s_nsinks++] = s;
+    return 1;
+}
+
+int pass_tags_add_sink_first(const pass_tags_sink *s)
+{
+    int i;
+    if (s_nsinks >= PT_MAX_SINKS) return 0;
+    for (i = s_nsinks; i > 0; i--) s_sinks[i] = s_sinks[i - 1];
+    s_sinks[0] = s;
+    s_nsinks++;
     return 1;
 }
 
@@ -143,7 +157,7 @@ static void pt_check_esp(uint32_t esp0, uint32_t popped)
 
 static void hook_105CE0(void)
 {
-    uint32_t gfx = g_ecx, esp0 = g_esp, refl = 0, p, i, frame_tag;
+    uint32_t gfx = g_ecx, esp0 = g_esp, refl = 0, p, i, frame_tag, hd_tag;
     pass_tag_event ev;
 
     if (!pt_enter(0)) {
@@ -161,6 +175,7 @@ static void hook_105CE0(void)
 
     s_st.frame++;
     frame_tag = (g_hud_anchor_on || g_box_on || g_race2d_on || g_panel_on) ? hud_anchor_frame() : 0;   /* HUD tags recomputed per frame */
+    hd_tag = s_hd_gate ? (HUD_TAG_MAGIC_HDGATE << 16) | hud_anchor_hd_gate() : 0;   /* this image's HD HUD gate */
     s_st.event = 0;
     s_st.in_frame = 1;
     s_st.grp_open = 0;
@@ -180,6 +195,13 @@ static void hook_105CE0(void)
         ev.extra = frame_tag;
         pt_dispatch(&ev);
     }
+    if (hd_tag) {
+        memset(&ev, 0, sizeof ev);
+        ev.type  = PT_EV_HUD;
+        ev.view  = PASS_TAG_VIEW_NONE;
+        ev.extra = hd_tag;
+        pt_dispatch(&ev);
+    }
     if (s_st.frame % 60u == 0) {
         for (i = 0; i < (uint32_t)s_nsinks; i++)
             if (s_sinks[i]->flush) s_sinks[i]->flush();
@@ -188,6 +210,8 @@ static void hook_105CE0(void)
 
     g_ecx = gfx;
     sub_00105CE0();
+    /* online name tags: this image's tags, kept under its frame number for its FRAME_END */
+    if (g_np_tags_on) np_tags_frame(s_st.frame);
 
     {
         uint32_t sv_eax = g_eax, sv_edx = g_edx;
@@ -310,7 +334,7 @@ static void hook_FAAE0(void)
 {
     uint32_t gfx = g_ecx, esp0 = g_esp, blk = MEM32(g_esp + 4u);
 
-    if (pt_enter(1)) {
+    if (g_pass_tags_mode && pt_enter(1)) {
         s_cnt.h2++;
         pt_note_record(gfx, blk);
         pt_leave();
@@ -355,6 +379,7 @@ call:
 
 void (*pass_tags_lookup(uint32_t xbox_va))(void)
 {
+    if (!g_pass_tags_mode) return 0;
     if (xbox_va == 0x00105CE0u) return hook_105CE0;
     if (xbox_va == 0x000FAAE0u) return hook_FAAE0;
     if (xbox_va == 0x000FE940u) return hook_FE940;
@@ -650,7 +675,12 @@ static void emit_event(const pass_tag_event *ev)
     PUSH32(g_esp, ctx);                 /* argument: the pushbuffer context */
     PUSH32(g_esp, 0);                   /* dummy return address */
     sub_0016B920();                     /* ret 4: pops the 8 bytes */
-    if (g_esp != esp0) { s_emit.esp_bad++; g_esp = esp0; }
+    if (g_esp != esp0) {                /* an error: written when it happens (the first 20) */
+        if (s_emit.esp_bad++ < 20u)
+            fprintf(stderr, "[PASS-TAGS] emit: esp off by %d bytes after sub_0016B920, put back\n",
+                    (int)(g_esp - esp0));
+        g_esp = esp0;
+    }
     wp = g_eax;
     MEM32(wp) = 0x00040100u;            /* NV097_NO_OPERATION, 1 parameter, subchannel 0 */
     MEM32(wp + 4u) = tag;
@@ -661,7 +691,7 @@ static void emit_event(const pass_tag_event *ev)
 static void emit_flush(void)
 {
     static unsigned n;
-    if (++n % 10u) return;              /* ~ every 600 frames */
+    if (++n % 10u || !xbox_log_stats()) return;    /* ~ every 600 frames, XBOX_LOG_STATS=1 */
     fprintf(stderr, "[PASS-TAGS] emit: %llu markers written; skipped: %llu out of frame, "
             "%llu while recording, %llu without context; esp_bad %llu\n",
             s_emit.written, s_emit.skipped_noframe, s_emit.skipped_recording,
@@ -689,6 +719,36 @@ void pass_tags_init(void)
     }
     /* Proportional HUD needs the markers (phase + HUD tags). */
     if (g_hud_anchor_on || g_box_on || g_race2d_on || g_panel_on) split = 1;
+    /* So does a render scale other than 100 %: the 3D is brought to the
+     * render size at the first HUD group of each image (d3d8_rscale.h). */
+    {
+        extern int d3d8_rscale_wanted(void);
+        if (d3d8_rscale_wanted() != 100) split = 1;
+    }
+    /* And the speed blur and the vignette, a post at FRAME_END (d3d8_speedfx.h). */
+    {
+        extern int d3d8_speedfx_wanted(void);
+        extern int d3d8_bloom_wanted(void);
+        if (d3d8_speedfx_wanted()) split = 1;
+        /* and the selective bloom, which knows its lights by their group */
+        if (d3d8_bloom_wanted()) split = 1;
+    }
+    /* And the distance veil, a pass at the particles' group marker (d3d8_veil.h). */
+    {
+        extern int d3d8_VeilWanted(void);
+        if (d3d8_VeilWanted()) split = 1;
+    }
+    /* And the temporal inputs (XBOX_TEMPORAL): the jitter of the 3D, its
+     * end at FRAME_END, the groups of the reactive mask (d3d8_temporal.h). */
+    {
+        extern int d3d8_temporal_wanted(void);
+        if (d3d8_temporal_wanted()) split = 1;
+    }
+    /* Online name tags: drawn at the FRAME_END marker of their image. */
+    if (g_np_tags_on) split = 1;
+    /* And the HD HUD: its fonts and atlases follow each image's gate marker
+     * (hud_anchor_hd_gate; none of it in the pause). */
+    if (hdtex_configured()) split = s_hd_gate = 1;
     if (!split && (!e || !*e || !strcmp(e, "0") || !strcmp(e, "off"))) {
         g_pass_tags_mode = PASS_TAGS_OFF;
         return;
@@ -699,7 +759,8 @@ void pass_tags_init(void)
     if (split && !want_emit) {
         want_emit = 1;
         fprintf(stderr, "[PASS-TAGS] emit turned on by %s\n", g_hud_anchor_on
-                ? "the proportional HUD" : "XBOX_POST_SPLIT (3D post at the FRAME_END marker)");
+                ? "the proportional HUD" : g_np_tags_on ? "the online name tags"
+                : "XBOX_POST_SPLIT (3D post at the FRAME_END marker)");
     }
     if (!want_log && !want_emit) {
         fprintf(stderr, "[PASS-TAGS] XBOX_PASS_TAGS=%s unknown (0 | log | emit | log+emit): off\n", e);
@@ -709,6 +770,7 @@ void pass_tags_init(void)
     if (want_log) log_open();
     if (want_emit) {
         pass_tags_add_sink(&s_sink_emit);
+        if (s_hd_gate) hdtex_set_frame_gate(1);
         fprintf(stderr, "[PASS-TAGS] emit mode: NOP markers 0x5358xxxx in the pushbuffer\n");
     }
     g_pass_tags_mode = !s_nsinks ? PASS_TAGS_OFF : want_emit ? PASS_TAGS_EMIT : PASS_TAGS_LOG;

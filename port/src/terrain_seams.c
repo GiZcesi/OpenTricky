@@ -622,15 +622,18 @@ void terrain_seams_note(uint32_t obj, uint32_t vb, uint32_t pidx)
 /* ---- the pump side ---- */
 
 static uint32_t s_l8[112];      /* the title's 8x8 strip with no edge remapped */
-/* host buffer: the slot's 64 vertices, then 4 x 64 copies carrying a
- * neighbour's placement (vertex numbers 64 (1 + edge) + node), then the
- * per-vertex alphas: 64 floats per edge for the slot's own vertices, then 64
- * per edge for the copies */
+/* host buffer: the slot's 64 vertices, then 4 x 64 copies, one per blended
+ * edge (vertex numbers 64 (1 + edge) + node: the patch's own vertices, or
+ * with a neighbour's placement), then the per-vertex alphas: 64 floats per
+ * edge for the slot's own vertices (debug lines), then 64 per edge for the
+ * copies (the blends: one base of weights for every edge, so that the edges
+ * of the same state are drawn together) */
 #define ALTV        SLOT_BYTES
 #define WEIGHTS     (5u * SLOT_BYTES)
 #define WALT        (WEIGHTS + 4u * 256u)
-static uint8_t s_vbuf[WALT + 4u * 256u], s_recbuf[REC_SIZE];
+#define VBUF_BYTES  (WALT + 4u * 256u)
 static uint32_t s_bl[4][98 * 3];
+static uint32_t s_cat[4 * 98 * 3];      /* the blends of a group of edges, one after the other */
 
 /* the textures the pump has seen bound for each snow (t0) / normal map (t2)
  * number of the level's patches */
@@ -753,7 +756,6 @@ static int edge_rows(int e, int nd)     /* rows of nodes between node nd and edg
     int i = nd % 8, j = nd / 8;
     return e == 0 ? j : e == 1 ? 7 - i : e == 2 ? 7 - j : i;
 }
-static uint32_t s_ibuf[112];
 static uint32_t s_ov[SEAM_KINDS + 2][98 * 3];
 
 /* lightmap atlases as the pump sees them bound (t1) for each atlas number */
@@ -762,8 +764,80 @@ static struct { uint32_t gen, off[ATLN], fmt[ATLN]; } s_atl;
 
 static struct {
     unsigned long long draws, terrain, moved, subst, race, stale, corner, overlays, blends, clamped;
+    unsigned long long hits, misses, changed, edges;    /* the patch cache */
     ULONGLONG t0;
 } ps;
+
+/* The patch cache (pump only). What a substituted draw hands out -- the
+ * vertices with their texture coordinates moved / clamped, the copies and
+ * alphas of each blended edge, the triangles of each band -- depends only on
+ * the slot's 64 vertices, the patch's record, the title's 112 indices and the
+ * level's tables. An entry is keyed by (level, patch) and used only when the
+ * slot, the record and the indices are byte for byte the ones it was built
+ * from (one byte changed: built again); the level's tables change with the
+ * level's number. What is decided per draw stays per draw: whether an edge is
+ * blended and with which textures (learnt in flight), the address words (the
+ * title's state), the neighbour's clamp (its record: compared with the one
+ * the edge was built with). 128 sets of 4 (the patch number picks the set),
+ * the least recently used one goes: bounded, and the same draws make the
+ * same choices. The debug view builds into a scratch entry, every draw. */
+#define SC_SETS 128u
+#define SC_WAYS 4u
+typedef struct {
+    uint32_t gen, pidx;                 /* key; gen 0: empty */
+    unsigned long long use;             /* last use, for the eviction */
+    uint8_t ebuilt;                     /* bit per edge: its copy, alphas and band are built */
+    int8_t ecmask[4];                   /* the neighbour's clamped axes they were built with */
+    double eqshift[4][2];
+    uint32_t enb[4];                    /* indices of each edge's band */
+    uint32_t idx[112];                  /* the title's data the entry was built from */
+    uint8_t slot[SLOT_BYTES], rec[REC_SIZE];
+    uint8_t vbuf[VBUF_BYTES];           /* handed to the translator as it is */
+    uint32_t bl[4][98 * 3];             /* each edge's band (triangle list over its copy) */
+} sc_entry;
+static sc_entry *s_sc, s_scratch;
+static int s_sc_failed;
+static unsigned long long s_sc_use;
+
+/* The entry of this patch with these very bytes (*hit = 1), or the one to
+ * build it in (*hit = 0; gen cleared until it is built). */
+static sc_entry *sc_get(uint32_t gen, uint32_t pidx, const uint8_t *slot, const uint8_t *rec,
+                        const uint32_t *idx, int *hit)
+{
+    sc_entry *set, *victim = NULL;
+    uint32_t w;
+    int keyed = 0;
+    *hit = 0;
+    if (!s_sc && !s_sc_failed) {
+        s_sc = (sc_entry *)calloc(SC_SETS * SC_WAYS, sizeof *s_sc);
+        if (!s_sc) {
+            s_sc_failed = 1;
+            fprintf(stderr, "[SEAMS] patch cache: out of memory, built every draw\n");
+            fflush(stderr);
+        }
+    }
+    if (!s_sc) { ps.misses++; s_scratch.gen = 0; return &s_scratch; }
+    set = s_sc + (pidx & (SC_SETS - 1u)) * SC_WAYS;
+    for (w = 0; w < SC_WAYS; w++) {
+        sc_entry *E = &set[w];
+        if (E->gen == gen && E->pidx == pidx) {
+            if (!memcmp(E->idx, idx, sizeof E->idx) && !memcmp(E->rec, rec, REC_SIZE) &&
+                !memcmp(E->slot, slot, SLOT_BYTES)) {
+                E->use = ++s_sc_use;
+                *hit = 1;
+                ps.hits++;
+                return E;
+            }
+            keyed = 1;
+        }
+        if (!victim || (victim->gen && (!E->gen || E->use < victim->use))) victim = E;
+    }
+    ps.misses++;
+    if (keyed) ps.changed++;
+    victim->gen = 0;
+    victim->use = ++s_sc_use;
+    return victim;
+}
 
 static void snake(uint32_t *out, int dims)
 {
@@ -835,8 +909,9 @@ static void pump_report(void)
     if (t - ps.t0 < 2000) return;
     ps.t0 = t;
     fprintf(stderr, "[SEAMS] pump: draws %llu terrain %llu moved %llu substituted %llu overlays %llu blends %llu | "
-            "clamped %llu | refused: race %llu stale %llu corner %llu\n",
-            ps.draws, ps.terrain, ps.moved, ps.subst, ps.overlays, ps.blends, ps.clamped, ps.race, ps.stale, ps.corner);
+            "clamped %llu | refused: race %llu stale %llu corner %llu | cache: hits %llu misses %llu (changed %llu) edges built %llu\n",
+            ps.draws, ps.terrain, ps.moved, ps.subst, ps.overlays, ps.blends, ps.clamped, ps.race, ps.stale, ps.corner,
+            ps.hits, ps.misses, ps.changed, ps.edges);
     fflush(stderr);
 }
 
@@ -893,6 +968,84 @@ static int clamp_axes(level_t *L, uint32_t p, corners_t c, double shift[2])
     return m;
 }
 
+/* Edge ed of the patch in E (built, its vertices final): the copy of its
+ * vertices the blend reads (the patch's own, or the neighbour's placement
+ * carried across the edge, or its own coordinates moved into the neighbour's
+ * clamped tile), the alphas (1/2 on the edge, 0 at the band's end) and the
+ * strip's triangles in the band, over the copy. */
+static void sc_edge(sc_entry *E, level_t *L, uint32_t pidx, int ed, int full, int cmask, const double qshift[2],
+                    int clampm, const double shift[2])
+{
+    uint32_t vofs = 64u * (1u + (uint32_t)ed), nb = 0, w;   /* vertex numbers of the copy */
+    float *wt = (float *)(E->vbuf + WALT + 256u * (uint32_t)ed);
+    uint8_t *cv = E->vbuf + ALTV + SLOT_BYTES * (uint32_t)ed;
+    int Re = s_blend_rows, m;
+    if (s_width > 0.0) {
+        /* alpha 1/2 on the edge, 0 at s_width metres (39.4 units each) from it, whatever
+         * the cells' size: the weights run on below 0 and the pixel shader clamps them */
+        double Wu = s_width * 39.4;
+        Re = 1;
+        for (w = 0; w < 64; w++) {
+            int r = edge_rows(ed, (int)w), en = (int)w, s;
+            const uint8_t *a = E->vbuf + VSZ * w, *b;
+            double dx, dy, dz, dd;
+            /* the node of the same step on the edge */
+            s = (ed == 0 || ed == 2) ? en % 8 : en / 8;
+            b = E->vbuf + VSZ * (uint32_t)edge_node(ed, s, 0);
+            dx = rdf(a) - rdf(b); dy = rdf(a + 4) - rdf(b + 4); dz = rdf(a + 8) - rdf(b + 8);
+            dd = sqrt(dx * dx + dy * dy + dz * dz);
+            wt[w] = (float)(0.5 * (1.0 - dd / Wu));
+            if (wt[w] < -8.0f) wt[w] = -8.0f;
+            if (r > 0 && r <= 3 && dd < Wu && r + 1 > Re) Re = r + 1;
+        }
+        if (Re > 3) Re = 3;
+    } else
+        for (w = 0; w < 64; w++) {
+            int r = edge_rows(ed, (int)w);
+            wt[w] = r < s_blend_rows ? (float)(0.5 * (1.0 - r / (double)s_blend_rows)) : 0.0f;
+        }
+    memcpy(cv, E->vbuf, SLOT_BYTES);
+    if (full) {             /* the neighbour's placement */
+        const float *x = L->ext + 1280u * pidx + 320u * (uint32_t)ed;
+        for (w = 0; w < 64; w++) {
+            memcpy(cv + VSZ * w + 0x0C, &x[5 * w], 4);
+            memcpy(cv + VSZ * w + 0x1C, &x[5 * w + 1], 4);
+            if (s_blend_tangent) memcpy(cv + VSZ * w + 0x10, &x[5 * w + 2], 12);   /* relief lit in its own frame */
+        }
+    } else if (cmask) {     /* the same placement, as the neighbour's own coordinates: own + whole repeats */
+        for (w = 0; w < 64; w++) {
+            float u = rdf(cv + VSZ * w + 0x0C) + (float)(((clampm & 1) ? shift[0] : 0.0) + L->dint[8u * pidx + 2u * (uint32_t)ed]),
+                  v = rdf(cv + VSZ * w + 0x1C) + (float)(((clampm & 2) ? shift[1] : 0.0) + L->dint[8u * pidx + 2u * (uint32_t)ed + 1u]);
+            memcpy(cv + VSZ * w + 0x0C, &u, 4);
+            memcpy(cv + VSZ * w + 0x1C, &v, 4);
+        }
+    }
+    if (cmask) {            /* into the neighbour's tile, read with clamp like its own pass */
+        for (w = 0; w < 64; w++) {
+            float u = rdf(cv + VSZ * w + 0x0C) - (float)qshift[0], v = rdf(cv + VSZ * w + 0x1C) - (float)qshift[1];
+            if (cmask & 1) memcpy(cv + VSZ * w + 0x0C, &u, 4);
+            if (cmask & 2) memcpy(cv + VSZ * w + 0x1C, &v, 4);
+        }
+    }
+    for (m = 0; m + 2 < 112; m++) {
+        uint32_t a0 = s_l8[m], a1 = s_l8[m + 1], a2 = s_l8[m + 2];
+        uint32_t r0 = E->idx[m], r1 = E->idx[m + 1], r2 = E->idx[m + 2];
+        int rmin;
+        if (a0 == a1 || a1 == a2 || a0 == a2 || r0 == r1 || r1 == r2 || r0 == r2) continue;
+        rmin = edge_rows(ed, (int)a0);
+        if (edge_rows(ed, (int)a1) < rmin) rmin = edge_rows(ed, (int)a1);
+        if (edge_rows(ed, (int)a2) < rmin) rmin = edge_rows(ed, (int)a2);
+        if (rmin >= Re) continue;                    /* the triangle's cell is outside the band */
+        if (m & 1) { uint32_t tt = r0; r0 = r1; r1 = tt; }
+        E->bl[ed][nb] = r0 + vofs; E->bl[ed][nb + 1] = r1 + vofs; E->bl[ed][nb + 2] = r2 + vofs; nb += 3;
+    }
+    E->enb[ed] = nb;
+    E->ecmask[ed] = (int8_t)cmask;
+    E->eqshift[ed][0] = qshift[0]; E->eqshift[ed][1] = qshift[1];
+    E->ebuilt |= (uint8_t)(1u << ed);
+    ps.edges++;
+}
+
 static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
                  const uint32_t offset[16], const uint32_t format[16], PgraphDrawSubst *out)
 {
@@ -912,6 +1065,7 @@ static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
     uint32_t addr, key, s1, novl[SEAM_KINDS + 2] = { 0 }, k;
     slot_t e;
     level_t *L;
+    sc_entry *ent;
     int moved, dbg = s_debug, m, blend = 0, clampm = 0;
     double shift[2] = { 0.0, 0.0 };
 
@@ -979,36 +1133,47 @@ static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
     }
     if (!moved && !dbg && !blend && !clampm) return 0;
 
-    memcpy(s_vbuf, (const void *)XBOX_PTR(e.addr), SLOT_BYTES);
-    memcpy(s_recbuf, (const void *)XBOX_PTR(e.rec), REC_SIZE);
-    for (k = 0; k < 4; k++) {           /* the slot really holds this patch */
-        v3 p;
-        const uint8_t *nv = s_vbuf + VSZ * (uint32_t)corner[k];
-        double x = rdf(nv), y = rdf(nv + 4), z = rdf(nv + 8);
-        double tol = 0.5 + 1e-4 * (fabs(x) + fabs(y) + fabs(z));
-        rec_eval(s_recbuf, ca[k], cb[k], &p, NULL, NULL);
-        if (!(fabs(p.x - x) <= tol && fabs(p.y - y) <= tol && fabs(p.z - z) <= tol)) { ps.corner++; return 0; }
-    }
-    if (moved) {
-        const float *d = L->duv + 128u * e.pidx;
-        for (k = 0; k < 64; k++) {
-            float u = rdf(s_vbuf + VSZ * k + 0x0C) + d[2 * k], v = rdf(s_vbuf + VSZ * k + 0x1C) + d[2 * k + 1];
-            memcpy(s_vbuf + VSZ * k + 0x0C, &u, 4);
-            memcpy(s_vbuf + VSZ * k + 0x1C, &v, 4);
+    {
+        const uint8_t *gslot = (const uint8_t *)XBOX_PTR(e.addr), *grec = (const uint8_t *)XBOX_PTR(e.rec);
+        int hit = 0;
+        if (dbg) { ent = &s_scratch; ent->gen = 0; }
+        else ent = sc_get(e.lvl, e.pidx, gslot, grec, idx, &hit);
+        if (!hit) {
+            memcpy(ent->slot, gslot, SLOT_BYTES);
+            memcpy(ent->rec, grec, REC_SIZE);
+            memcpy(ent->idx, idx, sizeof ent->idx);
+            memcpy(ent->vbuf, ent->slot, SLOT_BYTES);
+            for (k = 0; k < 4; k++) {           /* the slot really holds this patch */
+                v3 p;
+                const uint8_t *nv = ent->vbuf + VSZ * (uint32_t)corner[k];
+                double x = rdf(nv), y = rdf(nv + 4), z = rdf(nv + 8);
+                double tol = 0.5 + 1e-4 * (fabs(x) + fabs(y) + fabs(z));
+                rec_eval(ent->rec, ca[k], cb[k], &p, NULL, NULL);
+                if (!(fabs(p.x - x) <= tol && fabs(p.y - y) <= tol && fabs(p.z - z) <= tol)) { ps.corner++; return 0; }
+            }
+            if (moved) {
+                const float *d = L->duv + 128u * e.pidx;
+                for (k = 0; k < 64; k++) {
+                    float u = rdf(ent->vbuf + VSZ * k + 0x0C) + d[2 * k], v = rdf(ent->vbuf + VSZ * k + 0x1C) + d[2 * k + 1];
+                    memcpy(ent->vbuf + VSZ * k + 0x0C, &u, 4);
+                    memcpy(ent->vbuf + VSZ * k + 0x1C, &v, 4);
+                }
+            }
+            if (clampm) {
+                /* the patch's own tile, moved to [0, 1] (a whole repeat: the image is
+                 * the same), then sampled with clamp on that axis: the filter's
+                 * footprint at the edge no longer reaches the far side of the texture */
+                for (k = 0; k < 64; k++) {
+                    float u = rdf(ent->vbuf + VSZ * k + 0x0C) - (float)shift[0], v = rdf(ent->vbuf + VSZ * k + 0x1C) - (float)shift[1];
+                    if (clampm & 1) memcpy(ent->vbuf + VSZ * k + 0x0C, &u, 4);
+                    if (clampm & 2) memcpy(ent->vbuf + VSZ * k + 0x1C, &v, 4);
+                }
+            }
+            ent->ebuilt = 0;
+            if (!dbg) { ent->gen = e.lvl; ent->pidx = e.pidx; }
         }
     }
-    if (clampm) {
-        /* the patch's own tile, moved to [0, 1] (a whole repeat: the image is
-         * the same), then sampled with clamp on that axis: the filter's
-         * footprint at the edge no longer reaches the far side of the texture */
-        for (k = 0; k < 64; k++) {
-            float u = rdf(s_vbuf + VSZ * k + 0x0C) - (float)shift[0], v = rdf(s_vbuf + VSZ * k + 0x1C) - (float)shift[1];
-            if (clampm & 1) memcpy(s_vbuf + VSZ * k + 0x0C, &u, 4);
-            if (clampm & 2) memcpy(s_vbuf + VSZ * k + 0x1C, &v, 4);
-        }
-        ps.clamped++;
-    }
-    memcpy(s_ibuf, idx, sizeof s_ibuf);
+    if (clampm) ps.clamped++;
     memset(out, 0, sizeof *out);
     if (clampm) {
         uint32_t st;
@@ -1019,123 +1184,83 @@ static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
             out->address[st] = ad;
         }
     }
-    out->indices = s_ibuf;
+    out->indices = ent->idx;
     out->count = 112;
-    out->host = s_vbuf;
-    out->size = sizeof s_vbuf;
+    out->host = ent->vbuf;
+    out->size = sizeof ent->vbuf;
     out->base = offset[0] & 0x0FFFFFFFu;
     out->span = VSZ;
     ps.subst++;
     if (blend) {
         /* fade into the neighbour's textures along each such edge: alpha 1/2 on
-         * the edge, 0 after s_blend_rows rows of nodes; same coordinates (the
-         * placement follows across the edge, up to whole repeats) */
-        int ed, R = s_blend_rows;
+         * the edge, 0 at the band's end. The edges that follow one another with
+         * the same textures and address words are one draw (their triangles in
+         * the same order: the same image) */
+        struct { int ed; uint32_t o0, f0, o2, f2, ad[4], eff[4]; } bc[4];
+        int ed, nbc = 0, i;
+        uint32_t cat = 0;
         for (ed = 0; ed < 4; ed++) {
             int32_t pq = L->partner[e.pidx * 4u + (uint32_t)ed];
-            uint32_t o0, f0, o2, f2, nb = 0, w;
+            uint32_t o0, f0, o2, f2, st;
             int full = L->full[e.pidx * 4u + (uint32_t)ed];
             int cmask = 0;                                         /* XBOX_TERRAIN_CLAMP: the neighbour's clamped axes */
             double qshift[2] = { 0.0, 0.0 };
-            uint32_t vofs;
             if (s_clamp && pq >= 0) {
                 corners_t cq;
                 rec_corners(REC(L, (uint32_t)pq >> 2), cq);
                 cmask = clamp_axes(L, (uint32_t)pq >> 2, cq, qshift);
             }
-            vofs = (full || cmask) ? 64u * (1u + (uint32_t)ed) : 0u;  /* vertex numbers of the copy */
-            int Re;
-            float *wt = (float *)(s_vbuf + (full ? WALT : WEIGHTS) + 256u * (uint32_t)ed);
-            PgraphDrawOverlay *ov;
             if (pq >= 0 && (full || s_match != 0) &&
-                !tex_similar(rds(s_recbuf + 0x1C0), rds(REC(L, (uint32_t)pq >> 2) + 0x1C0))) continue;
+                !tex_similar(rds(ent->rec + 0x1C0), rds(REC(L, (uint32_t)pq >> 2) + 0x1C0))) continue;
             if (!(L->cont[e.pidx * 4u + (uint32_t)ed] || full) || pq < 0 ||
                 !tex_find(0, rds(REC(L, (uint32_t)pq >> 2) + 0x1C0), &o0, &f0) ||
                 !tex_find(1, rds(REC(L, (uint32_t)pq >> 2) + 0x1C2), &o2, &f2)) continue;
-            Re = R;
-            if (s_width > 0.0) {
-                /* alpha 1/2 on the edge, 0 at s_width metres (39.4 units each) from it, whatever
-                 * the cells' size: the weights run on below 0 and the pixel shader clamps them */
-                double Wu = s_width * 39.4;
-                int far_ = 0;
-                Re = 1;
-                for (w = 0; w < 64; w++) {
-                    int r = edge_rows(ed, (int)w), en = (int)w, s;
-                    const uint8_t *a = s_vbuf + VSZ * w, *b;
-                    double dx, dy, dz, dd;
-                    /* the node of the same step on the edge */
-                    s = (ed == 0 || ed == 2) ? en % 8 : en / 8;
-                    b = s_vbuf + VSZ * (uint32_t)edge_node(ed, s, 0);
-                    dx = rdf(a) - rdf(b); dy = rdf(a + 4) - rdf(b + 4); dz = rdf(a + 8) - rdf(b + 8);
-                    dd = sqrt(dx * dx + dy * dy + dz * dz);
-                    wt[w] = (float)(0.5 * (1.0 - dd / Wu));
-                    if (wt[w] < -8.0f) wt[w] = -8.0f;
-                    if (r > 0 && r <= 3 && dd < Wu && r + 1 > Re) Re = r + 1;
-                    (void)far_;
-                }
-                if (Re > 3) Re = 3;
-            } else
-                for (w = 0; w < 64; w++) {
-                    int r = edge_rows(ed, (int)w);
-                    wt[w] = r < R ? (float)(0.5 * (1.0 - r / (double)R)) : 0.0f;
-                }
-            if (full) {             /* the copy: same vertices, the neighbour's placement */
-                const float *x = L->ext + 1280u * e.pidx + 320u * (uint32_t)ed;
-                uint8_t *cv = s_vbuf + ALTV + SLOT_BYTES * (uint32_t)ed;
-                memcpy(cv, s_vbuf, SLOT_BYTES);
-                for (w = 0; w < 64; w++) {
-                    memcpy(cv + VSZ * w + 0x0C, &x[5 * w], 4);
-                    memcpy(cv + VSZ * w + 0x1C, &x[5 * w + 1], 4);
-                    if (s_blend_tangent) memcpy(cv + VSZ * w + 0x10, &x[5 * w + 2], 12);   /* relief lit in its own frame */
-                }
-            } else if (cmask) {     /* the same placement, as the neighbour's own coordinates: own + whole repeats */
-                uint8_t *cv = s_vbuf + ALTV + SLOT_BYTES * (uint32_t)ed;
-                memcpy(cv, s_vbuf, SLOT_BYTES);
-                for (w = 0; w < 64; w++) {
-                    float u = rdf(cv + VSZ * w + 0x0C) + (float)(((clampm & 1) ? shift[0] : 0.0) + L->dint[8u * e.pidx + 2u * (uint32_t)ed]),
-                          v = rdf(cv + VSZ * w + 0x1C) + (float)(((clampm & 2) ? shift[1] : 0.0) + L->dint[8u * e.pidx + 2u * (uint32_t)ed + 1u]);
-                    memcpy(cv + VSZ * w + 0x0C, &u, 4);
-                    memcpy(cv + VSZ * w + 0x1C, &v, 4);
-                }
-            }
-            if (cmask) {            /* into the neighbour's tile, read with clamp like its own pass */
-                uint8_t *cv = s_vbuf + ALTV + SLOT_BYTES * (uint32_t)ed;
-                for (w = 0; w < 64; w++) {
-                    float u = rdf(cv + VSZ * w + 0x0C) - (float)qshift[0], v = rdf(cv + VSZ * w + 0x1C) - (float)qshift[1];
-                    if (cmask & 1) memcpy(cv + VSZ * w + 0x0C, &u, 4);
-                    if (cmask & 2) memcpy(cv + VSZ * w + 0x1C, &v, 4);
-                }
-            }
-            for (m = 0; m + 2 < 112; m++) {
-                uint32_t a0 = s_l8[m], a1 = s_l8[m + 1], a2 = s_l8[m + 2];
-                uint32_t r0 = idx[m], r1 = idx[m + 1], r2 = idx[m + 2];
-                int rmin;
-                if (a0 == a1 || a1 == a2 || a0 == a2 || r0 == r1 || r1 == r2 || r0 == r2) continue;
-                rmin = edge_rows(ed, (int)a0);
-                if (edge_rows(ed, (int)a1) < rmin) rmin = edge_rows(ed, (int)a1);
-                if (edge_rows(ed, (int)a2) < rmin) rmin = edge_rows(ed, (int)a2);
-                if (rmin >= Re) continue;                    /* the triangle's cell is outside the band */
-                if (m & 1) { uint32_t tt = r0; r0 = r1; r1 = tt; }
-                s_bl[ed][nb] = r0 + vofs; s_bl[ed][nb + 1] = r1 + vofs; s_bl[ed][nb + 2] = r2 + vofs; nb += 3;
-            }
-            if (!nb || out->n_overlay >= PGRAPH_SUBST_OVERLAYS) continue;
-            ov = &out->overlay[out->n_overlay++];
-            ov->indices = s_bl[ed];
-            ov->count = nb;
-            ov->blend = 1;
-            ov->weights = (full ? WALT : WEIGHTS) + 256u * (uint32_t)ed - 4u * vofs;
-            ov->tex_offset[0] = o0; ov->tex_format[0] = f0;
-            ov->tex_offset[2] = o2; ov->tex_format[2] = f2;
-            if (cmask) {
-                uint32_t st;
-                for (st = 0; st < 4; st += 2) {
-                    uint32_t ad = pgraph_d3d11_tex_address((int)st);
+            if (!(ent->ebuilt & (1u << ed)) || ent->ecmask[ed] != cmask ||
+                ent->eqshift[ed][0] != qshift[0] || ent->eqshift[ed][1] != qshift[1])
+                sc_edge(ent, L, e.pidx, ed, full, cmask, qshift, clampm, shift);
+            if (!ent->enb[ed]) continue;
+            bc[nbc].ed = ed;
+            bc[nbc].o0 = o0; bc[nbc].f0 = f0; bc[nbc].o2 = o2; bc[nbc].f2 = f2;
+            for (st = 0; st < 4; st++) {
+                uint32_t ad = pgraph_d3d11_tex_address((int)st);
+                bc[nbc].ad[st] = 0;
+                if (cmask && (st == 0 || st == 2)) {
                     if (cmask & 1) ad = (ad & ~0xFu) | 3u;
                     if (cmask & 2) ad = (ad & ~0xF00u) | 0x300u;
-                    ov->address[st] = ad;
+                    bc[nbc].ad[st] = ad;
+                }
+                bc[nbc].eff[st] = ad;                       /* the word the draw samples with */
+            }
+            nbc++;
+            ps.blends++;
+        }
+        for (i = 0; i < nbc; ) {
+            int j = i + 1, g;
+            PgraphDrawOverlay *ov;
+            while (j < nbc && bc[j].o0 == bc[i].o0 && bc[j].f0 == bc[i].f0 && bc[j].o2 == bc[i].o2 &&
+                   bc[j].f2 == bc[i].f2 && !memcmp(bc[j].eff, bc[i].eff, sizeof bc[i].eff))
+                j++;
+            if (out->n_overlay >= PGRAPH_SUBST_OVERLAYS) break;
+            ov = &out->overlay[out->n_overlay++];
+            if (j - i == 1) {
+                ov->indices = ent->bl[bc[i].ed];
+                ov->count = ent->enb[bc[i].ed];
+            } else {
+                ov->indices = s_cat + cat;
+                ov->count = 0;
+                for (g = i; g < j; g++) {
+                    memcpy(s_cat + cat, ent->bl[bc[g].ed], 4u * ent->enb[bc[g].ed]);
+                    cat += ent->enb[bc[g].ed];
+                    ov->count += ent->enb[bc[g].ed];
                 }
             }
-            ps.blends++;
+            ov->blend = 1;
+            ov->weights = WALT - 256u;      /* edge ed's alphas at WALT + 256 ed, its vertices from 64 (1 + ed) */
+            ov->tex_offset[0] = bc[i].o0; ov->tex_format[0] = bc[i].f0;
+            ov->tex_offset[2] = bc[i].o2; ov->tex_format[2] = bc[i].f2;
+            memcpy(ov->address, bc[i].ad, sizeof ov->address);
+            ps.overlays++;
+            i = j;
         }
     }
     if (!dbg) return 1;
@@ -1152,7 +1277,7 @@ static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
         for (ed = 0; ed < 4; ed++) {
             int kd = L->kind[e.pidx * 4u + (uint32_t)ed];
             uint32_t nb = 0, w;
-            float *wt = (float *)(s_vbuf + WEIGHTS + 256u * (uint32_t)ed);
+            float *wt = (float *)(ent->vbuf + WEIGHTS + 256u * (uint32_t)ed);
             PgraphDrawOverlay *ov;
             if (kd == SEAM_OK && lm_step(L, e.pidx, ed) >= LM_STEP) kd = SEAM_KINDS;
             if (kd <= SEAM_OK || out->n_overlay >= PGRAPH_SUBST_OVERLAYS) continue;
@@ -1182,7 +1307,7 @@ static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
     /* debug view: the strip's triangles in the cells along each tinted edge */
     {
         uint32_t t1off, t1fmt;
-        int a = rds(s_recbuf + 0x1C4), ek[4], ed;
+        int a = rds(ent->rec + 0x1C4), ek[4], ed;
         if (s_atl.gen != e.lvl) { memset(&s_atl, 0, sizeof s_atl); s_atl.gen = e.lvl; }
         pgraph_d3d11_tex_binding(1, &t1off, &t1fmt);
         if (a >= 0 && a < ATLN && t1off) { s_atl.off[a] = t1off; s_atl.fmt[a] = t1fmt; }

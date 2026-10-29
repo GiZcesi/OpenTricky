@@ -807,10 +807,10 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
         return NULL;
     }
 
-    hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
-                    NULL, NULL, "main", "ps_5_0",
-                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                    &code, &errors);
+    hr = d3d8_shader_compile_logged(hlsl, (SIZE_T)len, "ps_combiner",
+                                    NULL, "main", "ps_5_0",
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                                    &code, &errors);
     if (FAILED(hr)) {
         fprintf(stderr, "NV2A combiners: HLSL compile failed: %s\n",
                 errors ? (char *)ID3D10Blob_GetBufferPointer(errors)

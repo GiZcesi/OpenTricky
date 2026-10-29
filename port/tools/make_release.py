@@ -3,7 +3,7 @@
 """Package dist/OpenTricky (made by build.sh) as a release zip.
 
     OT_RELEASE=1 ./build.sh "path/to/SSX Tricky (USA).iso"
-    python port/tools/make_release.py [label]      # e.g. 0.1.1 or 0.1.1-unstable
+    python port/tools/make_release.py [label]      # e.g. 0.1.4
 
     dist/OpenTricky-<label>-win64/
         OpenTricky.exe    the launcher, with its ui/ folder and
@@ -35,43 +35,66 @@ EXE = "SSX Tricky.exe"
 LAUNCHER = "OpenTricky.exe"
 LICENCES = "THIRD-PARTY-LICENSES.txt"
 
-README = """OpenTricky {version} -- SSX Tricky (Xbox) for Windows
-=========================================================
-
-A recompiled PC port of SSX Tricky for the original Xbox. Not an emulator.
-UNSTABLE release: see "Known issues" on the project page.
-This download is the executable only: no disc image, game data, music or
-video. You need your own SSX Tricky (USA) Xbox disc
-image (.iso).
-
+# The README of the zip: the same text as the README of the project's release
+# zips, for this zip's layout (the game beside the launcher, not in a bin
+# folder) and with its LICENSE.txt.
+TITLE = "OpenTricky {version} -- SSX Tricky on PC (static recompilation of the Xbox game)"
+README = """
 Start
   Double-click "OpenTricky.exe", the launcher. The first time, choose your
-  disc image (or drop it on the launcher's window): the launcher remembers
-  it. PLAY starts the game; Settings has the display, graphics, audio,
-  controls, game and advanced options (saved in settings.ini next to the
-  launcher). "SSX Tricky.exe" also starts the game directly, with the same
-  settings.
+  own copy of SSX Tricky (USA) for Xbox as a disc image (.iso or .xiso), or
+  drop it on the launcher's window: the launcher remembers it. PLAY starts
+  the game; Settings has the display, graphics, audio, controls and other
+  options (settings.ini, written by the launcher beside it).
+  The game itself is beside the launcher: "SSX Tricky.exe" also starts it
+  directly, with the same settings.
+  With Settings > Advanced > Skip launcher next time on, the game starts
+  directly; to see the launcher again, hold Shift (or Back / Select on a
+  controller) while you start OpenTricky.exe.
+
+Coming from 0.1.2 or 0.1.3
+  Let the launcher update you: your saves, settings and disc image are kept (a
+  preset takes its new values). Your 0.1.2 or 0.1.3 launcher checks GitHub
+  once a day: if no update shows up, close it, delete update-cache.txt next to
+  settings.ini, and open it again.
+
+Coming from 0.1.1
+  Install this version fresh: unzip it into a new, empty folder.
+  - Saves in Documents\\My Games\\SSX Tricky\\Saves stay where they are. If
+    your saves were inside the old folder (a Saves folder with portable.txt,
+    or an hdd folder), copy that folder (and portable.txt) into the new
+    folder.
+  - Do not copy settings.ini: the new defaults are recommended. The launcher
+    asks for your disc image again the first time; if you had chosen a save
+    folder, choose it again in Settings > Game > Save folder.
+  - Then delete the old folder.
+  A shortcut to the old "SSX Tricky.exe" (desktop, Steam, Windows graphics
+  settings) must be made again: point it to "OpenTricky.exe" (or to the new
+  "SSX Tricky.exe").
 
 In the game
-  Alt+Enter / F11   window / fullscreen
-  F12               screenshot (Screenshots folder next to the game)
-  Alt+F4            quit
+  F12          screenshot (Screenshots folder beside OpenTricky.exe)
+  Shift+F12    a burst of screenshots
+  Alt+Enter    window / fullscreen (F11 too)
+  Alt+F4       quit
 
 Saves
   Documents\\My Games\\SSX Tricky\\Saves
-  For a portable copy, create an empty file named portable.txt next to
-  "SSX Tricky.exe": saves then go to its Saves folder.
+  To keep everything in this folder instead (a portable copy), create an
+  empty file named portable.txt beside "OpenTricky.exe": saves then go to
+  its Saves folder. Settings > Game > Save folder can also point to any
+  folder.
 
 Problems
-  If the game closes unexpectedly, the launcher offers a bug report: a zip
-  on your Desktop with the logs and settings (never your disc image or
-  saves). Nothing is sent automatically. Attach it to a bug report:
-  https://github.com/GiZcesi/OpenTricky/issues
+  If the game closes unexpectedly, the launcher offers a bug report: a zip on
+  your Desktop with the logs and settings (never your disc image or saves).
+  Nothing is sent automatically.
 
 OpenTricky continues SSX Tricky PC by MatiasRiveraC, built on xboxrecomp by
 sp00nznet. SSX and SSX Tricky are trademarks of Electronic Arts; this is an
 unofficial fan project, not affiliated with EA or Microsoft.
-Third-party licences: THIRD-PARTY-LICENSES.txt.
+Licences: LICENSE.txt (OpenTricky, GPL-3.0-only) and THIRD-PARTY-LICENSES.txt
+  (Settings > Advanced > About OpenTricky > Licences).
 
 Version {version} ({stamp})
 """
@@ -164,7 +187,8 @@ def main():
         if f in (EXE, LAUNCHER, LICENCES) or f.lower().endswith(".dll"):
             shutil.copy2(os.path.join(SRC, f), dst)
     shutil.copytree(os.path.join(SRC, "ui"), os.path.join(dst, "ui"))
-    write(os.path.join(dst, "README.txt"),
+    title = TITLE.format(version=label)
+    write(os.path.join(dst, "README.txt"), title + "\n" + "=" * len(title) + "\n" +
           README.format(version=label, stamp=datetime.date.today().isoformat()))
     shutil.copy2(os.path.join(ROOT, "LICENSE"), os.path.join(dst, "LICENSE.txt"))
 

@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "apu_xaudio2.h"
+#include "../kernel/xbox_logstats.h"
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
  * stubbed to report inactive; real audio output via SDL2 comes later. */
@@ -392,6 +393,7 @@ int xa2_is_active(void)
     return g_xa2_initialized;
 }
 
+
 /* Buffers the device still has to play -- the clock the APU frame thread
  * paces itself by. */
 int xa2_queued(void)
@@ -478,9 +480,9 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     /* Say whether what reaches the speakers is sound or silence. A buffer
      * count alone cannot tell -- the pipeline submits zeros whenever no voice
-     * is playing, so "frames written" rises either way. Reported every 5 s
-     * while anything non-silent has been heard, and once when output first
-     * stops being silent. */
+     * is playing, so "frames written" rises either way. Reported at most
+     * every 5 s while anything non-silent has been heard (see below), and
+     * once when output first stops being silent. */
     {
         static int peak = 0, announced = 0;
         static unsigned long loud = 0, last_tick = 0;
@@ -495,29 +497,41 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
             announced = 1;
             fprintf(stderr, "[XA2] first non-silent buffer (peak %d) after %d buffers\n",
                     bpeak, g_xa2_frames_written);
-            fflush(stderr);
+            xbox_log_flush();
         }
         if (loud) {
+            static unsigned long shown_underruns, shown_drops;
+            static UINT32 shown_glitches;
             unsigned long now = GetTickCount();
+            /* Every 5 s: the engine's counters read and the latency window
+             * closed. Printed every time with XBOX_LOG_STATS=1
+             * (xbox_logstats.h); otherwise only when sound was lost since the
+             * last line: underruns, drops, or glitches of the engine (a
+             * processing pass late, which can happen with buffers queued). */
             if (now - last_tick >= 5000) {
-                last_tick = now;
                 XAUDIO2_PERFORMANCE_DATA perf;
+                last_tick = now;
                 memset(&perf, 0, sizeof(perf));
                 IXAudio2_GetPerformanceData(g_xa2, &perf);
-                fprintf(stderr, "[XA2] %d buffers sent, %lu non-silent, peak %d, "
-                        "%lu underruns, %lu dropped\n",
-                        g_xa2_frames_written, loud, peak, g_xa2_underruns, g_xa2_drops);
-                /* Queue target, measured queue latency over the last
-                 * window (mean / max, submitted but unplayed), the engine's
-                 * own device latency and its glitch count. */
-                fprintf(stderr, "[XA2] queue %d: latency mean %.1f ms max %.1f ms, "
-                        "device %.1f ms, glitches %u\n", xa2_target_queued(),
-                        g_xa2_lat_n ? (double)g_xa2_lat_sum / (double)g_xa2_lat_n * 1000.0 / XA2_SAMPLE_RATE : 0.0,
-                        (double)g_xa2_lat_max * 1000.0 / XA2_SAMPLE_RATE,
-                        perf.CurrentLatencyInSamples * 1000.0 / XA2_SAMPLE_RATE,
-                        (unsigned)perf.GlitchesSinceEngineStarted);
+                if (xbox_log_stats() || g_xa2_underruns != shown_underruns || g_xa2_drops != shown_drops ||
+                    perf.GlitchesSinceEngineStarted != shown_glitches) {
+                    shown_underruns = g_xa2_underruns;
+                    shown_drops = g_xa2_drops;
+                    shown_glitches = perf.GlitchesSinceEngineStarted;
+                    fprintf(stderr, "[XA2] %d buffers sent, %lu non-silent, peak %d, "
+                            "%lu underruns, %lu dropped\n",
+                            g_xa2_frames_written, loud, peak, g_xa2_underruns, g_xa2_drops);
+                    /* Queue target, measured queue latency over the last
+                     * window (mean / max, submitted but unplayed), the engine's
+                     * own device latency and its glitch count. */
+                    fprintf(stderr, "[XA2] queue %d: latency mean %.1f ms max %.1f ms, "
+                            "device %.1f ms, glitches %u\n", xa2_target_queued(),
+                            g_xa2_lat_n ? (double)g_xa2_lat_sum / (double)g_xa2_lat_n * 1000.0 / XA2_SAMPLE_RATE : 0.0,
+                            (double)g_xa2_lat_max * 1000.0 / XA2_SAMPLE_RATE,
+                            perf.CurrentLatencyInSamples * 1000.0 / XA2_SAMPLE_RATE,
+                            (unsigned)perf.GlitchesSinceEngineStarted);
+                }
                 g_xa2_lat_sum = g_xa2_lat_n = g_xa2_lat_max = 0;
-                fflush(stderr);
             }
         }
     }

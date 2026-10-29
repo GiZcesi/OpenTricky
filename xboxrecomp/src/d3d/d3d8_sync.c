@@ -3,6 +3,7 @@
  */
 #define COBJMACROS
 #include "d3d8_sync.h"
+#include "../kernel/xbox_logstats.h"
 #include <dxgi1_3.h>
 #include <dxgi1_5.h>
 #include <math.h>
@@ -20,7 +21,41 @@ static HANDLE s_wait;                   /* latency object (flip model) */
 static HWND   s_hwnd;
 static volatile LONG s_hz;              /* refresh rate of the window's display */
 static volatile LONG s_pace_fps;        /* frame rate limit (0: none), see d3d8_sync_set_pace */
+static volatile LONG s_adaptive_tears;  /* Adaptive: the game is slower than its pace, late frames shown at once */
+/* How the frames reach the display, from the media statistics of the frames
+ * the display took (presentation_mode_note): a DXGI_FRAME_PRESENTATION_MODE,
+ * -1 unknown. The presenting thread writes it, any thread reads it. */
+static volatile LONG s_comp_mode = -1;
+static volatile LONG s_comp_again;      /* any thread: something changed, read it again from the frames presented after */
+static struct {                         /* presenting thread only */
+    IDXGISwapChainMedia *m;             /* the chain's media statistics (queried once; refused: again 2 s later) */
+    double read, qi_retry;              /* last reading; no media interface: next try (ms) */
+    UINT mark, seen, lpc;               /* present counts: when a change is taken (frames presented before count as
+                                           before it); of the last reading; at it */
+    int marked;
+    double changed;                     /* when the last change was taken (ms) */
+    double found;                       /* how long after it the mode was known (ms, logged; < 0: none) */
+    double us;                          /* time spent reading (logged) */
+    unsigned long n;
+    double logged;                      /* last line written (ms): one a second at most */
+    unsigned long skipped;              /* changes not written since */
+    int pending;                        /* a change not written yet */
+} CM = { .found = -1.0 };
 static double s_qf;
+/* Render gate, see d3d8_sync_gate. */
+static int    s_gate;                   /* XBOX_RENDER_GATE: frames allowed ahead of a render (0: off) */
+static volatile LONG s_gate_live;       /* the retire thread runs: the pump no longer waits */
+static volatile LONG s_presented, s_retired, s_qadj, s_gate_stop;
+static HANDLE s_gate_thread;
+static unsigned long long s_gate_resync, s_gate_dn;
+static long long s_gate_dsum;           /* statistics' queue - counted queue, summed (diagnostic) */
+/* Present grid, see pgrid_wait. */
+static struct { int on; double margin, anchor, last_slot; unsigned long long held, late, restart; } G;
+static int s_fc;                        /* the frame timer is on an exact grid (port, frame_clock.c) */
+
+void d3d8_sync_set_frame_clock(void) { s_fc = 1; }
+static void pgrid_init(void);
+static void pgrid_wait(IDXGISwapChain *sc, double t);
 
 static const char *const k_mode_name[] = { "legacy", "off", "vsync", "adaptive" };
 
@@ -60,6 +95,36 @@ void d3d8_sync_set_pace(int fps)
     InterlockedExchange(&s_pace_fps, fps > 0 && fps <= 1000 ? fps : 0);
 }
 
+/* Whether the frame of the render about to start will reach the screen as
+ * soon as it is presented (fps_cap: its image then shows the render's start,
+ * else its slot). That takes:
+ * - a sync interval of 0: VSync off; Adaptive gives it to the frames that come
+ *   late while its running average says the game is slower than its pace, and
+ *   this answers for every render of that phase (one that comes on time waits
+ *   for its refresh, but then its start is its slot);
+ * - tearing allowed (ALLOW_TEARING): without it a frame waits for the next
+ *   refresh all the same, the newest one being shown;
+ * - the frames flipped on their own, which the media statistics call an
+ *   overlay plane (an independent flip, too): measured in full screen, they
+ *   then reach the screen at every point of the refresh. A frame the desktop
+ *   composes waits for its next refresh.
+ * While the way the frames reach the display is unknown (no statistics yet, a
+ * change they do not show yet, frames presented and none taken since the last
+ * reading) or not an overlay plane (a mode they do not specify, a composition
+ * failure: known for the reading's pace, waiting for this answer), a frame
+ * counts as waiting. The legacy chain (DISCARD) gives no statistics: the desktop
+ * composes it on Windows 10, but Windows 11 may flip it and let it tear
+ * ("Optimizations for windowed games"); not knowing, it counts as waiting. */
+int d3d8_sync_immediate(void)
+{
+    switch (d3d8_sync_mode()) {
+    case D3D8_SYNC_OFF:      break;
+    case D3D8_SYNC_ADAPTIVE: if (!s_adaptive_tears) return 0; break;
+    default:                 return 0;
+    }
+    return s_tearing && s_comp_mode == DXGI_FRAME_PRESENTATION_MODE_OVERLAY;
+}
+
 int d3d8_monitor_hz(HWND hwnd)
 {
     MONITORINFOEXW mi;
@@ -75,6 +140,207 @@ int d3d8_monitor_hz(HWND hwnd)
     dm.dmSize = sizeof dm;
     if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) return 0;
     return dm.dmDisplayFrequency > 1 ? (int)dm.dmDisplayFrequency : 0;   /* 0 / 1 = hardware default */
+}
+
+/* ── exact refresh rate ────────────────────────────────────────────
+ * Windows lists a display's rate as an integer: 240 for a signal at
+ * 239.98 Hz, 60 (or 59) for 59.94. A frame rate limit set to that integer
+ * produced frames slightly faster than the display: the DXGI queue filled
+ * up and stayed full (+2.5 to +3 ms between the start of a render and the
+ * screen at 240 Hz). The exact rate is the signal's vertical sync
+ * frequency, a rational, from QueryDisplayConfig (Windows 7+; Wine has it
+ * too). Not found, or far from the integer rate: the integer rate. */
+static double qdc_rate(const WCHAR *dev)
+{
+    DISPLAYCONFIG_PATH_INFO *p = NULL;
+    DISPLAYCONFIG_MODE_INFO *mo = NULL;
+    UINT32 np = 0, nm = 0, i;
+    double r = 0.0;
+    int tries;
+    for (tries = 0; tries < 3; tries++) {       /* the layout may change between the two calls */
+        LONG e;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return 0.0;
+        p = (DISPLAYCONFIG_PATH_INFO *)calloc(np, sizeof *p);
+        mo = (DISPLAYCONFIG_MODE_INFO *)calloc(nm ? nm : 1, sizeof *mo);
+        if (!p || !mo) { free(p); free(mo); return 0.0; }
+        e = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, p, &nm, mo, NULL);
+        if (e == ERROR_SUCCESS) break;
+        free(p); free(mo); p = NULL; mo = NULL;
+        if (e != ERROR_INSUFFICIENT_BUFFER) return 0.0;
+    }
+    if (!p) return 0.0;
+    for (i = 0; i < np; i++) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sn;
+        DISPLAYCONFIG_RATIONAL q;
+        UINT32 k;
+        memset(&sn, 0, sizeof sn);
+        sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sn.header.size = sizeof sn;
+        sn.header.adapterId = p[i].sourceInfo.adapterId;
+        sn.header.id = p[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS || wcscmp(sn.viewGdiDeviceName, dev)) continue;
+        /* the signal's timing first (exact), else the path's rate */
+        q = p[i].targetInfo.refreshRate;
+        k = p[i].targetInfo.modeInfoIdx;
+        if (k != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && k < nm && mo[k].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET
+            && mo[k].targetMode.targetVideoSignalInfo.vSyncFreq.Numerator
+            && mo[k].targetMode.targetVideoSignalInfo.vSyncFreq.Denominator)
+            q = mo[k].targetMode.targetVideoSignalInfo.vSyncFreq;
+        if (q.Numerator && q.Denominator) r = (double)q.Numerator / (double)q.Denominator;
+        break;
+    }
+    free(p);
+    free(mo);
+    return r;
+}
+
+double d3d8_monitor_rate(HWND hwnd, const char **src)
+{
+    MONITORINFOEXW mi;
+    DEVMODEW dm;
+    HMONITOR m;
+    POINT o = { 0, 0 };
+    const char *e = NULL;
+    double hz = 0.0, r;
+    if (src) *src = "unknown";
+    if (e && *e) {                              /* test: a rate, the display untouched */
+        /* "A" or "A@T:B" (B from T seconds after the first read on: a mode
+         * change, read again on the next WM_DISPLAYCHANGE); A, B = Hz or N/D */
+        static double t_first;
+        char *end;
+        double v = strtod(e, &end), now = now_ms();
+        if (*end == '/') { double d = strtod(end + 1, &end); v = d > 0.0 ? v / d : 0.0; }
+        if (t_first <= 0.0) t_first = now;
+        if (*end == '@') {
+            double t = strtod(end + 1, &end);
+            if (*end == ':' && now - t_first >= t * 1000.0) {
+                v = strtod(end + 1, &end);
+                if (*end == '/') { double d = strtod(end + 1, &end); v = d > 0.0 ? v / d : 0.0; }
+            }
+        }
+        if (v >= 24.0 && v <= 1000.0) { if (src) *src = "XBOX_TEST_DISPLAY_RATE (test)"; return v; }
+    }
+    m = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+             : MonitorFromPoint(o, MONITOR_DEFAULTTOPRIMARY);
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    if (!m || !GetMonitorInfoW(m, (MONITORINFO *)&mi)) return 0.0;
+    memset(&dm, 0, sizeof dm);
+    dm.dmSize = sizeof dm;
+    if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) {
+        hz = (double)dm.dmDisplayFrequency;
+        if (src) *src = "integer rate";
+    }
+    r = qdc_rate(mi.szDevice);
+    /* the integer is rounded (239.98 -> 240) or cut (59.94 -> 59): within 1.5 Hz */
+    if (r >= 24.0 && r <= 1000.0 && (hz <= 0.0 || fabs(r - hz) <= 1.5)) {
+        if (src) *src = "display signal";
+        return r;
+    }
+    return hz;
+}
+
+/* The exact rate of the window's display, as last read (mHz), and a count
+ * of its changes: the frame rate limit follows it (fps_cap.c). */
+static volatile LONG s_rate_mhz, s_rate_gen;
+static volatile LONG_PTR s_rate_mon;            /* HMONITOR it was read on */
+
+static void rate_update(HWND hwnd, const char *why)
+{
+    const char *src;
+    double r = d3d8_monitor_rate(hwnd, &src);
+    LONG v = (LONG)(r * 1000.0 + 0.5);
+    HMONITOR m = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : NULL;
+    InterlockedExchangePointer((PVOID volatile *)&s_rate_mon, (PVOID)m);
+    if (v != s_rate_mhz) {
+        InterlockedExchange(&s_rate_mhz, v);
+        InterlockedIncrement(&s_rate_gen);
+        fprintf(stderr, "D3D8: display refresh %.3f Hz (%s; %s)\n", r, src, why);
+        fflush(stderr);
+    }
+}
+
+double d3d8_display_rate(LONG *gen)
+{
+    if (gen) *gen = s_rate_gen;
+    return (double)s_rate_mhz / 1000.0;
+}
+
+void d3d8_sync_display_changed(int moved)
+{
+    HWND h = s_hwnd;
+    if (!h) return;
+    /* WM_MOVE: only when the window has gone over to another display */
+    if (moved && (LONG_PTR)MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) == s_rate_mon) return;
+    InterlockedExchange(&s_comp_again, 1);      /* how the frames reach this display: read again */
+    InterlockedExchange(&s_hz, d3d8_monitor_hz(h));
+    rate_update(h, moved ? "window on another display" : "display mode changed");
+}
+
+/* ── XBOX_TEST_DISPLAY_HZ (test only, see d3d8_sync.h) ───────────── */
+static volatile LONG s_test_hz_on;       /* 1 while our mode is set */
+static WCHAR s_test_hz_dev[CCHDEVICENAME];
+
+void d3d8_test_display_hz_restore(void)
+{
+    LONG r;
+    if (!InterlockedExchange(&s_test_hz_on, 0)) return;
+    /* NULL mode, no flags: back to the mode saved in the registry (the desktop's). */
+    r = ChangeDisplaySettingsExW(s_test_hz_dev, NULL, NULL, 0, NULL);
+    fprintf(stderr, "D3D8: XBOX_TEST_DISPLAY_HZ: desktop mode restored (%ld)\n", (long)r);
+    fflush(stderr);
+}
+
+static void test_display_hz_atexit(void) { d3d8_test_display_hz_restore(); }
+
+void d3d8_test_display_hz_apply(void)
+{
+    const char *e = NULL;                               /* never the desktop's mode */
+    MONITORINFOEXW mi;
+    DEVMODEW cur, dm;
+    POINT o = { 0, 0 };
+    HMONITOR m;
+    long hz;
+    LONG r;
+    static int done;
+    if (done || !e || !*e) return;
+    done = 1;
+    hz = strtol(e, NULL, 10);
+    if (hz < 24 || hz > 1000) { fprintf(stderr, "D3D8: XBOX_TEST_DISPLAY_HZ=%s invalid: ignored\n", e); return; }
+    m = MonitorFromPoint(o, MONITOR_DEFAULTTOPRIMARY);   /* the game window opens there (fps_cap_init) */
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    memset(&cur, 0, sizeof cur);
+    cur.dmSize = sizeof cur;
+    if (!m || !GetMonitorInfoW(m, (MONITORINFO *)&mi) || !EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &cur)) {
+        fprintf(stderr, "D3D8: XBOX_TEST_DISPLAY_HZ: display not found: ignored\n");
+        return;
+    }
+    if ((long)cur.dmDisplayFrequency == hz) {
+        fprintf(stderr, "D3D8: XBOX_TEST_DISPLAY_HZ=%ld: display already at %ld Hz\n", hz, hz);
+        return;
+    }
+    dm = cur;
+    dm.dmDisplayFrequency = (DWORD)hz;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+    r = ChangeDisplaySettingsExW(mi.szDevice, &dm, NULL, CDS_TEST, NULL);
+    if (r != DISP_CHANGE_SUCCESSFUL) {
+        fprintf(stderr, "D3D8: XBOX_TEST_DISPLAY_HZ=%ld: %lux%lu at %ld Hz refused by the display (%ld): ignored\n",
+                hz, cur.dmPelsWidth, cur.dmPelsHeight, hz, (long)r);
+        return;
+    }
+    memcpy(s_test_hz_dev, mi.szDevice, sizeof s_test_hz_dev);
+    /* CDS_FULLSCREEN: a temporary mode, never written to the registry. */
+    r = ChangeDisplaySettingsExW(mi.szDevice, &dm, NULL, CDS_FULLSCREEN, NULL);
+    if (r != DISP_CHANGE_SUCCESSFUL) {
+        fprintf(stderr, "D3D8: XBOX_TEST_DISPLAY_HZ=%ld: mode change failed (%ld): ignored\n", hz, (long)r);
+        return;
+    }
+    InterlockedExchange(&s_test_hz_on, 1);
+    atexit(test_display_hz_atexit);
+    fprintf(stderr, "D3D8: XBOX_TEST_DISPLAY_HZ (TEST): %lux%lu %lu Hz -> %ld Hz until the game exits\n",
+            cur.dmPelsWidth, cur.dmPelsHeight, cur.dmDisplayFrequency, hz);
+    fflush(stderr);
 }
 
 /* ALLOW_TEARING: Windows 10 1607+ and a driver that allows it. */
@@ -135,7 +401,11 @@ UINT d3d8_sync_swap_flags(void) { return s_flags; }
 
 void d3d8_sync_window_changed(void)
 {
-    if (s_hwnd) InterlockedExchange(&s_hz, d3d8_monitor_hz(s_hwnd));
+    /* window <-> full screen: how the frames reach the display is read again */
+    InterlockedExchange(&s_comp_again, 1);
+    if (!s_hwnd) return;
+    InterlockedExchange(&s_hz, d3d8_monitor_hz(s_hwnd));
+    rate_update(s_hwnd, "window resized");
 }
 
 /* ── mesures (XBOX_PACING_LOG / XBOX_PACING_CSV) ─────────────────── */
@@ -221,6 +491,9 @@ void d3d8_sync_report(void)
     static LONG done;
     if (!M.on || InterlockedExchange(&done, 1)) return;
     report_global("summary");
+    if (G.on)
+        fprintf(stderr, "D3D8: present grid: %llu frames held to their slot, %llu late, %llu restarts\n",
+                G.held, G.late, G.restart);
     if (M.csv) fflush(M.csv);
 }
 
@@ -231,7 +504,7 @@ static void pacing_init(void)
     if (!M.on) return;
     if (c && *c) {
         M.csv = fopen(c, "w");
-        if (M.csv) fprintf(M.csv, "# t_ms,itv_ms,wait_ms,present_ms,sync,flags,present_count,present_refresh,sync_refresh,sync_qpc_ms,hz\n");
+        if (M.csv) fprintf(M.csv, "# t_ms,itv_ms,wait_ms,present_ms,sync,flags,present_count,present_refresh,sync_refresh,sync_qpc_ms,hz,last_present\n");
     }
     M.t0 = M.win_t0 = now_ms();
     atexit(pacing_atexit);
@@ -268,12 +541,18 @@ static void pacing_note(IDXGISwapChain *sc, double t_end, double wait_ms, double
             if (fs.PresentCount != M.pc0) { M.pc0 = fs.PresentCount; M.pr0 = fs.PresentRefreshCount; }
         } else M.stats_err++;
     }
-    if (M.csv)
-        fprintf(M.csv, "%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%.3f,%ld\n", t_end - M.t0, itv, wait_ms, pres_ms,
+    if (M.csv) {
+        /* last_present: the PresentCount DXGI gave this very Present, the
+         * same key as present_count in the frame statistics: each row's frame is
+         * then found on screen exactly (no index offset to guess). */
+        UINT lpc = 0;
+        if (s_flip && FAILED(IDXGISwapChain_GetLastPresentCount(sc, &lpc))) lpc = 0;
+        fprintf(M.csv, "%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%.3f,%ld,%u\n", t_end - M.t0, itv, wait_ms, pres_ms,
                 sync, flags, have ? fs.PresentCount : 0, have ? fs.PresentRefreshCount : 0,
                 have ? fs.SyncRefreshCount : 0,
                 have && fs.SyncQPCTime.QuadPart ? (double)fs.SyncQPCTime.QuadPart * 1000.0 / s_qf - M.t0 : 0.0,
-                (long)s_hz);
+                (long)s_hz, lpc);
+    }
     if (t_end - M.win_t0 >= 10000.0) {
         if (getenv("XBOX_PACING_LOG")) report_window();
         if (M.csv) fflush(M.csv);
@@ -282,10 +561,80 @@ static void pacing_note(IDXGISwapChain *sc, double t_end, double wait_ms, double
     }
 }
 
+/* ── render gate (XBOX_RENDER_GATE=1|2, off by default) ──────────────
+ * Without it, the pump waits on the latency object just before Present:
+ * when the DXGI queue is full, the game has already started (and frozen
+ * the content of) the next frame, which then waits in the queue. With it,
+ * the game's thread waits before it starts a render (fps_cap.c,
+ * render_gate) until at most N frames are still on their way to the
+ * screen (in the push buffer + in the DXGI queue): the content is taken as
+ * late as the screen allows. The pump no longer waits; a thread takes the
+ * latency object's signals instead (one per frame that left the queue),
+ * and the count is checked against the DXGI frame statistics after every
+ * Present (a lost signal must not tighten the gate for good). */
+static DWORD WINAPI gate_retire_thread(LPVOID arg)
+{
+    HANDLE w = (HANDLE)arg;
+    while (!s_gate_stop)
+        if (WaitForSingleObjectEx(w, 50, FALSE) == WAIT_OBJECT_0) InterlockedIncrement(&s_retired);
+    return 0;
+}
+
+int d3d8_sync_gate(void) { return s_gate_live ? s_gate : 0; }
+
+/* Frames that left the queue so far (the latency object's signals). */
+long d3d8_sync_retired(void) { return s_retired; }
+
+void d3d8_sync_gate_stats(double *stats_minus_count, unsigned long long *resync)
+{
+    *stats_minus_count = s_gate_dn ? (double)s_gate_dsum / (double)s_gate_dn : 0.0;
+    *resync = s_gate_resync;
+}
+
+int d3d8_sync_queued(void)
+{
+    LONG q = s_presented + s_qadj - s_retired + s_latency;   /* the object starts with s_latency signals */
+    return q < 0 ? 0 : (int)q;
+}
+
+/* Pump, after a Present (gate on): the counted queue is never more than what
+ * the frame statistics show (those may lag a refresh behind: an upper bound). */
+static void gate_check(IDXGISwapChain *sc)
+{
+    DXGI_FRAME_STATISTICS fs;
+    UINT lpc = 0;
+    LONG cq = s_presented + s_qadj - s_retired + s_latency, sq;
+    if (cq < 0) { InterlockedExchangeAdd(&s_qadj, -cq); cq = 0; }
+    memset(&fs, 0, sizeof fs);
+    if (FAILED(IDXGISwapChain_GetLastPresentCount(sc, &lpc)) || FAILED(IDXGISwapChain_GetFrameStatistics(sc, &fs))
+        || !fs.PresentCount || lpc < fs.PresentCount)
+        return;
+    sq = (LONG)(lpc - fs.PresentCount);
+    s_gate_dsum += sq - cq;
+    s_gate_dn++;
+    if (cq > sq) {
+        InterlockedExchangeAdd(&s_qadj, sq - cq);
+        s_gate_resync++;
+    }
+}
+
+static void gate_start(void)
+{
+    if (!s_gate || !s_flip || !s_wait || s_gate_thread) return;
+    s_gate_stop = 0;
+    s_gate_thread = CreateThread(NULL, 0, gate_retire_thread, s_wait, 0, NULL);
+    if (!s_gate_thread) { fprintf(stderr, "D3D8: XBOX_RENDER_GATE: no thread, gate off\n"); return; }
+    SetThreadPriority(s_gate_thread, THREAD_PRIORITY_HIGHEST);
+    InterlockedExchange(&s_gate_live, 1);
+    fprintf(stderr, "D3D8: XBOX_RENDER_GATE=%d: the game waits before each render until at most %d frame(s) are on "
+            "their way to the screen; no wait before Present\n", s_gate, s_gate);
+}
+
 void d3d8_sync_created(IDXGISwapChain *sc, HWND hwnd)
 {
     s_hwnd = hwnd;
     InterlockedExchange(&s_hz, d3d8_monitor_hz(hwnd));
+    rate_update(hwnd, "game window");
     if (s_flip) {
         static const GUID iid_sc2 = { 0xa8be2ac4, 0x199f, 0x4946, { 0xb3,0x31, 0x79,0x59,0x9f,0xb9,0x8d,0xe7 } };
         IDXGISwapChain2 *sc2 = NULL;
@@ -297,11 +646,17 @@ void d3d8_sync_created(IDXGISwapChain *sc, HWND hwnd)
     }
     now_ms();
     pacing_init();
+    pgrid_init();
+    if (G.on) fprintf(stderr, "D3D8: XBOX_PRESENT_GRID=%d: 60 fps Presents on a steady grid, margin %.1f ms%s "
+                      "(only at the 60 fps limit with VSync / Adaptive on a display above 60 Hz)\n", G.on, G.margin,
+                      G.on == 2 ? ", GPU waited for, kept off the vertical blank"
+                      : G.on == 3 ? " at least, adaptive (GPU end p95 + 0.5, up to 10 ms), GPU waited for, kept off the vertical blank" : "");
     fprintf(stderr, "D3D8: presentation %s (%s%s), display %ld Hz%s\n", k_mode_name[s_mode],
             s_flip ? "flip model, 3 buffers" : "DXGI_SWAP_EFFECT_DISCARD",
             s_flip ? (s_tearing ? ", tearing allowed" : ", no tearing") : (s_legacy_vsync ? ", XBOX_VSYNC=1" : ""),
             (long)s_hz, s_wait ? "" : (s_flip ? ", no latency object" : ""));
     if (s_flip && s_wait) fprintf(stderr, "D3D8: presentation queue: %d frame(s) at most\n", s_latency);
+    gate_start();
 }
 
 /* Adaptive: an arrival gap of this length or more is a load or a stall, not
@@ -313,6 +668,568 @@ void d3d8_sync_created(IDXGISwapChain *sc, HWND hwnd)
 #define ADAPTIVE_AVG_MS   500.0
 #define ADAPTIVE_SLOW     1.10
 
+/* Present grid (mode 1, XBOX_PRESENT_GRID=1[:margin ms]; mode 3 is the default).
+ * At the 60 fps limit the game's own frame timer re-arms itself with whole
+ * milliseconds: its frames come 14 to 19 ms apart (16.667 on average). On a
+ * display above 60 Hz each one then reaches the screen after 3, 4 or 5
+ * refreshes at 240 Hz (20 to 34 % of frames not on 4). With the grid,
+ * the Present waits for a steady 60 Hz slot that follows the game's own
+ * frames (anchor nudged towards their mean, so it never drifts away), plus a
+ * margin that covers their spread: every frame is shown for the same time.
+ * The game's timer and logic are untouched; only the Present is held (by
+ * the margin, ~3 ms, plus the frame's earliness). */
+#define PGRID_PERIOD      (1000.0 / 60.0)
+
+/* Mode 2 (XBOX_PRESENT_GRID=2[:margin ms[:guard ms]], off by default):
+ * the grid of mode 1, plus what mode 1 leaves to chance (Presents
+ * regular to 0.02 ms, still 10-17 % of frames on 3 or 5 refreshes at
+ * 240 Hz, at every phase against the refresh):
+ *  - the frame's GPU work is waited for (D3D11 event query) before the
+ *    hold: a frame finished at a varying time after its Present reached the
+ *    screen at a varying refresh;
+ *  - the vertical blank is predicted from the DXGI frame statistics (last
+ *    blank's QPC time and count, period measured over >= 1 s of blanks): a
+ *    Present that would fall less than `guard` before a blank (the flip may
+ *    or may not catch it) waits until just after it, so consecutive frames
+ *    stay on the same side. The phase of the game's frames against the
+ *    blanks drifts slowly (60 against 239.98 / 4 Hz here: one refresh in
+ *    ~50 s), so this moves frames by one refresh once per crossing only.
+ * Cost: the presenting thread waits for the GPU (the game waits for that
+ * thread; at 60 fps the GPU frame fits well within 16.7 ms), plus up to
+ * `guard` + 0.3 ms in the guard band. With a variable refresh (G-Sync /
+ * FreeSync) the blank prediction is meaningless: the guard is skipped when
+ * the measured period strays from the display's rate. */
+#include <d3d11.h>
+#include <d3d11_4.h>
+static struct {
+    int tried, have_q;
+    ID3D11DeviceContext *ctx;
+    ID3D11Query *q;
+    double guard, vq0, vper;
+    UINT vc0;
+    unsigned long long gpu_frames, gpu_slow, guarded, vbl_ok;
+    double gpu_ms;
+    double gd[128], mcur;           /* mode 3: GPU end - slot over the last 128 frames (~2 s), margin in use */
+    int gn, gi;
+} V;
+
+/* Mode 3 ("2b", XBOX_PRESENT_GRID=3[:min margin ms[:guard ms]], the
+ * default: 3:3:2.5, see pgrid_init): mode 2
+ * with a margin that follows the GPU. Mode 2's fixed 3 ms was shorter than
+ * the GPU work on this PC (~4.9 ms after the frame's arrival, PC alone):
+ * 79 to 92 % of frames came after their slot + margin and left at once, off
+ * the grid. Here the margin = p95 of (GPU end - slot) over the last
+ * ~2 s + 0.5 ms, within [margin, 10] ms (margin: 3 by default): the frame
+ * is finished before it is sent, and sent on the grid. */
+static double pgrid_margin3(double d)
+{
+    double tmp[128], p;
+    int i, j, n;
+    V.gd[V.gi] = d;
+    V.gi = (V.gi + 1) & 127;
+    if (V.gn < 128) V.gn++;
+    n = V.gn;
+    if (n < 30) { V.mcur = G.margin; return V.mcur; }
+    /* Sticky: a margin that moved every frame moved the Present across the
+     * guard band's edge and back (3 / 5 refresh pairs). Recomputed
+     * every 128 frames (~2 s): taken when higher, lowered only by more than
+     * 1 ms. */
+    if (V.mcur > 0.0 && V.gi != 0) return V.mcur;
+    for (i = 0; i < n; i++) {                 /* insertion sort, 128 values at most */
+        double x = V.gd[i];
+        for (j = i; j > 0 && tmp[j - 1] > x; j--) tmp[j] = tmp[j - 1];
+        tmp[j] = x;
+    }
+    p = tmp[(int)(0.95 * (n - 1))] + 0.5;
+    if (p < G.margin) p = G.margin;
+    if (p > 10.0) p = 10.0;
+    if (V.mcur <= 0.0 || p > V.mcur || p < V.mcur - 1.0) V.mcur = p;
+    return V.mcur;
+}
+
+/* The wait for the frame's GPU work sleeps (M1): it used to turn on
+ * YieldProcessor + Sleep(0) for the whole GPU time of every frame (S60 and
+ * the grid, the defaults at 60 fps), a core busy for 3 to 10 ms a frame.
+ *  - A D3D11 fence (ID3D11Device5, Windows 10 1703+; DXVK has it): when the
+ *    usual GPU time is 3 ms or more, Signal after the frame's commands,
+ *    SetEventOnCompletion and WaitForSingleObject until 2 ms before it (the
+ *    event wakes the thread sooner if the GPU is done), then the event query
+ *    is turned on to the end exactly as before. A shorter GPU time is waited
+ *    for exactly as before (turned on whole: the old cost, under 3 ms).
+ *  - Without one: the event query as before, polled with Sleep(1) while the
+ *    wait is more than 2.5 ms short of the usual GPU time, then turned on for
+ *    the end (Sleep(1) may last up to ~2 ms). The usual time is a running
+ *    mean of the waits of every 8th frame, turned on from the start: a mean
+ *    of the slept waits would grow with the sleeps' lateness (measured: 2.0
+ *    against 0.9 ms) and push the grid's margin up.
+ * Both stop at 25 ms, as before (never block a stalled frame for long). */
+static struct {
+    int tried, ok, spin, test_sleep;
+    ID3D11DeviceContext4 *ctx4;
+    ID3D11Fence *fence;
+    HANDLE ev;
+    UINT64 value;
+    double mean;                    /* running mean of the turned-on waits (ms), for the query's polling */
+    unsigned n;                     /* frames waited with the query */
+} F;
+
+static const IID k_iid_device5 = { 0x8ffde202, 0xa0e7, 0x45df, { 0x9e, 0x01, 0xe8, 0x37, 0x80, 0x1b, 0x5e, 0xa0 } };
+static const IID k_iid_context4 = { 0x917600da, 0xf58c, 0x4c33, { 0x98, 0xd8, 0x3e, 0x15, 0xb3, 0x90, 0xfa, 0x24 } };
+static const IID k_iid_fence = { 0xaffde9d1, 0x1df7, 0x4bb7, { 0x8a, 0x34, 0x0f, 0x46, 0x25, 0x1d, 0xab, 0x80 } };
+
+static void gpu_fence_init(ID3D11Device *dev)
+{
+    ID3D11Device5 *d5 = NULL;
+    if (FAILED(ID3D11Device_QueryInterface(dev, &k_iid_device5, (void **)&d5)) || !d5) d5 = NULL;
+    if (d5 && SUCCEEDED(ID3D11DeviceContext_QueryInterface(V.ctx, &k_iid_context4, (void **)&F.ctx4)) && F.ctx4 &&
+        SUCCEEDED(ID3D11Device5_CreateFence(d5, 0, D3D11_FENCE_FLAG_NONE, &k_iid_fence, (void **)&F.fence)) && F.fence &&
+        (F.ev = CreateEventW(NULL, FALSE, FALSE, NULL)) != NULL) {
+        F.ok = 1;
+    } else {
+        if (F.fence) { ID3D11Fence_Release(F.fence); F.fence = NULL; }
+        if (F.ctx4) { ID3D11DeviceContext4_Release(F.ctx4); F.ctx4 = NULL; }
+    }
+    if (d5) ID3D11Device5_Release(d5);
+    fprintf(stderr, "D3D8: GPU wait: %s\n", F.ok ? "fence (asleep to 2 ms before the usual GPU end when it is 3 ms or more)"
+                                                 : "event query, Sleep(1) polling (no D3D11 fence)");
+}
+
+static void pgrid_gpu_wait(IDXGISwapChain *sc)
+{
+    double t0, el;
+    int armed = 0;
+    if (!V.tried) {
+        ID3D11Device *dev = NULL;
+        D3D11_QUERY_DESC qd;
+        V.tried = 1;
+        qd.Query = D3D11_QUERY_EVENT;
+        qd.MiscFlags = 0;
+        if (SUCCEEDED(IDXGISwapChain_GetDevice(sc, &IID_ID3D11Device, (void **)&dev)) && dev) {
+            ID3D11Device_GetImmediateContext(dev, &V.ctx);
+            if (V.ctx && SUCCEEDED(ID3D11Device_CreateQuery(dev, &qd, &V.q)) && V.q) V.have_q = 1;
+            if (V.ctx) gpu_fence_init(dev);
+            ID3D11Device_Release(dev);
+        }
+        if (!V.have_q && !F.ok) fprintf(stderr, "D3D8: XBOX_PRESENT_GRID=2: no GPU event query, the GPU is not waited for\n");
+    }
+    if (!V.have_q) return;
+    if (F.ok && (F.n & 7u) && (F.mean >= 3.0 || F.test_sleep)) {
+        /* asleep on the fence's event until 2 ms before the usual end (sooner if the GPU is done),
+         * then the query turned on as before: a wake by the event alone comes a little after the
+         * GPU's end (offmode not settled, 1.35 against 0.96 %) */
+        t0 = now_ms();
+        F.value++;
+        ID3D11DeviceContext4_Signal(F.ctx4, F.fence, F.value);
+        ID3D11DeviceContext_Flush(V.ctx);
+        if (ID3D11Fence_GetCompletedValue(F.fence) < F.value) {
+            if (FAILED(ID3D11Fence_SetEventOnCompletion(F.fence, F.value, F.ev))) {
+                F.ok = 0;                       /* not again: Sleep(1) polling from now on */
+                fprintf(stderr, "D3D8: GPU wait: SetEventOnCompletion failed, Sleep(1) polling from now on\n");
+            } else {
+                armed = 1;
+                WaitForSingleObject(F.ev, F.test_sleep ? 25u : (DWORD)(F.mean - 2.0));
+            }
+        }
+        ID3D11DeviceContext_End(V.ctx, (ID3D11Asynchronous *)V.q);
+    } else {
+        ID3D11DeviceContext_End(V.ctx, (ID3D11Asynchronous *)V.q);
+        t0 = now_ms();
+    }
+    /* flags 0: the first call flushes the commands */
+    while (ID3D11DeviceContext_GetData(V.ctx, (ID3D11Asynchronous *)V.q, NULL, 0, 0) != S_OK) {
+        el = now_ms() - t0;
+        if (el > 25.0) { V.gpu_slow++; break; }      /* never block a stalled frame for long */
+        if (!F.ok && !F.spin && (F.n & 7u) && el + 2.5 < F.mean) { Sleep(1); continue; }
+        YieldProcessor();
+        Sleep(0);
+    }
+    if (armed) WaitForSingleObject(F.ev, 0);       /* its signal, if the turn saw the end first */
+    el = now_ms() - t0;
+    if (!(F.n++ & 7u)) F.mean = F.mean > 0.0 ? F.mean + (el - F.mean) / 4.0 : el;   /* every 8th: turned on */
+    V.gpu_frames++;
+    V.gpu_ms += el;
+}
+
+/* Next vertical blank strictly after t (ms, QPC base), from the frame
+ * statistics; 0 if unknown or the refresh does not look fixed. */
+static double pgrid_next_blank(IDXGISwapChain *sc, double t)
+{
+    DXGI_FRAME_STATISTICS fs;
+    double q, n, nominal = s_hz > 0 ? 1000.0 / (double)s_hz : 0.0;
+    memset(&fs, 0, sizeof fs);
+    if (!s_flip || FAILED(IDXGISwapChain_GetFrameStatistics(sc, &fs)) || !fs.SyncQPCTime.QuadPart || nominal <= 0.0) return 0.0;
+    q = (double)fs.SyncQPCTime.QuadPart * 1000.0 / s_qf;
+    if (!V.vc0 || fs.SyncRefreshCount < V.vc0 || q < V.vq0) { V.vc0 = fs.SyncRefreshCount; V.vq0 = q; V.vper = 0.0; return 0.0; }
+    if (fs.SyncRefreshCount - V.vc0 >= (UINT)(s_hz > 0 ? s_hz : 60))   /* >= 1 s of blanks */
+        V.vper = (q - V.vq0) / (double)(fs.SyncRefreshCount - V.vc0);
+    if (V.vper <= 0.0) return 0.0;
+    if (fabs(V.vper - nominal) > 0.02 * nominal) {                 /* VRR, mode change: start again */
+        V.vc0 = fs.SyncRefreshCount; V.vq0 = q; V.vper = 0.0;
+        return 0.0;
+    }
+    n = ceil((t - q) / V.vper);
+    if (q + n * V.vper <= t) n += 1.0;
+    V.vbl_ok++;
+    return q + n * V.vper;
+}
+
+/* The grid only where 60 fps can be even: a display at a multiple of 60 Hz
+ * (120, 180, 240, 360; within 1 %, so 239 or 59.94 x 4 count). At 144 or
+ * 165 Hz a 60 fps frame lasts 2.4 or 2.75 refreshes whatever is done; the
+ * grid would only add delay there. Checked again when the display's
+ * rate changes (window moved to another display); one log line each time. */
+static int pgrid_hz_ok(long hz)
+{
+    static long checked = -1;
+    static int ok;
+    if (hz != checked) {
+        long n = (hz + 30) / 60;
+        checked = hz;
+        ok = n >= 2 && labs(hz - 60 * n) <= (60 * n) / 100;
+        fprintf(stderr, "D3D8: present grid: display %ld Hz %s\n", hz,
+                ok ? "is a multiple of 60: grid on" : "is not a multiple of 60: grid off (a 60 fps frame cannot last a whole number of refreshes there)");
+    }
+    return ok;
+}
+
+static void pgrid_init(void)
+{
+    const char *e = getenv("XBOX_PRESENT_GRID"), *c;
+    /* Default: mode 3 with a 3 ms minimum margin and a 2.5 ms guard, the
+     * measured best (0-1.5 % of 60 fps frames off 4 refreshes at
+     * 240 Hz, against 25-29 % without the grid; ~5 ms more delay). It is a
+     * fix, always on: it only acts at the 60 fps limit with VSync / Adaptive
+     * on a display at a multiple of 60 Hz (pgrid_hz_ok), and the game's
+     * logic is untouched. XBOX_PRESENT_GRID=0 turns it off (diagnostic). */
+    /* With the frame timer on an exact grid (frame_clock.c) the frames
+     * arrive ~2.5 ms less scattered: the adaptive margin is let down to 1 ms
+     * (it stays the p95 of GPU end - slot + 0.5). */
+    if (!e || !e[0]) e = s_fc ? "3:1:2.5" : "3:3:2.5";
+    G.on = e[0] == '1' || e[0] == '2' || e[0] == '3' ? e[0] - '0' : 0;
+    G.margin = 3.0;
+    V.guard = G.on == 3 ? 2.5 : 1.0;
+    if (G.on && (c = strchr(e, ':')) != NULL) {
+        double m = atof(c + 1);
+        if (m >= 0.0 && m <= 8.0) G.margin = m;
+        if ((c = strchr(c + 1, ':')) != NULL) {
+            m = atof(c + 1);
+            if (m >= 0.0 && m <= 4.0) V.guard = m;
+        }
+    }
+}
+
+
+/* ── 60 Hz displays (XBOX_S60=0: off, diagnostic) ───────────────────
+ * The title's frames come at 60.000 Hz (its own timer; frame_clock.c puts it
+ * on an exact grid). A "60 Hz" display refreshes a little slower: 59.973 Hz
+ * here (period 16.6745 ms), 59.94 on a TV. With VSync each refresh takes one
+ * frame from the DXGI queue, in order; frames came 0.008 ms per frame faster
+ * than they left, the queue filled up to its limit (2 frames) in ~1 min and
+ * stayed full: 28-31 ms from Present to the screen, and the presenting thread
+ * blocked on the latency object until the title, held up, rendered two ticks
+ * as one (measured: 2 frames waiting at every Present). Above 61 Hz the
+ * grid shows one frame for a refresh fewer now and then instead; at 60 Hz
+ * there is no refresh fewer: a frame has to be left out.
+ * Here, as the console on an NTSC set: each frame is planned on a refresh from
+ * the present grid (its steady 60 Hz slot + margin, GPU waited for) and the
+ * refresh times of the frame statistics; when two frames come to plan the same
+ * refresh (once every 1 / (60 - rate) s: ~37 s here, ~17 s at 59.94), the
+ * second is not presented -- two ticks for one refresh -- and the queue never
+ * holds more than the frame waiting for its refresh. A frame not finished in
+ * time for its refresh is presented just after it (one refresh later, its
+ * predecessor shown twice); the next one, planned on that refresh, is then
+ * left out. The title's logic and ticks are untouched; only Presents are left
+ * out. Only at the 60 fps limit, VSync (or Adaptive without tearing), on a
+ * display at 59-61 Hz with a fixed refresh in the frame statistics; anywhere
+ * else (VRR, no statistics: Deck / DXVK without them, a window behind) the
+ * previous presentation is kept (2-frame queue), and one log line says so. */
+#define S60_LEAD    1.5     /* ms before its refresh a Present must be made (GPU done) to be shown on it */
+#define S60_HYST    1.0     /* ms: how early a frame must be for an occupied refresh to be left out (see s60_wait) */
+static struct {
+    int tried, off, on;
+    double s_prev;          /* refresh the last presented frame is shown on (ms, QPC); 0: unknown */
+    double t_log;
+    const char *why;        /* last reason it stood aside */
+    unsigned long long frames, drops, late, recover, held, kept;
+} S6;
+#define S60_RING    16
+static struct { UINT pc; double s; } S6R[S60_RING];     /* refresh planned for each Present (by its PresentCount) */
+
+static void s60_note(int on, const char *why)
+{
+    if (on != S6.on || (!on && why != S6.why)) {
+        fprintf(stderr, "D3D8: 60 Hz display: %s%s%s\n", on ? "frames planned on the refresh, one left out when two meet"
+                : "previous presentation (", on ? "" : why, on ? "" : ")");
+        fflush(stderr);
+    }
+    S6.on = on;
+    S6.why = why;
+    if (!on) S6.s_prev = 0.0;
+}
+
+/* 1: this frame takes the 60 Hz display path (s60_wait), from the frame's
+ * arrival (t) and its sync interval. */
+static int s60_check(IDXGISwapChain *sc, double t, UINT sync)
+{
+    long hz = s_hz, cap = s_pace_fps;
+    if (!S6.tried) {
+        const char *e = getenv("XBOX_S60");
+        S6.tried = 1;
+        S6.off = e && e[0] == '0';
+        if (S6.off) fprintf(stderr, "D3D8: XBOX_S60=0: 60 Hz displays keep the 2-frame queue (diagnostic)\n");
+    }
+    if (S6.off || hz < 59 || hz > 61) { if (S6.on) s60_note(0, "display not at 60 Hz"); return 0; }
+    if (!s_flip || !G.on || cap != 60 || sync != 1 || s_gate_live
+        || (s_mode != D3D8_SYNC_VSYNC && s_mode != D3D8_SYNC_ADAPTIVE)) {
+        s60_note(0, "not at the 60 fps limit with VSync");
+        return 0;
+    }
+    if (pgrid_next_blank(sc, t) <= 0.0 || V.vper <= 0.0) {
+        s60_note(0, "no fixed refresh in the frame statistics (VRR, window behind, or none)");
+        return 0;
+    }
+    if (!S6.on) s60_note(1, NULL);
+    return 1;
+}
+
+/* 60 Hz display path (see above): 1 = present now (planned refresh in
+ * S6.s_prev), 0 = leave this frame out. */
+static int s60_wait(IDXGISwapChain *sc, double t)
+{
+    double k, slot, margin, plan, s, per, hold;
+    DXGI_FRAME_STATISTICS fs;
+    S6.frames++;
+    pgrid_gpu_wait(sc);
+    per = V.vper;
+    /* the present grid's slot (as pgrid_wait), its margin from the GPU end */
+    if (G.anchor <= 0.0 || t - G.last_slot > 4.0 * PGRID_PERIOD || t < G.last_slot) {
+        G.anchor = G.last_slot = slot = t;
+        G.restart++;
+    } else {
+        k = floor((t - G.anchor) / PGRID_PERIOD + 0.5);
+        slot = G.anchor + k * PGRID_PERIOD;
+        if (slot < G.last_slot + 0.5 * PGRID_PERIOD) slot = G.last_slot + PGRID_PERIOD;
+        G.anchor += 0.02 * (t - slot);
+        G.last_slot = slot;
+    }
+    t = now_ms();
+    margin = pgrid_margin3(t - slot);
+    plan = slot + margin;
+    if (plan - t > margin + 0.5 * PGRID_PERIOD) plan = t;        /* never planned more than ~half a frame + margin ahead */
+    s = pgrid_next_blank(sc, plan + S60_LEAD);                   /* the refresh it is planned on */
+    if (s <= 0.0) { S6.s_prev = 0.0; return 1; }
+    /* The latest frame shown, by the statistics (updated at each flip): shown
+     * on another refresh than planned (a refresh missed unseen) -> the frames
+     * planned after it move as much, so that the next one meets them and is
+     * left out (the queue back to one frame). */
+    memset(&fs, 0, sizeof fs);
+    if (SUCCEEDED(IDXGISwapChain_GetFrameStatistics(sc, &fs)) && fs.PresentCount && fs.SyncQPCTime.QuadPart) {
+        int i = (int)(fs.PresentCount % S60_RING), j;
+        if (S6R[i].pc == fs.PresentCount && S6R[i].s > 0.0) {
+            double a = (double)fs.SyncQPCTime.QuadPart * 1000.0 / s_qf
+                     - (double)(fs.SyncRefreshCount - fs.PresentRefreshCount) * per;
+            double d = a - S6R[i].s, n = floor(d / per + 0.5);
+            S6R[i].pc = 0;                                       /* checked once */
+            if (n != 0.0 && fabs(d) < 8.0 * per) {
+                for (j = 0; j < S60_RING; j++)
+                    if (S6R[j].pc > fs.PresentCount) S6R[j].s += n * per;
+                if (S6.s_prev > 0.0) S6.s_prev += n * per;
+                S6.recover++;
+            }
+        }
+    }
+    /* A frame already planned on that refresh (or later): this one is left
+     * out only when it is early for it by S60_HYST more than the lead; else
+     * it goes on the refresh after (up to S60_HYST more delay). The plan
+     * jitters by ~0.1 ms (grid anchor, margin steps) and the beat moves it
+     * 0.008 ms per frame: without this margin the plan crossed the refresh
+     * back and forth near the meeting point, 8-14 frames left out a minute
+     * (with as many shown twice) instead of one per beat (measured).
+     * After a frame left out the next one starts S60_HYST clear of it. */
+    if (S6.s_prev > 0.0 && s < S6.s_prev + 0.5 * per && S6.s_prev - t < 3.0 * per) {
+        if (plan + S60_LEAD + S60_HYST <= S6.s_prev) { S6.drops++; return 0; }
+        s = S6.s_prev + per;
+        S6.kept++;
+    }
+    t = now_ms();
+    /* The other side: a plan moved past the refresh after the previous one
+     * (a margin step) while the frame is ready for it keeps the cadence (no
+     * refresh left without a new frame). */
+    if (S6.s_prev > 0.0 && s > S6.s_prev + 1.5 * per && S6.s_prev - t < 3.0 * per && t + S60_LEAD <= S6.s_prev + per) {
+        s = S6.s_prev + per;
+        S6.kept++;
+    }
+    if (t > s - S60_LEAD) {
+        /* too late for it: the first refresh it surely makes (a refresh
+         * closer than the lead may or may not catch it: just after it) */
+        double b = pgrid_next_blank(sc, t);
+        S6.late++;
+        if (b <= 0.0) { hold = t; s = 0.0; }
+        else if (b - t < S60_LEAD) { hold = b + 0.3; s = b + per; }
+        else { hold = t; s = b; }
+    } else {
+        hold = s - per + 0.3;                                    /* never before the refresh ahead of it: shown on s, not earlier */
+    }
+    if (t < hold) S6.held++;
+    while ((t = now_ms()) < hold) {
+        if (hold - t > 1.5) Sleep((DWORD)(hold - t - 1.0));
+        else { YieldProcessor(); if (hold - t > 0.3) Sleep(0); }
+    }
+    S6.s_prev = s;
+    if (t - S6.t_log >= 10000.0) {
+        if (S6.t_log > 0.0 && xbox_log_stats())
+            fprintf(stderr, "D3D8: 60 Hz display: %llu frames, %llu left out (two on one refresh), %llu late (a refresh later), "
+                    "%llu shown off plan by the statistics, refresh %.4f ms, margin now %.2f ms\n",
+                    S6.frames, S6.drops, S6.late, S6.recover, per, V.mcur);
+        S6.t_log = t;
+    }
+    return 1;
+}
+
+/* Holds the calling (presenting) thread until this frame's slot + margin
+ * (mode 2: GPU done first, then off the blank's guard band). */
+static void pgrid_wait(IDXGISwapChain *sc, double t)
+{
+    double k, slot, target, margin;
+    long hz = s_hz, cap = s_pace_fps;
+    static double last_log;
+    if (!G.on || cap != 60 || (s_mode != D3D8_SYNC_VSYNC && s_mode != D3D8_SYNC_ADAPTIVE)) {
+        return;
+    }
+    if (hz <= 61) return;
+    if (!pgrid_hz_ok(hz)) return;
+    /* Counters every 10 s: the benches end the game with TerminateProcess (no atexit). */
+    if (t - last_log >= 10000.0) {
+        if (last_log > 0.0 && xbox_log_stats()) {
+            fprintf(stderr, "D3D8: present grid: %llu frames held to their slot, %llu late, %llu restarts (total)\n",
+                    G.held, G.late, G.restart);
+            if (G.on >= 2)
+                fprintf(stderr, "D3D8: present grid %d: GPU wait %.2f ms avg (%llu over 25 ms), %llu frames moved past a blank, blank known %llu, period %.4f ms, guard %.1f ms, margin now %.2f ms\n",
+                        G.on, V.gpu_frames ? V.gpu_ms / (double)V.gpu_frames : 0.0, V.gpu_slow, V.guarded, V.vbl_ok, V.vper, V.guard,
+                        G.on == 3 ? V.mcur : G.margin);
+        }
+        last_log = t;
+    }
+    if (G.on >= 2) pgrid_gpu_wait(sc);
+    if (G.anchor <= 0.0 || t - G.last_slot > 4.0 * PGRID_PERIOD || t < G.last_slot) {
+        /* start, load, stall: the grid starts again on this frame */
+        G.anchor = G.last_slot = t;
+        G.restart++;
+        return;
+    }
+    k = floor((t - G.anchor) / PGRID_PERIOD + 0.5);
+    slot = G.anchor + k * PGRID_PERIOD;
+    if (slot < G.last_slot + 0.5 * PGRID_PERIOD) slot = G.last_slot + PGRID_PERIOD;   /* one frame per slot */
+    /* follow the game's clock: mean arrival on the slot */
+    G.anchor += 0.02 * (t - slot);
+    G.last_slot = slot;
+    t = now_ms();                                               /* modes 2, 3: after the GPU wait */
+    margin = G.on == 3 ? pgrid_margin3(t - slot) : G.margin;
+    target = slot + margin;
+    if (t >= target) G.late++;
+    else if (target - t > margin + 0.5 * PGRID_PERIOD) target = t;   /* never hold more than ~half a frame + margin */
+    else G.held++;
+    if (G.on >= 2) {
+        double b = pgrid_next_blank(sc, target);
+        if (b > 0.0 && b - target < V.guard) {                  /* the flip may or may not catch this blank */
+            target = b + 0.3;
+            V.guarded++;
+        }
+    }
+    while ((t = now_ms()) < target) {
+        if (target - t > 1.5) Sleep((DWORD)(target - t - 1.0));
+        else { YieldProcessor(); if (target - t > 0.3) Sleep(0); }
+    }
+}
+
+/* Fork: how the frames reach the display (IDXGISwapChainMedia, flip model):
+ * composed by the desktop (+ a refresh or so), on a hardware overlay plane
+ * (an independent flip), or a mode the statistics do not specify. They
+ * describe the last frame the display took, so a reading counts only when it
+ * moves on: after a change (window <-> full screen, another display, the
+ * display's mode: s_comp_again), only once it describes a frame presented
+ * after it; and frames presented while none reached the display since the
+ * last reading (the window hidden, covered, minimised) leave it unknown.
+ * Read every COMP_READ_MS while known (a mode the statistics do not specify,
+ * or a composition failure, included), every COMP_RETRY_MS while unknown;
+ * kept for d3d8_sync_immediate. A line for the log at a change, one a second
+ * at most (the changes in between counted), written whole, never flushed
+ * here: the log's own thread empties it. */
+#define COMP_READ_MS    100.0
+#define COMP_RETRY_MS   16.0
+#define COMP_LOG_MS     1000.0
+#define COMP_QI_MS      2000.0
+static void presentation_mode_note(IDXGISwapChain *sc, double t)
+{
+    static const GUID iid_media = { 0xdd95b90b, 0xf05f, 0x4f6a, { 0xbd,0x65, 0x25,0xbf,0xb2,0x64,0xbd,0x84 } };
+    static const char *const k_name[] = { "composed by the desktop", "hardware overlay plane",
+                                          "none specified", "composition failure" };
+    static int prev = -2;
+    static const char *why = "no media statistics";
+    DXGI_FRAME_STATISTICS_MEDIA fs;
+    UINT lpc = 0;
+    double t0;
+    int mode = -1;
+    char line[200];
+    if (!s_flip) return;
+    if (InterlockedExchange(&s_comp_again, 0)) {
+        InterlockedExchange(&s_comp_mode, -1);
+        CM.marked = SUCCEEDED(IDXGISwapChain_GetLastPresentCount(sc, &CM.mark));
+        CM.changed = t;
+        prev = -1;                      /* the mode found after it is logged, the same or not */
+    }
+    if (t - CM.read >= (s_comp_mode >= 0 ? COMP_READ_MS : COMP_RETRY_MS)) {
+        CM.read = t;
+        t0 = now_ms();
+        if (!CM.m && t >= CM.qi_retry && (FAILED(IDXGISwapChain_QueryInterface(sc, &iid_media, (void **)&CM.m)) || !CM.m)) {
+            CM.m = NULL;                /* no media statistics here (some translation layers): not asked again at once */
+            CM.qi_retry = t + COMP_QI_MS;
+        }
+        why = "no media statistics";
+        if (CM.m) {
+            memset(&fs, 0, sizeof fs);
+            if (SUCCEEDED(IDXGISwapChainMedia_GetFrameStatisticsMedia(CM.m, &fs)) && fs.PresentCount
+                && SUCCEEDED(IDXGISwapChain_GetLastPresentCount(sc, &lpc))) {
+                if (CM.marked && fs.PresentCount <= CM.mark) why = "no frame shown since the change";
+                else if (fs.PresentCount == CM.seen && lpc != CM.lpc) why = "frames presented, none shown since";
+                else { mode = (int)fs.CompositionMode; CM.marked = 0; }
+                CM.seen = fs.PresentCount;
+                CM.lpc = lpc;
+            }
+        }
+        CM.us += (now_ms() - t0) * 1000.0;
+        CM.n++;
+        InterlockedExchange(&s_comp_mode, mode);
+        if (mode >= 0 && CM.changed > 0.0) {
+            CM.found = t - CM.changed;
+            CM.changed = 0.0;
+        }
+        if (mode != prev) {
+            prev = mode;
+            if (CM.pending) CM.skipped++;
+            CM.pending = 1;
+        }
+    }
+    if (CM.pending && t - CM.logged >= COMP_LOG_MS) {
+        int n, k = s_comp_mode;
+        n = snprintf(line, sizeof line, "D3D8: presentation mode: %s%s%s (media statistics read %lu times, %.1f us each",
+                     k >= 0 && k <= 3 ? k_name[k] : "unknown (", k >= 0 && k <= 3 ? "" : why, k >= 0 && k <= 3 ? "" : ")",
+                     CM.n, CM.n ? CM.us / CM.n : 0.0);
+        if (n > 0 && n < (int)sizeof line && k >= 0 && CM.found >= 0.0)
+            n += snprintf(line + n, sizeof line - n, "; %.0f ms after a change", CM.found);
+        if (n > 0 && n < (int)sizeof line && CM.skipped)
+            n += snprintf(line + n, sizeof line - n, "; %lu changes not written", CM.skipped);
+        if (n > 0 && n < (int)sizeof line - 2) {
+            line[n++] = ')'; line[n++] = '\n'; line[n] = 0;
+            fputs(line, stderr);
+        }
+        CM.logged = t;
+        CM.pending = 0;
+        CM.skipped = 0;
+        if (k >= 0) CM.found = -1.0;
+    }
+}
+
 HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
 {
     static double last_arrive, arrive_avg;
@@ -321,13 +1238,8 @@ HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
     HRESULT hr;
 
     t0 = now_ms();
-    if (s_wait) {
-        /* A frame may enter the queue. Bounded timeout: a hidden window or a
-         * display turned off must not freeze the presenting thread. */
-        if (WaitForSingleObjectEx(s_wait, 100, TRUE) == WAIT_TIMEOUT) M.waits_to++;
-    }
-    t1 = now_ms();
-    wait_ms = t1 - t0;
+    /* The sync interval first (it depends on the arrival only, t0): the 60 Hz
+     * display path applies to VSync'ed frames only. */
     switch (s_mode) {
     case D3D8_SYNC_OFF:
         sync = 0;
@@ -351,6 +1263,7 @@ HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
              * frames right after it (race start after the tips screen) are
              * not taken for a slow game. */
             arrive_avg = period;
+            InterlockedExchange(&s_adaptive_tears, 0);
             sync = 1;
             break;
         }
@@ -360,6 +1273,7 @@ HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
          * (tearing) only while the game stays more than 10 % slower than
          * the target pace; otherwise VSync. */
         arrive_avg += (d - arrive_avg) * (period / ADAPTIVE_AVG_MS);
+        InterlockedExchange(&s_adaptive_tears, arrive_avg > ADAPTIVE_SLOW * period);
         if (arrive_avg > ADAPTIVE_SLOW * period && d > period) {
             sync = 0;
             flags = s_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
@@ -371,15 +1285,56 @@ HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
         sync = s_legacy_vsync ? 1 : 0;
         break;
     }
-    hr = IDXGISwapChain_Present(sc, sync, flags);
-    t2 = now_ms();
     last_arrive = t0;
+    if (s60_check(sc, t0, sync)) {
+        /* 60 Hz display: planned on its refresh first; a frame left out
+         * is never presented (and takes nothing from the latency object) */
+        if (!s60_wait(sc, now_ms())) {
+            if (dxgi_ms) *dxgi_ms = 0.0;
+            return S_OK;
+        }
+        if (s_wait && !s_gate_live && WaitForSingleObjectEx(s_wait, 100, TRUE) == WAIT_TIMEOUT) M.waits_to++;
+    } else {
+        if (s_wait && !s_gate_live) {
+            /* A frame may enter the queue. Bounded timeout: a hidden window or a
+             * display turned off must not freeze the presenting thread. */
+            if (WaitForSingleObjectEx(s_wait, 100, TRUE) == WAIT_TIMEOUT) M.waits_to++;
+        }
+        pgrid_wait(sc, now_ms());
+    }
+    t1 = now_ms();
+    wait_ms = t1 - t0;
+    hr = IDXGISwapChain_Present(sc, sync, flags);
+    if (S6.on && S6.s_prev > 0.0) {                         /* the refresh planned for this Present */
+        UINT lpc = 0;
+        if (SUCCEEDED(IDXGISwapChain_GetLastPresentCount(sc, &lpc)) && lpc) {
+            S6R[lpc % S60_RING].pc = lpc;
+            S6R[lpc % S60_RING].s = S6.s_prev;
+        }
+    }
+    if (s_gate_live) {
+        InterlockedIncrement(&s_presented);
+        gate_check(sc);
+    }
+    t2 = now_ms();
     if (dxgi_ms) *dxgi_ms = t2 - t1;
     if (M.on) pacing_note(sc, t2, wait_ms, t2 - t1, sync, flags);
+    presentation_mode_note(sc, t2);
     return hr;
 }
 
 void d3d8_sync_release(void)
 {
+    if (s_gate_thread) {        /* before its handle goes */
+        InterlockedExchange(&s_gate_live, 0);
+        InterlockedExchange(&s_gate_stop, 1);
+        WaitForSingleObject(s_gate_thread, 500);
+        CloseHandle(s_gate_thread);
+        s_gate_thread = NULL;
+        if (s_gate_resync) fprintf(stderr, "D3D8: render gate: queue count corrected %llu times\n", s_gate_resync);
+    }
     if (s_wait) { CloseHandle(s_wait); s_wait = NULL; }
+    if (CM.m) { IDXGISwapChainMedia_Release(CM.m); CM.m = NULL; }
+    InterlockedExchange(&s_comp_mode, -1);
+    InterlockedExchange(&s_comp_again, 1);
 }

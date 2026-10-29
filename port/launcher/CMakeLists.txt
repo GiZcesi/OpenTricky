@@ -23,3 +23,4 @@ endif()
 
 add_executable(ot_assets_preview tools/ot_assets_preview.c tools/png_write.c)
 target_link_libraries(ot_assets_preview PRIVATE ot_launcher_assets)
+

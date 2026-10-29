@@ -7,7 +7,7 @@
  * glyph is cleared and an icon drawing is fitted inside it; the rest of the
  * atlas is kept. Drawings: port/assets/btnicons/juliocacko/ (CC0), built into
  * the executable as resources; the "ps2" style has its own pictures
- * (port/assets/btnicons/ps2/). No picture of the Xbox game is stored anywhere.
+ * (port/assets/btnicons/ps2/).
  *
  * The launcher always sets XBOX_BUTTON_ICONS ([Fork] ButtonIcons). Unset or
  * "0" (test runs started without the launcher's settings): nothing here
@@ -20,7 +20,7 @@
  *                                  SELECT, START)
  *                     ps2          the PS2 button style, its pictures
  *                                  (port/assets/btnicons/ps2/), at
- *                                  the PS2 sizes and sampled nearest
+ *                                  their own sizes and sampled nearest
  *                                  neighbour (auto in a build made with
  *                                  -DSSX_PS2_BUTTONS=OFF)
  *                     debug        each glyph rectangle filled with a bright
@@ -65,7 +65,7 @@ IDirect3DTexture8 *btnicons_compose(const uint8_t *level0, uint32_t n0, uint32_t
                                     uint32_t color, IDirect3DTexture8 *guest);
 
 /* 1 in the "ps2" style (the PS2 button style): ctlscheme.c then draws
- * the button shapes at the PS2 sizes. */
+ * the button shapes at the pictures' sizes. */
 int btnicons_ps2(void);
 
 /* 1 when `t` is a composed button atlas to be sampled nearest neighbour (the
@@ -74,8 +74,8 @@ int btnicons_point(const IDirect3DTexture8 *t);
 
 /* The "ps2" style's shapes of the trick and race HUDs, i = 0, 1, ...: the
  * shape number, its UV rectangle in texels (u0, v0, u1, v1, as measured in
- * game), its size in the game and the size that shows the PS2 glyph at the
- * PS2 size (the game's rule: texels + 1). 0 past the last one. */
+ * game), its size in the game and the size that shows the style's picture at
+ * its own size (the game's rule: texels + 1). 0 past the last one. */
 int btnicons_ps2_shape(int i, unsigned *shape, float uv[4], float game_wh[2], float ps2_wh[2]);
 
 /* The trick tutorial of the "ps2" and "playstation" styles, i = 0, 1, ...:

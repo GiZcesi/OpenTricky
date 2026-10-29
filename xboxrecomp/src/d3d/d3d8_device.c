@@ -17,11 +17,20 @@
 
 #include <time.h>
 #include "d3d8_internal.h"
+#include "d3d8_nv2a_vsh.h"   /* the ghost's draws (fork) */
 #include "d3d8_post.h"
 #include "d3d8_gpuprof.h"
 #include "d3d8_softshadow.h"
+#include "d3d8_veil.h"
+#include "d3d8_speedfx.h"
+#include "d3d8_lights.h"
+#include "d3d8_bloom.h"
+#include "d3d8_haze_halo.h"
+#include "d3d8_rscale.h"
+#include "d3d8_temporal.h"
 #include "d3d8_sync.h"
 #include "../kernel/xbox_perf.h"
+#include "../kernel/xbox_logstats.h"
 #include <intrin.h>
 #include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
@@ -64,6 +73,20 @@ typedef struct D3D8DeviceState {
     UINT                      swap_w, swap_h;
     UINT                      guest_w, guest_h;   /* the title's own backbuffer size */
 
+    /* Fork: render scale of the 3D (d3d8_rscale.h). The 3D of an image in
+     * a race goes here, at rs_w x rs_h; the targets above stay at the
+     * render size and get the rest of the image. Made only when the scale
+     * is not 100 %. Depth always typeless with a shader view (the copy to
+     * the render size and the soft shadows read it). */
+    ID3D11Texture2D          *rs_tex;         /* resolved, sampleable */
+    ID3D11ShaderResourceView *rs_srv;
+    ID3D11Texture2D          *rs_ms;          /* multisampled, when anti-aliasing */
+    ID3D11RenderTargetView   *rs_rtv;
+    ID3D11Texture2D          *rs_depth;
+    ID3D11DepthStencilView   *rs_dsv;
+    ID3D11ShaderResourceView *rs_depth_srv;
+    UINT                      rs_w, rs_h, rs_msaa;
+
     /* Window; width/height are the scene target's size */
     HWND                    hwnd;
     UINT                    width;
@@ -103,8 +126,277 @@ static HRESULT host_present(void);
 
 static void scene_resolve(D3D8DeviceState *s);
 
+/* ── Render scale of the 3D (fork; d3d8_rscale.h) ─────────────────────
+ *
+ * s_rs_pct is the scale applied: 100 (the default) and none of this runs --
+ * the cur_* helpers then give the render-size targets, the very objects the
+ * code used before, and the image is the title's, bit for bit.
+ *
+ * Otherwise, per presented image (the pass phases: nv2a_pgraph_d3d11.c):
+ *   - at a present, when the image just shown carried pass markers (a race;
+ *     menus, loading screens and videos carry none), the rs_* targets are
+ *     bound for the next image (rs_bind): its 3D -- the main view's draws
+ *     ahead of its first marker, groups 0-6, the post at FRAME_END, then the
+ *     perspective groups >= 7 (clouds, lens flare and its occlusion test) --
+ *     is drawn at the scaled size;
+ *   - at its first orthographic group >= 7 (PGRAPH_PHASE_HUD: the HUD, the
+ *     pause and result panels, the fades), rs_to_screen brings the colour to
+ *     the render-size target (box above 100 %, bilinear below, never
+ *     sharpened) and the depth with it, and binds that target: the 2D is
+ *     drawn at the render size, over the 3D, with the title's own blending;
+ *   - an image that never reaches a HUD group is brought down the same way
+ *     at its present (or when anything reads the scene first: captures).
+ * Viewport and window-clip / scissor rectangles follow the bound target
+ * (d3d8_GetGuestScale); occlusion counts are scaled back to title pixels
+ * with the scale of the target they were counted on. Pump thread only. */
+#define RS_MAX_PIXELS  (3840u * 2160u * 4u)     /* 4K at 200 % */
+#define RS_MAX_SAMPLES (RS_MAX_PIXELS * 4ull)   /* x anti-aliasing samples */
+#define RS_MAX_SIDE    16384u                   /* D3D11 texture limit */
+static UINT s_rs_pct = 100;     /* applied, percent; 100 = off */
+static int  s_rs_bound;         /* the image being built draws into rs_* */
+static int  s_rs_img;           /* ... and did from its start */
+static int  s_rs_marked;        /* this image saw a pass marker */
+static float s_occ_rs_scale;    /* occlusion: samples per title pixel at the last Begin */
+static struct {
+    unsigned long long at_hud, at_present, video, native, depth_fail;
+} s_rs_stats;
+
+static ID3D11RenderTargetView *cur_rtv(const D3D8DeviceState *s)
+    { return s_rs_bound ? s->rs_rtv : s->default_rtv; }
+static ID3D11DepthStencilView *cur_dsv(const D3D8DeviceState *s)
+    { return s_rs_bound ? s->rs_dsv : s->default_dsv; }
+static ID3D11Texture2D *cur_depth(const D3D8DeviceState *s)
+    { return s_rs_bound ? s->rs_depth : s->default_depth; }
+static ID3D11ShaderResourceView *cur_depth_srv(const D3D8DeviceState *s)
+    { return s_rs_bound ? s->rs_depth_srv : s->depth_srv; }
+static ID3D11Texture2D *cur_tex(const D3D8DeviceState *s)
+    { return s_rs_bound ? s->rs_tex : s->scene_tex; }
+static ID3D11ShaderResourceView *cur_srv(const D3D8DeviceState *s)
+    { return s_rs_bound ? s->rs_srv : s->scene_srv; }
+static UINT cur_w(const D3D8DeviceState *s) { return s_rs_bound ? s->rs_w : s->width; }
+static UINT cur_h(const D3D8DeviceState *s) { return s_rs_bound ? s->rs_h : s->height; }
+static UINT cur_msaa(const D3D8DeviceState *s) { return s_rs_bound ? s->rs_msaa : s->msaa; }
+
+/* Bring the sampleable copy of the bound target up to date. */
+static void cur_resolve(D3D8DeviceState *s)
+{
+    if (!s_rs_bound) { scene_resolve(s); return; }
+    if (s->rs_ms && s->rs_tex)
+        ID3D11DeviceContext_ResolveSubresource(s->d3d11_context,
+            (ID3D11Resource *)s->rs_tex, 0, (ID3D11Resource *)s->rs_ms, 0,
+            DXGI_FORMAT_R8G8B8A8_UNORM);
+}
+
+static int rs_fits(UINT w, UINT h, UINT msaa)
+{
+    unsigned long long px = (unsigned long long)w * h;
+    return w <= RS_MAX_SIDE && h <= RS_MAX_SIDE && px <= RS_MAX_PIXELS &&
+           px * (msaa ? msaa : 1u) <= RS_MAX_SAMPLES;
+}
+
+/* The scale and the scaled size, from XBOX_RENDER_SCALE and the render size
+ * (s->width x s->height, which never change). Above 100 % the next step
+ * down is taken while the budget is exceeded (200 -> 175 -> ... -> 100). */
+static void rs_choose(D3D8DeviceState *s)
+{
+    int want = d3d8_rscale_wanted(), n, i;
+    const int *st = d3d8_rscale_steps(&n);
+    s_rs_pct = 100;
+    s->rs_w = s->rs_h = 0;
+    if (want == 100 || !s->width || !s->height) return;
+    for (i = n - 1; i >= 0; i--) {
+        UINT p = (UINT)st[i], w, h;
+        if ((int)p > want || (want > 100 && p <= 100)) continue;
+        if (want < 100 && (int)p != want) continue;
+        w = (s->width * p + 50u) / 100u;
+        h = (s->height * p + 50u) / 100u;
+        if (w < 1u) w = 1u;
+        if (h < 1u) h = 1u;
+        if (rs_fits(w, h, 1u)) {
+            s_rs_pct = p;
+            s->rs_w = w;
+            s->rs_h = h;
+            break;
+        }
+    }
+    fprintf(stderr, "D3D8: render scale %u %% (asked %d %%): 3D at %ux%u, render size %ux%u\n",
+            s_rs_pct, want, s_rs_pct != 100 ? s->rs_w : s->width,
+            s_rs_pct != 100 ? s->rs_h : s->height, s->width, s->height);
+    fflush(stderr);
+}
+
+static void rs_targets_release(D3D8DeviceState *s)
+{
+    if (s->rs_depth_srv) { ID3D11ShaderResourceView_Release(s->rs_depth_srv); s->rs_depth_srv = NULL; }
+    if (s->rs_dsv)       { ID3D11DepthStencilView_Release(s->rs_dsv); s->rs_dsv = NULL; }
+    if (s->rs_depth)     { ID3D11Texture2D_Release(s->rs_depth); s->rs_depth = NULL; }
+    if (s->rs_rtv)       { ID3D11RenderTargetView_Release(s->rs_rtv); s->rs_rtv = NULL; }
+    if (s->rs_srv)       { ID3D11ShaderResourceView_Release(s->rs_srv); s->rs_srv = NULL; }
+    if (s->rs_ms)        { ID3D11Texture2D_Release(s->rs_ms); s->rs_ms = NULL; }
+    if (s->rs_tex)       { ID3D11Texture2D_Release(s->rs_tex); s->rs_tex = NULL; }
+    s->rs_msaa = 0;
+}
+
+/* The scaled targets, with the render-size target's anti-aliasing held to
+ * the budget. Any failure: everything released and the scale back to 100. */
+static void rs_targets_create(D3D8DeviceState *s)
+{
+    static const FLOAT black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    ID3D11Device *dev = s->d3d11_device;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+    UINT msaa = s->msaa ? s->msaa : 1u;
+
+    rs_targets_release(s);
+    if (s_rs_pct == 100 || !dev || !s->rs_w || !s->rs_h) return;
+    while (msaa > 1u && !rs_fits(s->rs_w, s->rs_h, msaa)) msaa >>= 1;
+    if (!d3d8_rscale_init(dev)) goto fail;
+
+    memset(&td, 0, sizeof td);
+    td.Width = s->rs_w;
+    td.Height = s->rs_h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &s->rs_tex))) goto fail;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)s->rs_tex,
+                                                     NULL, &s->rs_srv))) goto fail;
+    if (msaa > 1u) {
+        td.SampleDesc.Count = msaa;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &s->rs_ms))) goto fail;
+    }
+    if (FAILED(ID3D11Device_CreateRenderTargetView(dev,
+            (ID3D11Resource *)(s->rs_ms ? s->rs_ms : s->rs_tex), NULL, &s->rs_rtv))) goto fail;
+
+    td.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    td.SampleDesc.Count = msaa;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &s->rs_depth))) goto fail;
+    memset(&dv, 0, sizeof dv);
+    dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dv.ViewDimension = msaa > 1u ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
+    if (FAILED(ID3D11Device_CreateDepthStencilView(dev, (ID3D11Resource *)s->rs_depth,
+                                                   &dv, &s->rs_dsv))) goto fail;
+    memset(&sv, 0, sizeof sv);
+    sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    if (msaa > 1u) sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+    else { sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1; }
+    if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)s->rs_depth,
+                                                     &sv, &s->rs_depth_srv))) goto fail;
+
+    ID3D11DeviceContext_ClearRenderTargetView(s->d3d11_context, s->rs_rtv, black);
+    ID3D11DeviceContext_ClearDepthStencilView(s->d3d11_context, s->rs_dsv,
+                                              D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    s->rs_msaa = msaa;
+    fprintf(stderr, "D3D8: render scale targets %ux%u, %ux AA\n", s->rs_w, s->rs_h, msaa);
+    fflush(stderr);
+    return;
+fail:
+    rs_targets_release(s);
+    fprintf(stderr, "D3D8: render scale %u %%: targets not made, 100 %%\n", s_rs_pct);
+    fflush(stderr);
+    s_rs_pct = 100;
+}
+
+/* The viewport from one bound size to the other: the whole target stays the
+ * whole target (exact); anything else is scaled by the ratio. */
+static void rs_viewport_move(ID3D11DeviceContext *ctx, UINT ow, UINT oh, UINT nw, UINT nh)
+{
+    D3D11_VIEWPORT vp;
+    UINT n = 1;
+    ID3D11DeviceContext_RSGetViewports(ctx, &n, &vp);
+    if (!n || !ow || !oh || (vp.TopLeftX == 0.0f && vp.TopLeftY == 0.0f &&
+                             vp.Width == (FLOAT)ow && vp.Height == (FLOAT)oh)) {
+        if (!n) { vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f; }
+        vp.TopLeftX = 0.0f; vp.TopLeftY = 0.0f;
+        vp.Width = (FLOAT)nw; vp.Height = (FLOAT)nh;
+    } else {
+        float kx = (float)nw / (float)ow, ky = (float)nh / (float)oh;
+        vp.TopLeftX *= kx; vp.Width *= kx;
+        vp.TopLeftY *= ky; vp.Height *= ky;
+    }
+    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+}
+
+/* At a present: the next image's 3D goes to the scaled targets. */
+static void rs_bind(D3D8DeviceState *s)
+{
+    ID3D11DeviceContext *ctx = s->d3d11_context;
+    if (s_rs_pct == 100 || s_rs_bound || !ctx || !s->rs_rtv || !s->rs_dsv) return;
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &s->rs_rtv, s->rs_dsv);
+    rs_viewport_move(ctx, s->width, s->height, s->rs_w, s->rs_h);
+    s_rs_bound = 1;
+}
+
+/* The 3D to the render-size targets, which are bound from here on. keep = 0
+ * (a video frame replaces the image): nothing is copied. */
+static void rs_to_screen(D3D8DeviceState *s, int at_hud, int keep)
+{
+    ID3D11DeviceContext *ctx = s->d3d11_context;
+    if (!s_rs_bound) return;
+    s_rs_bound = 0;
+    if (!ctx || !s->default_rtv) return;
+    if (keep) {
+        if (g_gpuprof_on) gpuprof_begin(GP_RSCALE);
+        if (s->rs_ms && s->rs_tex)
+            ID3D11DeviceContext_ResolveSubresource(ctx, (ID3D11Resource *)s->rs_tex, 0,
+                (ID3D11Resource *)s->rs_ms, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+        d3d8_rscale_resample(s->d3d11_device, ctx, s->rs_srv, s->rs_w, s->rs_h,
+                             s->default_rtv, s->width, s->height);
+        if (s->default_dsv &&
+            !d3d8_rscale_depth_copy(s->d3d11_device, ctx, s->rs_depth_srv, s->rs_msaa > 1u,
+                                    s->rs_w, s->rs_h, s->default_dsv, s->width, s->height)) {
+            ID3D11DeviceContext_ClearDepthStencilView(ctx, s->default_dsv,
+                D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+            s_rs_stats.depth_fail++;
+        }
+        if (g_gpuprof_on) gpuprof_end();
+        if (at_hud) s_rs_stats.at_hud++; else s_rs_stats.at_present++;
+    } else {
+        s_rs_stats.video++;
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &s->default_rtv, s->default_dsv);
+    rs_viewport_move(ctx, s->rs_w, s->rs_h, s->width, s->height);
+}
+
+/* Before anything reads the scene target outside the image's own order
+ * (captures, the video upload): the 3D brought down first. */
+static void rs_finish(D3D8DeviceState *s)
+{
+    if (s_rs_bound) rs_to_screen(s, 0, 1);
+}
+
+/* End of a present: counts, then the next image's targets. */
+static void rs_next_image(D3D8DeviceState *s)
+{
+    int marked = s_rs_marked;
+    if (s_rs_pct == 100) return;
+    if (!s_rs_img) s_rs_stats.native++;      /* menus, loading screens, videos */
+    {
+        unsigned long long n = s_rs_stats.at_hud + s_rs_stats.at_present + s_rs_stats.video +
+                               s_rs_stats.native;
+        if (n && n % 600 == 0)
+            fprintf(stderr, "[RSCALE] %llu images: %llu brought down at the HUD, %llu at the "
+                    "present, %llu replaced by a video, %llu at the render size; depth copy "
+                    "failed %llu\n", n, s_rs_stats.at_hud, s_rs_stats.at_present,
+                    s_rs_stats.video, s_rs_stats.native, s_rs_stats.depth_fail);
+    }
+    s_rs_marked = 0;
+    s_rs_img = 0;
+    if (marked) {
+        rs_bind(s);
+        s_rs_img = s_rs_bound;
+    }
+}
+
 static HRESULT scene_texture_get(ID3D11Texture2D **out)
 {
+    rs_finish(&g_device_state);
     scene_resolve(&g_device_state);
     *out = g_device_state.scene_tex;
     if (!*out) return E_FAIL;
@@ -151,6 +443,26 @@ static void present_source(ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv
     if (g_gpuprof_on) gpuprof_end();
 }
 
+/* Fork: the image's lights (d3d8_lights.h), the selective bloom
+ * (d3d8_bloom.h), onto the bound 3D target, before the HUD: at the first
+ * change into the HUD phase, or at the present for an image without one.
+ * Once per image; nothing when no light was drawn (bloom off, the default). */
+static void lights_apply(D3D8DeviceState *s)
+{
+    ID3D11ShaderResourceView *src[3] = { NULL, NULL, NULL };
+    if (!d3d8_lights_pending() || !s->d3d11_context || !cur_rtv(s)) return;
+    if (g_gpuprof_on) gpuprof_begin(GP_LIGHTS);
+    if (d3d8_lights_take(s->d3d11_context, cur_w(s), cur_h(s), src))
+        d3d8_bloom_composite(s->d3d11_device, s->d3d11_context, src[0], src[1], src[2], cur_depth_srv(s),
+                             cur_rtv(s), cur_w(s), cur_h(s));
+    if (src[0]) d3d8_haze_halo_composite(s->d3d11_device, s->d3d11_context, src[0], src[1], src[2],  /* the lights in the haze */
+                                         cur_depth_srv(s), cur_rtv(s), cur_w(s), cur_h(s), cur_w(s), cur_h(s));
+    d3d8_vignette_image_done();         /* the image's vignette read by the composites */
+    if (g_gpuprof_on) gpuprof_end();
+}
+
+ID3D11RenderTargetView *d3d8_Get3DRTV(void) { return cur_rtv(&g_device_state); }
+
 /* Split 3D / overlay. Called by the translator on the pump
  * thread when a pass_tags marker changes the render phase (registered by
  * main.c with pgraph_d3d11_set_pass_phase_callback when XBOX_POST_SPLIT or
@@ -162,25 +474,70 @@ static void present_source(ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv
  * title draws the overlay (groups >= 7: mist, lens flare, HUD) over it with
  * its own blending. Once per image: a second FRAME_END before the present is
  * counted and left alone, never posted twice. */
+static void post_at_frame_end(D3D8DeviceState *s, unsigned tag);
+static int  s_tmp_marked;       /* fork: this image saw a pass marker (temporal jitter) */
+
 void d3d8_PassPhaseChanged(int old_phase, int new_phase, unsigned tag)
 {
     D3D8DeviceState *s = &g_device_state;
+    int tmp = d3d8_temporal_active() && !s_video_frame;     /* fork: temporal inputs */
+    (void)old_phase;
+    s_tmp_marked = 1;
+    if (new_phase == 4 /* PGRAPH_PHASE_HUD */) d3d8_temporal_jitter_off();
+    if (new_phase == 4 /* PGRAPH_PHASE_HUD */ && !s_video_frame)
+        lights_apply(s);                /* fork: the bloom before the HUD */
+    if (s_rs_pct != 100) {              /* fork: render scale of the 3D */
+        s_rs_marked = 1;
+        if (new_phase == 4 /* PGRAPH_PHASE_HUD */ && s_rs_bound && !s_video_frame)
+            rs_to_screen(s, 1, 1);
+    }
+    if (new_phase != 5 /* PGRAPH_PHASE_END */) return;
+    /* fork: the temporal inputs of the 3D (d3d8_temporal.h): the jitter
+     * off, the motion vectors and the reactive mask, before the post */
+    if (tmp && s->d3d11_context)
+        d3d8_temporal_frame_end(s->d3d11_device, s->d3d11_context, cur_depth_srv(s), cur_depth(s),
+                                cur_w(s), cur_h(s), tag);
+    else d3d8_temporal_jitter_off();
+    if (tmp && s->d3d11_context && d3d8_temporal_probing() && cur_tex(s)) {    /* diagnostic */
+        cur_resolve(s);
+        d3d8_temporal_probe(s->d3d11_device, s->d3d11_context, cur_tex(s));
+    }
+    if (d3d8_post_split_active() && !s_video_frame)
+        post_at_frame_end(s, tag);
+    if (tmp && s->d3d11_context && cur_rtv(s)) {
+        d3d8_temporal_show(s->d3d11_device, s->d3d11_context, cur_rtv(s), cur_w(s), cur_h(s));
+        /* the target switches here: what is drawn after FRAME_END is at the
+         * output size (where a super-resolution pass will put its output); the lights
+         * of the 3D first, at the size they were drawn at */
+        if (s_rs_bound) {
+            lights_apply(s);
+            rs_to_screen(s, 1, 1);
+            d3d8_temporal_set_moved();
+        }
+    }
+}
+
+/* The post chain on the 3D at FRAME_END (split 3D / overlay). */
+static void post_at_frame_end(D3D8DeviceState *s, unsigned tag)
+{
     ID3D11Texture2D *pt;
     ID3D11ShaderResourceView *ps;
     D3D11_TEXTURE2D_DESC td;
-    (void)old_phase; (void)tag;
-    if (new_phase != 5 /* PGRAPH_PHASE_END */) return;
-    if (!d3d8_post_split_active() || s_video_frame) return;
-    if (!s->d3d11_context || !s->scene_tex || !s->scene_srv || !s->default_rtv) return;
+    /* the bound target: the scaled one when the render scale is on */
+    if (!s->d3d11_context || !cur_tex(s) || !cur_srv(s) || !cur_rtv(s)) return;
     if (s_split_done) { s_split_stats.doubles++; return; }
     if (g_gpuprof_on) gpuprof_begin(GP_POST_SPLIT);
-    scene_resolve(s);
-    ID3D11Texture2D_GetDesc(s->scene_tex, &td);
-    if (d3d8_post_run(s->d3d11_device, s->d3d11_context, s->scene_tex, s->scene_srv,
+    cur_resolve(s);
+    ID3D11Texture2D_GetDesc(cur_tex(s), &td);
+    d3d8_post_split_call(1);
+    d3d8_speedfx_set_depth(cur_depth_srv(s), cur_depth(s));    /* fork: speed effect */
+    d3d8_speedfx_set_tag(tag);          /* the image's own camera, by its frame number */
+    if (d3d8_post_run(s->d3d11_device, s->d3d11_context, cur_tex(s), cur_srv(s),
                       td.Width, td.Height, s_post_frame, &pt, &ps)
-        && d3d8_post_copy_into(s->d3d11_device, s->d3d11_context, s->default_rtv, ps,
+        && d3d8_post_copy_into(s->d3d11_device, s->d3d11_context, cur_rtv(s), ps,
                                td.Width, td.Height))
         s_split_done = 1;           /* else chain off or failed: the present falls back */
+    d3d8_post_split_call(0);
     if (g_gpuprof_on) gpuprof_end();
 }
 
@@ -200,14 +557,14 @@ int d3d8_SoftShadowDraw(float shade, unsigned cmp, unsigned ref, unsigned rmask,
     RECT rc;
     int ok;
     static int alt = -1;
-    if (!d3d8_softshadow_enabled() || !s->d3d11_context || !s->default_rtv ||
-        !s->default_dsv || !s->depth_srv || !s->default_depth)
+    if (!d3d8_softshadow_enabled() || !s->d3d11_context || !cur_rtv(s) ||
+        !cur_dsv(s) || !cur_depth_srv(s) || !cur_depth(s))
         return 0;
     /* XBOX_SOFT_SHADOWS_ALT=1 (test): soft on even presents only, so that
      * consecutive captures of one run compare hard and soft. */
     if (alt < 0) { const char *e = getenv("XBOX_SOFT_SHADOWS_ALT"); alt = e && e[0] == '1'; }
     if (alt && (d3d8_PresentSeq() & 1u)) return 0;
-    ID3D11Texture2D_GetDesc(s->default_depth, &td);
+    ID3D11Texture2D_GetDesc(cur_depth(s), &td);     /* the bound target's (render scale) */
     rc.left = (LONG)(fx0 * (float)td.Width);
     rc.top = (LONG)(fy0 * (float)td.Height);
     rc.right = (LONG)(fx1 * (float)td.Width + 0.999f);
@@ -217,16 +574,111 @@ int d3d8_SoftShadowDraw(float shade, unsigned cmp, unsigned ref, unsigned rmask,
     if (rc.right > (LONG)td.Width) rc.right = (LONG)td.Width;
     if (rc.bottom > (LONG)td.Height) rc.bottom = (LONG)td.Height;
     if (g_gpuprof_on) gpuprof_begin(GP_SOFTSHADOW);
-    ok = d3d8_softshadow_run(s->d3d11_device, s->d3d11_context, s->default_rtv, s->default_dsv,
-                             s->depth_srv, td.Width, td.Height, td.SampleDesc.Count,
+    ok = d3d8_softshadow_run(s->d3d11_device, s->d3d11_context, cur_rtv(s), cur_dsv(s),
+                             cur_depth_srv(s), td.Width, td.Height, td.SampleDesc.Count,
                              shade, cmp, ref, rmask, &rc);
     if (g_gpuprof_on) gpuprof_end();
     if (ok) done++; else fails++;
     if (done == 1 && ok)
-        fprintf(stderr, "[SOFTSHADOW] on: %ux%u, %u sample(s), shade %.3f\n",
-                td.Width, td.Height, td.SampleDesc.Count, shade);
+        fprintf(stderr, "[SOFTSHADOW] on: %ux%u, %u sample(s), shade %.3f, edge width %d %%\n",
+                td.Width, td.Height, td.SampleDesc.Count, shade, d3d8_softshadow_width());
     if (fails == 1 && !ok) { fprintf(stderr, "[SOFTSHADOW] failed, title's quad kept\n"); fails++; }
     return ok;
+}
+
+/* Fork: distance veil (d3d8_veil.h). Called by the translator: the snapshot
+ * once the sky dome is drawn, the pass once per image after the opaque
+ * world; k maps a scene pixel (x, y, depth, 1) to the sky dome's
+ * coordinates. Both on the bound target (the scaled one with the render
+ * scale). XBOX_VEIL_ALT=1: even images only. */
+static int s_veil_last;             /* applied to the image being drawn */
+int d3d8_VeilWanted(void) { return d3d8_veil_wanted(); }
+int d3d8_VeilOn(void) { return d3d8_veil_on(); }
+int d3d8_VeilAmbOn(void) { return d3d8_veil_amb_on(); }
+int d3d8_VeilProbe(void) { return d3d8_veil_probe(); }
+void d3d8_VeilPrepare(void)
+{
+    D3D8DeviceState *s = &g_device_state;
+    if (!d3d8_veil_wanted() || !s->d3d11_device) return;
+    d3d8_veil_prepare(s->d3d11_device);
+    d3d8_veil_pretargets(s->d3d11_device, cur_rtv(s));
+}
+
+int d3d8_VeilSnapshot(void)
+{
+    D3D8DeviceState *s = &g_device_state;
+    if (!d3d8_veil_wants_bg() || !s->d3d11_context || !cur_rtv(s)) return 0;
+    return d3d8_veil_snapshot(s->d3d11_device, s->d3d11_context, cur_rtv(s));
+}
+
+int d3d8_VeilTerrainDepth(void)
+{
+    D3D8DeviceState *s = &g_device_state;
+    if (!s->d3d11_context || !cur_depth(s)) return 0;
+    return d3d8_veil_terrain_depth(s->d3d11_device, s->d3d11_context, cur_depth(s));
+}
+
+int d3d8_VeilLimit(float *limit, float *cell)
+{
+    d3d8_veil_cull c;
+    int ok = d3d8_VeilCull(&c);
+    *limit = ok ? c.limit : 0.0f;
+    *cell = ok ? c.cell : 0.0f;
+    return ok;
+}
+
+int d3d8_VeilDraw(const float k[16], const float eye[3], float clear_depth,
+                  float near_z, float far_z, const float fog_rgb[3], float fog_rho,
+                  const float *kw, const float eye_w[3])
+{
+    D3D8DeviceState *s = &g_device_state;
+    static unsigned long long done;
+    static int alt = -1;
+    D3D11_TEXTURE2D_DESC td;
+    d3d8_veil_frame f;
+    int ok;
+    s_veil_last = 0;
+    if ((!d3d8_veil_on() && !d3d8_veil_amb_on()) || !s->d3d11_context || !cur_rtv(s) ||
+        !cur_depth_srv(s) || !cur_depth(s))
+        return 0;
+    if (alt < 0) { const char *e = getenv("XBOX_VEIL_ALT"); alt = e && e[0] == '1'; }
+    if (alt && (d3d8_PresentSeq() & 1u)) return 0;
+    memset(&f, 0, sizeof f);
+    f.have_cull = d3d8_VeilCull(&f.cull);
+    ID3D11Texture2D_GetDesc(cur_depth(s), &td);
+    memcpy(f.k, k, sizeof f.k);
+    memcpy(f.eye, eye, sizeof f.eye);
+    f.clear_depth = clear_depth;
+    f.near_z = near_z;
+    f.far_z = far_z;
+    memcpy(f.fog_rgb, fog_rgb, sizeof f.fog_rgb);
+    f.fog_rho = fog_rho;
+    if (kw) {
+        f.have_world = 1;
+        memcpy(f.kw, kw, sizeof f.kw);
+        memcpy(f.eye_w, eye_w, sizeof f.eye_w);
+    }
+    if (g_gpuprof_on) gpuprof_begin(GP_SOFTSHADOW);
+    ok = d3d8_veil_run(s->d3d11_device, s->d3d11_context, cur_rtv(s), cur_depth_srv(s),
+                       td.Width, td.Height, td.SampleDesc.Count, &f);
+    if (g_gpuprof_on) gpuprof_end();
+    s_veil_last = ok;
+    if (ok && done++ == 0)
+        fprintf(stderr, "[VEIL] first pass: %ux%u, %u sample(s), planes %.1f / %.0f, cell window %s "
+                "(limit %.0f, cell %.0f, radius %.0f)\n", td.Width, td.Height, td.SampleDesc.Count,
+                near_z, far_z, f.have_cull ? "read" : "not read", f.cull.limit, f.cull.cell, f.cull.radius);
+    return ok;
+}
+
+/* The bound scene's size, for the translator's pixel -> guest mapping. */
+int d3d8_SceneSize(unsigned *w, unsigned *h)
+{
+    D3D8DeviceState *s = &g_device_state;
+    D3D11_TEXTURE2D_DESC td;
+    if (!cur_depth(s)) return 0;
+    ID3D11Texture2D_GetDesc(cur_depth(s), &td);
+    *w = td.Width; *h = td.Height;
+    return 1;
 }
 
 /* scene_texture_get for captures of what is shown (dumps, hashes,
@@ -549,7 +1001,7 @@ static int guest_fb_active(void)
                 active ? "active: presenting the video"
                        : "idle: presenting rendered frames",
                 g_guest_fb_locks, g_present_seq);
-        fflush(stderr);
+        xbox_log_flush();
         was_active = active;
     }
     return active;
@@ -678,7 +1130,7 @@ int d3d8_VideoPresentReady(void)
         if (++s_vid_skips == 1 || s_vid_skips % 500 == 0) {
             fprintf(stderr, "[FB] video present held: GPU still on the previous frame (%u so far)\n",
                     s_vid_skips);
-            fflush(stderr);
+            xbox_log_flush();
         }
         return 0;
     }
@@ -929,7 +1381,7 @@ void d3d8_PresentFrame(void)
     /* Present the backbuffer (VSync = 1) */
     g_last_present_tick = GetTickCount();
     if (g_device_state.swap_chain)
-        { static unsigned c = 0; if (++c == 1 || (c % 300) == 0) { fprintf(stderr, "  [PRESENT] PresentFrame #%u\n", c); fflush(stderr); } }
+        { static unsigned c = 0; if (++c == 1 || ((c % 300) == 0 && xbox_log_stats())) { fprintf(stderr, "  [PRESENT] PresentFrame #%u\n", c); xbox_log_flush(); } }
         host_present();
 }
 
@@ -942,6 +1394,7 @@ ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_dev
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
 IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
+ID3D11DepthStencilView *d3d8_GetDefaultDSV(void) { return g_device_state.default_dsv; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
 /* The title's own backbuffer size (640x480), which is the space its
  * vertices and pre-transformed positions are in -- not the scene target's. */
@@ -951,12 +1404,15 @@ UINT                 d3d8_GetBackbufferHeight(void)
     { return g_device_state.guest_h ? g_device_state.guest_h : g_device_state.height; }
 
 /* Scene-target pixels per title pixel, for anything specified in the title's
- * pixel units: scissor and clip rectangles. 1 in every automated run. */
+ * pixel units: scissor and clip rectangles. 1 in every automated run.
+ * Fork: of the bound target -- the scaled one during the 3D of an image
+ * when the render scale is on, the render size otherwise. */
 void d3d8_GetGuestScale(float *sx, float *sy)
 {
     const D3D8DeviceState *s = &g_device_state;
-    *sx = (s->guest_w && s->width)  ? (float)s->width  / (float)s->guest_w : 1.0f;
-    *sy = (s->guest_h && s->height) ? (float)s->height / (float)s->guest_h : 1.0f;
+    UINT w = cur_w(s), h = cur_h(s);
+    *sx = (s->guest_w && w) ? (float)w / (float)s->guest_w : 1.0f;
+    *sy = (s->guest_h && h) ? (float)h / (float)s->guest_h : 1.0f;
 }
 /* Occlusion queries for the NV2A zpass pixel counter (fork). A small
  * pool: the translator begins/ends one around each zpass-enabled span and
@@ -981,6 +1437,11 @@ int d3d8_OcclusionBegin(void)
         if (FAILED(ID3D11Device_CreateQuery(dev, &qd, &s_occ[i]))) { s_occ[i] = NULL; return -1; }
     }
     s_occ_busy[i] = 1;
+    if (s_rs_pct != 100) {      /* fork: counted on the bound target (render scale) */
+        float sx, sy;
+        d3d8_GetGuestScale(&sx, &sy);
+        s_occ_rs_scale = (float)(cur_msaa(&g_device_state) ? cur_msaa(&g_device_state) : 1u) * sx * sy;
+    }
     ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)s_occ[i]);
     return i;
 }
@@ -1012,6 +1473,19 @@ void d3d8_OcclusionFlush(void)
     if (ctx) ID3D11DeviceContext_Flush(ctx);
 }
 
+/* The pump has run out of commands. The D3D11 driver keeps what
+ * was recorded since the last submission until a Present, a Flush or a full
+ * buffer: at 60 fps the scene of frame N-1, translated right after its flip,
+ * waited ~14 ms in that buffer and the GPU only started it at the Present of
+ * frame N (~3.3 ms of GPU wait there). Submitting it when the pump
+ * goes idle lets the GPU work while the title waits for its next tick.
+ * Pump thread only (it owns the immediate context). */
+void d3d8_IdleFlush(void)
+{
+    ID3D11DeviceContext *ctx = g_device_state.d3d11_context;
+    if (ctx) ID3D11DeviceContext_Flush(ctx);
+}
+
 void d3d8_OcclusionRelease(int h)
 {
     if (h >= 0 && h < OCC_POOL) s_occ_busy[h] = 0;
@@ -1021,6 +1495,8 @@ float d3d8_OcclusionScale(void)
 {
     const D3D8DeviceState *s = &g_device_state;
     float sx, sy;
+    if (s_rs_pct != 100 && s_occ_rs_scale > 0.0f)
+        return s_occ_rs_scale;      /* fork: the target the samples were counted on */
     d3d8_GetGuestScale(&sx, &sy);
     return (float)(s->msaa ? s->msaa : 1) * sx * sy;
 }
@@ -1168,7 +1644,7 @@ static int video_aspect_fix(void)
         on = !(e && e[0] == '0');
         fprintf(stderr, "[D3D] XBOX_FIX_VIDEO_ASPECT=%d (videos %s)\n", on,
                 on ? "at their own 4:3 shape" : "stretched to the window");
-        fflush(stderr);
+        xbox_log_flush();
     }
     return on;
 }
@@ -1232,6 +1708,7 @@ void d3d8_SetHostUiHooks(const D3D8HostUiHooks *hooks)
     else memset(&s_ui_hooks, 0, sizeof s_ui_hooks);
 }
 
+
 void d3d8_SetMsaa(int samples)
 {
     InterlockedExchange(&s_want_msaa, (samples == 2 || samples == 4 || samples == 8) ? samples : 1);
@@ -1242,12 +1719,16 @@ int  d3d8_GetShowFps(void)       { return (int)s_show_fps; }
 int  d3d8_HostIsWidescreen(void) { return s_cfg_widescreen; }
 int  d3d8_HostIsFullscreen(void) { return s_fullscreen; }
 
+/* 0 = not made, 1 = being made, 2 = ready: the render thread only enters
+ * the lock once it reads 2 (InitializeCriticalSection is done by then). */
 static void shot_lock_init(void)
 {
-    if (InterlockedCompareExchange(&s_shot_lock_ready, 1, 0) == 0)
+    if (InterlockedCompareExchange(&s_shot_lock_ready, 1, 0) == 0) {
         InitializeCriticalSection(&s_shot_lock);
-    else
-        while (s_shot_lock_ready != 1) Sleep(0);
+        InterlockedExchange(&s_shot_lock_ready, 2);
+    } else {
+        while (s_shot_lock_ready != 2) Sleep(0);
+    }
 }
 
 /* Saved as PNG at the end of the next frame, from the scene target. */
@@ -1272,15 +1753,54 @@ void d3d8_HostToast(const wchar_t *text)
     InterlockedExchange(&s_toast_tick, (LONG)GetTickCount());
 }
 
+/* Called once by d3d8_HostExit before the process ends (NULL: nothing).
+ * The online mode sets it to tell the other players it left. */
+static void (*s_host_exit_hook)(void);
+
+void d3d8_SetHostExitHook(void (*fn)(void))
+{
+    s_host_exit_hook = fn;
+}
+
+/* Called at each present on the image about to be shown (NULL: nothing):
+ * returns 1 with another image in *out / *out_srv (a copy with something
+ * drawn over it), else 0. Only an optional module sets it. */
+static int (*s_present_image_overlay)(ID3D11Texture2D *img, ID3D11Texture2D **out,
+                                      ID3D11ShaderResourceView **out_srv);
+
+void d3d8_SetPresentImageOverlay(int (*fn)(ID3D11Texture2D *img, ID3D11Texture2D **out,
+                                           ID3D11ShaderResourceView **out_srv))
+{
+    s_present_image_overlay = fn;
+}
+
 /* Closing the window ends the game at once: the title has no quit path of
  * its own (a console is switched off), and waiting on its threads is what
  * left the window unclosable -- WM_CLOSE used to set a flag nothing read. */
 void d3d8_HostExit(void)
 {
+    if (s_host_exit_hook) s_host_exit_hook();
     d3d8_sync_report();                 /* [PACING] summary */
     fflush(stdout);
     fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 0);
+}
+
+/* XBOX_NO_ACTIVATE=1 (test tools only, never set by the launcher): the
+ * window never takes the focus from the program in front. It is shown
+ * without activation and put behind the other windows, and every later
+ * move or resize keeps it so (SWP_NOACTIVATE, no SW_RESTORE); with
+ * WS_EX_NOACTIVATE it never becomes the active window, not even when the
+ * window in front is minimised or closed, nor when it is clicked. The game
+ * renders, plays and takes its captures the same way: nothing here reads
+ * the focus (no pause or mute in the background; keyboard keys are read
+ * only while the window is in front, and test key presses don't need it).
+ * Off by default: unset or 0 changes nothing. */
+static int host_no_activate(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_NO_ACTIVATE"); on = (e && e[0] && e[0] != '0'); }
+    return on;
 }
 
 /* Borderless fullscreen on the window's monitor, or back to the saved
@@ -1290,7 +1810,11 @@ void d3d8_HostExit(void)
  * in fullscreen. Runs on the window's thread. */
 static void host_window_set_fullscreen(HWND h, int on)
 {
+    /* XBOX_NO_ACTIVATE while another window is in front: same change, but
+     * the window keeps its place behind and is not activated. */
+    int quiet;
     if (!h || on == s_fullscreen) return;
+    quiet = host_no_activate() && GetForegroundWindow() != h;
     if (on) {
         MONITORINFO mi;
         s_windowed_placement.length = sizeof s_windowed_placement;
@@ -1302,14 +1826,19 @@ static void host_window_set_fullscreen(HWND h, int on)
         SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                      mi.rcMonitor.right - mi.rcMonitor.left,
                      mi.rcMonitor.bottom - mi.rcMonitor.top,
-                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER |
+                     (quiet ? SWP_NOZORDER | SWP_NOACTIVATE : 0));
     } else {
+        WINDOWPLACEMENT wp = s_windowed_placement;
         SetWindowLongPtrW(h, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
         if (s_host_menu) SetMenu(h, s_host_menu);
-        SetWindowPlacement(h, &s_windowed_placement);
+        if (quiet)                      /* every other show command activates */
+            wp.showCmd = wp.showCmd == SW_SHOWMINIMIZED ? SW_SHOWMINNOACTIVE : SW_SHOWNOACTIVATE;
+        SetWindowPlacement(h, &wp);
         SetWindowPos(h, NULL, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED |
+                     (quiet ? SWP_NOACTIVATE : 0));
     }
     s_fullscreen = on;
 }
@@ -1325,14 +1854,17 @@ void d3d8_HostSetClientSize(unsigned w, unsigned h)
 {
     HWND hw = s_host_window;
     RECT r;
+    int quiet;                          /* XBOX_NO_ACTIVATE, see host_no_activate */
     if (!hw || !w || !h) return;
+    quiet = host_no_activate() && GetForegroundWindow() != hw;
     if (s_fullscreen) host_window_set_fullscreen(hw, 0);
-    if (IsZoomed(hw)) ShowWindow(hw, SW_RESTORE);
+    if (IsZoomed(hw)) ShowWindow(hw, quiet ? SW_SHOWNOACTIVATE : SW_RESTORE);
     r.left = 0; r.top = 0; r.right = (LONG)w; r.bottom = (LONG)h;
     AdjustWindowRectEx(&r, (DWORD)GetWindowLongPtrW(hw, GWL_STYLE), GetMenu(hw) != NULL,
                        (DWORD)GetWindowLongPtrW(hw, GWL_EXSTYLE));
     SetWindowPos(hw, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER |
+                 (quiet ? SWP_NOACTIVATE : 0));
 }
 
 /* Title bar: the name, frames per second if asked for, and any short note. */
@@ -1370,9 +1902,101 @@ static void host_window_update_title(HWND h)
     }
 }
 
+/* XBOX_NO_ACTIVATE: WS_EX_NOACTIVATE does not cover everything. When the
+ * window in front closes, Windows hands the activation to the next window
+ * even so (seen: ours in front for 9.8 s after another program's game
+ * closed). Then the activation is given back at once, on the window's
+ * thread: to the window that lost it if it is still there, else to the
+ * last window seen in front (noted by the title timer), else to the next
+ * visible window of another program in the z-order, else to the desktop;
+ * and ours goes to the bottom of the z-order. The game itself never stops:
+ * only the window changes. */
+#define HOST_WM_HAND_BACK (WM_APP + 0x606)
+static HWND s_na_prev;                  /* the window that lost the activation */
+static HWND s_na_last_front;            /* the last window in front that was not ours */
+static LONG s_na_logged;
+
+static BOOL na_is_ours(HWND w)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+/* A window that can take the activation back: there, shown, not minimised,
+ * another program's, not a tool or no-activate window, not cloaked (a
+ * suspended store app is "visible" but not on screen), not empty. */
+static BOOL na_candidate(HWND w)
+{
+    typedef HRESULT (WINAPI *DwmAttrFn)(HWND, DWORD, PVOID, DWORD);
+    static DwmAttrFn dwm_attr;
+    static LONG dwm_tried;
+    LONG_PTR ex;
+    RECT r;
+    DWORD cloaked = 0;
+    if (!w || !IsWindow(w) || !IsWindowVisible(w) || IsIconic(w) || na_is_ours(w)) return FALSE;
+    ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
+    if (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return FALSE;
+    if (!GetWindowRect(w, &r) || r.right <= r.left || r.bottom <= r.top) return FALSE;
+    if (!InterlockedExchange(&dwm_tried, 1)) {
+        HMODULE m = LoadLibraryW(L"dwmapi.dll");
+        dwm_attr = m ? (DwmAttrFn)(void *)GetProcAddress(m, "DwmGetWindowAttribute") : NULL;
+    }
+    if (dwm_attr && SUCCEEDED(dwm_attr(w, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof cloaked)) && cloaked)
+        return FALSE;
+    return TRUE;
+}
+
+static void na_note_front(void)
+{
+    HWND f = GetForegroundWindow();
+    if (f && !na_is_ours(f)) s_na_last_front = f;
+}
+
+static void na_hand_back(HWND self)
+{
+    HWND to = NULL, w;
+    const char *how = "the desktop";
+    BOOL ok;
+    if (GetForegroundWindow() != self) return;        /* already gone elsewhere */
+    if (na_candidate(s_na_prev)) { to = s_na_prev; how = "the window that lost it"; }
+    else if (na_candidate(s_na_last_front)) { to = s_na_last_front; how = "the last window in front"; }
+    else {
+        for (w = GetTopWindow(NULL); w; w = GetWindow(w, GW_HWNDNEXT))
+            if (na_candidate(w)) { to = w; how = "the next window in the z-order"; break; }
+    }
+    if (!to) to = GetShellWindow();
+    ok = to && SetForegroundWindow(to);
+    SetWindowPos(self, HWND_BOTTOM, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    if (InterlockedIncrement(&s_na_logged) <= 20) {
+        fprintf(stderr, "[FOCUS] XBOX_NO_ACTIVATE: activated by the system, handed back to %s (hwnd=%p)%s; "
+                "window sent to the bottom\n", how, (void *)to, ok ? "" : " -- refused");
+        fflush(stderr);
+    }
+}
+
 static LRESULT CALLBACK host_wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (host_no_activate()) {
+        if (msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE) {
+            /* Not here: Windows is still in the middle of the switch. */
+            s_na_prev = (HWND)lp;
+            PostMessageW(h, HOST_WM_HAND_BACK, 0, 0);
+        } else if (msg == HOST_WM_HAND_BACK) {
+            na_hand_back(h);
+            return 0;
+        } else if (msg == WM_TIMER) {
+            na_note_front();
+        }
+    }
     switch (msg) {
+        case WM_DISPLAYCHANGE:          /* the frame rate limit follows the display's rate */
+            d3d8_sync_display_changed(0);
+            break;
+        case WM_MOVE:
+            d3d8_sync_display_changed(1);
+            break;
         case WM_CLOSE:
             s_host_window_close_requested = TRUE;
             d3d8_HostExit();
@@ -1482,7 +2106,10 @@ static HWND host_window_create_here(UINT width, UINT height)
     if (x < mi.rcWork.left) x = mi.rcWork.left;
     if (y < mi.rcWork.top)  y = mi.rcWork.top;
 
-    h = CreateWindowExW(0, cls, L"SSX Tricky",
+    /* XBOX_NO_ACTIVATE: WS_EX_NOACTIVATE too, or minimising or closing the
+     * window in front would hand it the focus (WS_EX_APPWINDOW keeps its
+     * task bar button). */
+    h = CreateWindowExW(host_no_activate() ? WS_EX_NOACTIVATE | WS_EX_APPWINDOW : 0, cls, L"SSX Tricky",
                         WS_OVERLAPPEDWINDOW, x, y, ww, wh,
                         NULL, s_host_menu, inst, NULL);
     if (!h) {
@@ -1491,15 +2118,24 @@ static HWND host_window_create_here(UINT width, UINT height)
         return NULL;
     }
 
-    ShowWindow(h, SW_SHOW);
+    if (host_no_activate()) {
+        /* Shown without the focus and behind the window in front, in one
+         * step (shown first, it would cover that window for a moment). */
+        SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                     SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        na_note_front();
+    } else
+        ShowWindow(h, SW_SHOW);
     UpdateWindow(h);
     s_host_window = h;
     SetTimer(h, 1, 500, NULL);
     if (s_cfg_fullscreen)
         host_window_set_fullscreen(h, 1);
-    fprintf(stderr, "D3D8: created output window %ux%u%s%s (hwnd=%p)\n",
+    fprintf(stderr, "D3D8: created output window %ux%u%s%s%s (hwnd=%p)\n",
             width, height, s_fullscreen ? ", fullscreen" : "",
-            s_host_menu ? ", menu" : "", (void *)h);
+            s_host_menu ? ", menu" : "",
+            host_no_activate() ? ", not activated (XBOX_NO_ACTIVATE)" : "", (void *)h);
+    fprintf(stderr, "[TIME] output window at t+%.0f ms\n", d3d8_ms_since_start());
     fflush(stderr);
     return h;
 }
@@ -1566,12 +2202,15 @@ static volatile LONG    s_dac_dirty;        /* a new table to upload */
 static volatile LONG    s_dac_have;         /* a table was received */
 static int              s_dac_identity = 1;
 
+/* 0 = not made, 1 = being made, 2 = ready (as shot_lock_init). */
 static void dac_lock_init(void)
 {
-    if (InterlockedCompareExchange(&s_dac_lock_ready, 1, 0) == 0)
+    if (InterlockedCompareExchange(&s_dac_lock_ready, 1, 0) == 0) {
         InitializeCriticalSection(&s_dac_lock);
-    else
-        while (s_dac_lock_ready != 1) Sleep(0);
+        InterlockedExchange(&s_dac_lock_ready, 2);
+    } else {
+        while (s_dac_lock_ready != 2) Sleep(0);
+    }
 }
 
 int d3d8_GammaFixEnabled(void)
@@ -1586,7 +2225,7 @@ void d3d8_SetDacPalette(const unsigned char lut[256][3])
 {
     unsigned i;
     int ident = 1;
-    if (s_dac_lock_ready != 1) dac_lock_init();
+    if (s_dac_lock_ready != 2) dac_lock_init();
     EnterCriticalSection(&s_dac_lock);
     memcpy(s_dac_lut, lut, sizeof s_dac_lut);
     for (i = 0; i < 256; i++)
@@ -1607,7 +2246,7 @@ static int dac_active(void)
 /* CPU copy of the table for captures (R, G, B channels). */
 static void dac_lut_copy(unsigned char out[256][3])
 {
-    if (s_dac_lock_ready != 1) dac_lock_init();
+    if (s_dac_lock_ready != 2) dac_lock_init();
     EnterCriticalSection(&s_dac_lock);
     memcpy(out, s_dac_lut, sizeof s_dac_lut);
     LeaveCriticalSection(&s_dac_lock);
@@ -1657,18 +2296,18 @@ static int blit_init(void)
     if (failed || !dev) return 0;
     failed = 1;   /* cleared on success; never retried every frame */
 
-    if (FAILED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, "blit", NULL, NULL,
-                          "vs", "vs_5_0", 0, 0, &code, &err))) goto fail;
+    if (FAILED(d3d8_shader_compile_logged(s_blit_hlsl, sizeof s_blit_hlsl - 1, "blit", NULL,
+                                          "vs", "vs_5_0", 0, &code, &err))) goto fail;
     if (FAILED(ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(code),
             ID3D10Blob_GetBufferSize(code), NULL, &s_blit_vs))) goto fail;
     ID3D10Blob_Release(code); code = NULL;
-    if (FAILED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, "blit", NULL, NULL,
-                          "ps", "ps_5_0", 0, 0, &code, &err))) goto fail;
+    if (FAILED(d3d8_shader_compile_logged(s_blit_hlsl, sizeof s_blit_hlsl - 1, "blit", NULL,
+                                          "ps", "ps_5_0", 0, &code, &err))) goto fail;
     if (FAILED(ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(code),
             ID3D10Blob_GetBufferSize(code), NULL, &s_blit_ps))) goto fail;
     ID3D10Blob_Release(code); code = NULL;
-    if (FAILED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, "blit", NULL, NULL,
-                          "ps_lut", "ps_5_0", 0, 0, &code, &err))) goto fail;
+    if (FAILED(d3d8_shader_compile_logged(s_blit_hlsl, sizeof s_blit_hlsl - 1, "blit", NULL,
+                                          "ps_lut", "ps_5_0", 0, &code, &err))) goto fail;
     if (FAILED(ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(code),
             ID3D10Blob_GetBufferSize(code), NULL, &s_blit_ps_lut))) goto fail;
     ID3D10Blob_Release(code); code = NULL;
@@ -1853,6 +2492,10 @@ static HRESULT swap_targets_create(D3D8DeviceState *s)
  */
 static void scene_targets_release(D3D8DeviceState *s)
 {
+    d3d8_lights_release();              /* fork: their targets follow these */
+    d3d8_bloom_release();
+    d3d8_temporal_release();
+    d3d8_haze_halo_release();
     if (s->depth_srv)     { ID3D11ShaderResourceView_Release(s->depth_srv); s->depth_srv = NULL; }
     if (s->default_dsv)   { ID3D11DepthStencilView_Release(s->default_dsv); s->default_dsv = NULL; }
     if (s->default_depth) { ID3D11Texture2D_Release(s->default_depth); s->default_depth = NULL; }
@@ -1909,9 +2552,11 @@ static HRESULT scene_targets_create(D3D8DeviceState *s, UINT msaa)
     td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     td.SampleDesc.Count = msaa;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    if (d3d8_softshadow_enabled()) {
+    if (d3d8_softshadow_enabled() || d3d8_speedfx_wanted() || d3d8_veil_wanted() || d3d8_bloom_wanted() ||
+        d3d8_temporal_wanted()) {
         /* The soft shadows read the depth, so the buffer is typeless
-         * with a depth view and a shader view. Off, it is created as before. */
+         * with a depth view and a shader view; the speed effect too (its
+         * Strong blur follows the depth). Off, it is created as before. */
         D3D11_DEPTH_STENCIL_VIEW_DESC dv;
         D3D11_SHADER_RESOURCE_VIEW_DESC sv;
         td.Format = DXGI_FORMAT_R24G8_TYPELESS;
@@ -1967,9 +2612,9 @@ unsigned d3d8_DebugPeekScene(float fx, float fy)
     D3D11_MAPPED_SUBRESOURCE m;
     static ID3D11Texture2D *stage;
     unsigned x, y, v = 0xDEADBEEFu;
-    if (!s->scene_tex || !s->d3d11_context) return v;
-    scene_resolve(s);
-    ID3D11Texture2D_GetDesc(s->scene_tex, &td);
+    if (!cur_tex(s) || !s->d3d11_context) return v;
+    cur_resolve(s);                 /* fork: the bound target (render scale) */
+    ID3D11Texture2D_GetDesc(cur_tex(s), &td);
     if (!stage) {
         D3D11_TEXTURE2D_DESC sd;
         memset(&sd, 0, sizeof sd);
@@ -1982,7 +2627,7 @@ unsigned d3d8_DebugPeekScene(float fx, float fy)
     y = (unsigned)(fy * (float)td.Height); if (y >= td.Height) y = td.Height - 1;
     box.left = x; box.right = x + 1; box.top = y; box.bottom = y + 1; box.front = 0; box.back = 1;
     ID3D11DeviceContext_CopySubresourceRegion(s->d3d11_context, (ID3D11Resource *)stage, 0, 0, 0, 0,
-                                              (ID3D11Resource *)s->scene_tex, 0, &box);
+                                              (ID3D11Resource *)cur_tex(s), 0, &box);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s->d3d11_context, (ID3D11Resource *)stage, 0,
                                           D3D11_MAP_READ, 0, &m))) {
         const unsigned char *p = (const unsigned char *)m.pData;   /* R8G8B8A8 */
@@ -2254,6 +2899,608 @@ static HRESULT save_scene_png(D3D8DeviceState *s, ID3D11Texture2D *img, const WC
     return hr;
 }
 
+/* ── Screenshots of the image shown, and bursts ────────────
+ *
+ * F12 (hostui.c) saves the image the window shows: the swap chain's back
+ * buffer, read right after the blit -- at the window's size, after the post
+ * chain, the scaling into the window, the DAC palette and any black bars:
+ * the very pixels handed to Present. Shift+F12 saves a burst: N consecutive presents
+ * (XBOX_SHOT_BURST, 60 by default, 2 to 999) into a folder, to show what
+ * moves (a flicker, a grain). The render thread never waits for it: each
+ * image is copied into one of SHOWN_SLOTS staging textures, read back once
+ * the GPU is done with it (a present or two later), and the PNG is encoded
+ * and written by worker threads (XBOX_SHOT_THREADS, 4 by default; they start
+ * once the burst is copied, or at half the memory allowed), with the
+ * host's encoder (d3d8_SetPngEncoder; WIC fails in this process on some PCs,
+ * And the built-in writer does not compress), else those. A text
+ * file beside it says what was shown: hostui.c writes the game's context,
+ * shown_finish adds the image's (sizes, present times, cost per present).
+ * One capture at a time, from its request to its last file.
+ * d3d8_RequestScreenshot (the tools' internal capture: the scene target at
+ * the render size, the palette applied on the CPU) is unchanged;
+ * XBOX_SHOT_VERIFY=1 also takes one at the present of the first image
+ * ("<name> internal.png"), for comparisons. Nothing runs before the first
+ * request but one timestamp per present (the intervals before a burst).
+ */
+#define SHOWN_SLOTS   4
+#define SHOWN_LOG_MAX 4096
+#define SHOWN_HIST    120
+
+typedef struct ShownFrame {
+    struct ShownFrame *next;
+    unsigned index;
+    UINT w, h;
+    int bgra;                       /* bytes B,G,R,A (else R,G,B,A) */
+    size_t bytes;
+    BYTE *px;                       /* w * 4 bytes per row, top-down */
+} ShownFrame;
+
+typedef struct {
+    double t;                       /* ms (QPC) at this point of the present */
+    float cost;                     /* ms spent here at that present */
+    int frame;                      /* image captured at it, or -1 */
+    unsigned present;               /* s_frames */
+    char info[48];                  /* the host's note (race tick): captured images */
+} ShownLog;
+
+static struct {
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE work, room;
+    volatile LONG ready;            /* 2 once the lock exists */
+    /* the request (any thread -> the render thread) */
+    int pending;
+    WCHAR req_path[MAX_PATH], req_notes[MAX_PATH];
+    unsigned req_n;
+    /* the job, from its first image to its last file */
+    volatile LONG active;
+    int capturing;                  /* images still to copy: the workers wait (below) */
+    WCHAR path[MAX_PATH], notes[MAX_PATH];   /* single: the .png; burst: the folder */
+    unsigned n, captured, read;     /* render thread */
+    unsigned n_asked, burst_mb;     /* n before the burst's memory limit, and the limit */
+    unsigned written, failed;       /* under the lock */
+    ShownFrame *head, *tail;        /* for the workers */
+    size_t bytes, cap;              /* raw bytes held for the workers, and the limit */
+    double enc_ms, enc_max, t_written;
+    int wic_fail, threads, own_png;
+    BYTE *pool[8];                  /* buffers given back by the workers, pool_bytes each */
+    int pool_n;
+    size_t pool_bytes;
+} SH;
+
+/* The host's PNG encoder (packed R,G,B rows; a malloc'd PNG), else the
+ * built-in ones. */
+static void *(*s_sh_png)(const unsigned char *rgb, unsigned w, unsigned h, size_t *len);
+
+void d3d8_SetPngEncoder(void *(*fn)(const unsigned char *rgb, unsigned w, unsigned h, size_t *len))
+{
+    s_sh_png = fn;
+}
+
+/* Render thread only. */
+static struct {
+    ID3D11Texture2D *tex;
+    UINT w, h;
+    DXGI_FORMAT fmt;
+    int busy;
+    unsigned index;
+} s_sh_slot[SHOWN_SLOTS];
+static ShownLog s_sh_log[SHOWN_LOG_MAX];
+static unsigned s_sh_log_n;
+static double   s_sh_hist[SHOWN_HIST];   /* present times, for the intervals before a job */
+static unsigned s_sh_hist_n;
+static double   s_sh_before[SHOWN_HIST]; /* the job's: the last present times before it */
+static unsigned s_sh_before_n;
+static unsigned s_sh_gpu_waits, s_sh_mem_waits;
+static double   s_sh_mem_wait_ms;
+static void   (*s_sh_info_hook)(char *buf, size_t n);
+
+static double shown_now_ms(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+static int shown_env_int(const char *name, int def, int lo, int hi)
+{
+    const char *e = getenv(name);
+    int v = e && e[0] ? atoi(e) : def;
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+unsigned d3d8_ShotBurstCount(void)
+{
+    return (unsigned)shown_env_int("XBOX_SHOT_BURST", 60, 2, 999);
+}
+
+void d3d8_SetShotInfoHook(void (*fn)(char *buf, size_t n))
+{
+    s_sh_info_hook = fn;
+}
+
+/* Where image `index` of the job goes. SH.path and SH.n do not change while
+ * the job runs. */
+static void shown_frame_path(unsigned index, WCHAR *out)
+{
+    if (SH.n == 1) lstrcpynW(out, SH.path, MAX_PATH);
+    else swprintf(out, MAX_PATH, L"%ls\\%03u.png", SH.path, index);
+}
+
+static DWORD WINAPI shown_worker(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        ShownFrame *f;
+        WCHAR path[MAX_PATH];
+        BYTE *bgr, *png = NULL;
+        size_t png_len = 0;
+        UINT stride, x, y;
+        HRESULT hr = E_OUTOFMEMORY;
+        const char *step = "";
+        double t0, el;
+        int wic_failed = 0, own = 0;
+
+        /* Not while a burst is being copied, unless half the memory allowed is
+         * used: encoding next to the game slows it (measured: 4 threads at
+         * ~300 fps, presents 3.3 -> 5.3 ms), and the images would then show
+         * a slower game than the one played. */
+        EnterCriticalSection(&SH.lock);
+        while (!SH.head || (SH.capturing && SH.bytes < SH.cap / 2))
+            SleepConditionVariableCS(&SH.work, &SH.lock, INFINITE);
+        f = SH.head;
+        SH.head = f->next;
+        if (!SH.head) SH.tail = NULL;
+        shown_frame_path(f->index, path);
+        LeaveCriticalSection(&SH.lock);
+
+        t0 = shown_now_ms();
+        {
+            /* XBOX_SHOT_ENCODER (tests): host (default: the host's, else the
+             * two below) | wic | builtin */
+            const char *e = getenv("XBOX_SHOT_ENCODER");
+            int want_host = s_sh_png && !(e && (!strcmp(e, "wic") || !strcmp(e, "builtin")));
+            int want_wic = !want_host && !(e && !strcmp(e, "builtin"));
+            /* the host's: packed R,G,B rows; WIC and the built-in writer: B,G,R rows, 4-byte aligned */
+            const unsigned r = f->bgra ? 2u : 0u, b = f->bgra ? 0u : 2u;
+            const unsigned o0 = want_host ? r : b, o2 = want_host ? b : r;
+            stride = want_host ? f->w * 3u : (f->w * 3 + 3) & ~3u;
+            bgr = (BYTE *)malloc((size_t)stride * f->h);
+            if (bgr) {
+                for (y = 0; y < f->h; y++) {
+                    const BYTE *src = f->px + (size_t)y * f->w * 4u;
+                    BYTE *dst = bgr + (size_t)y * stride;
+                    for (x = 0; x < f->w; x++) {
+                        dst[x * 3 + 0] = src[x * 4 + o0];
+                        dst[x * 3 + 1] = src[x * 4 + 1];
+                        dst[x * 3 + 2] = src[x * 4 + o2];
+                    }
+                }
+                hr = E_FAIL;
+                if (want_host) {
+                    png = (BYTE *)s_sh_png(bgr, f->w, f->h, &png_len);
+                    hr = png && png_len ? S_OK : E_FAIL;
+                    if (FAILED(hr)) {           /* the built-in writer wants B,G,R */
+                        for (y = 0; y < f->h; y++)
+                            for (x = 0; x < f->w; x++) {
+                                BYTE t = bgr[(size_t)y * stride + x * 3];
+                                bgr[(size_t)y * stride + x * 3] = bgr[(size_t)y * stride + x * 3 + 2];
+                                bgr[(size_t)y * stride + x * 3 + 2] = t;
+                            }
+                    }
+                } else if (want_wic) {
+                    hr = png_encode_wic(bgr, f->w, f->h, stride, &png, &png_len, &step);
+                    if (FAILED(hr)) wic_failed = 1;
+                }
+                if (FAILED(hr)) {
+                    free(png);
+                    png = NULL;
+                    hr = png_encode_own(bgr, f->w, f->h, stride, &png, &png_len);
+                    own = 1;
+                }
+                if (SUCCEEDED(hr)) hr = file_write_whole(path, png, png_len);
+                free(png);
+                free(bgr);
+            }
+        }
+        el = shown_now_ms() - t0;
+        if (wic_failed)
+            fprintf(stderr, "D3D8: screenshot: WIC failed at %s%s\n", step,
+                    SUCCEEDED(hr) ? ", the built-in PNG writer was used" : "");
+        if (FAILED(hr))
+            fprintf(stderr, "D3D8: screenshot %ls: 0x%08lX\n", path, (unsigned long)hr);
+
+        EnterCriticalSection(&SH.lock);
+        SH.bytes -= f->bytes;
+        if (SUCCEEDED(hr)) SH.written++; else SH.failed++;
+        SH.enc_ms += el;
+        if (el > SH.enc_max) SH.enc_max = el;
+        SH.wic_fail += wic_failed;
+        SH.own_png += own;
+        SH.t_written = shown_now_ms();
+        if (SH.pool_n < 8 && (!SH.pool_n || SH.pool_bytes == f->bytes)) {
+            SH.pool_bytes = f->bytes;   /* kept for the next image: no new pages to touch */
+            SH.pool[SH.pool_n++] = f->px;
+            f->px = NULL;
+        }
+        WakeAllConditionVariable(&SH.room);
+        LeaveCriticalSection(&SH.lock);
+        free(f->px);
+        free(f);
+    }
+    return 0;                           /* not reached */
+}
+
+static void shown_init(void)
+{
+    static volatile LONG once;
+    if (InterlockedCompareExchange(&once, 1, 0) == 0) {
+        InitializeCriticalSection(&SH.lock);
+        InitializeConditionVariable(&SH.work);
+        InitializeConditionVariable(&SH.room);
+        InterlockedExchange(&SH.ready, 2);
+    } else {
+        while (SH.ready != 2) Sleep(0);
+    }
+}
+
+/* Raw bytes the workers may hold: a quarter of the free memory, 256 MB to
+ * 4 GB (XBOX_SHOT_MEM_MB). Beyond it the render thread waits for them. */
+static size_t shown_mem_cap(void)
+{
+    MEMORYSTATUSEX ms;
+    unsigned long long c = 1024ull << 20;
+    int mb = shown_env_int("XBOX_SHOT_MEM_MB", 0, 0, 65536);
+    if (mb) return (size_t)mb << 20;
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) c = ms.ullAvailPhys / 4u;
+    if (c < (256ull << 20)) c = 256ull << 20;
+    if (c > (4096ull << 20)) c = 4096ull << 20;
+    return (size_t)c;
+}
+
+/* Ask for n images of the window from the next present: path is the .png
+ * (n = 1) or an existing folder (n > 1, images 000.png, 001.png, ...); a
+ * description is appended to notes (may be NULL) once every file is written.
+ * Returns 0 when a capture is still running (nothing asked). Any thread. */
+int d3d8_RequestShownShot(const wchar_t *path, unsigned n, const wchar_t *notes)
+{
+    int ok = 0;
+    if (!path || !path[0]) return 0;
+    shown_init();
+    EnterCriticalSection(&SH.lock);
+    if (!SH.pending && !SH.active) {
+        lstrcpynW(SH.req_path, path, MAX_PATH);
+        lstrcpynW(SH.req_notes, notes ? notes : L"", MAX_PATH);
+        SH.req_n = n < 1 ? 1 : n > 999 ? 999 : n;
+        SH.pending = 1;
+        ok = 1;
+        if (!SH.threads) {
+            int i, want = shown_env_int("XBOX_SHOT_THREADS", 4, 1, 16);
+            for (i = 0; i < want; i++) {
+                HANDLE t = CreateThread(NULL, 0, shown_worker, NULL, 0, NULL);
+                if (t) { SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(t); SH.threads++; }
+            }
+            if (!SH.threads) { SH.pending = 0; ok = 0; }
+        }
+    }
+    LeaveCriticalSection(&SH.lock);
+    return ok;
+}
+
+/* 1 while a capture asked with d3d8_RequestShownShot is not finished. */
+int d3d8_ShownShotBusy(void)
+{
+    return SH.ready == 2 && (SH.pending || SH.active);
+}
+
+/* Render thread, at each present before anything is read: a request becomes
+ * the job, its first image is this present's. */
+static void shown_shots_begin(void)
+{
+    WCHAR vp[MAX_PATH];
+    if (SH.ready != 2 || SH.active) return;
+    EnterCriticalSection(&SH.lock);
+    if (SH.pending) {
+        SH.pending = 0;
+        lstrcpynW(SH.path, SH.req_path, MAX_PATH);
+        lstrcpynW(SH.notes, SH.req_notes, MAX_PATH);
+        SH.n = SH.n_asked = SH.req_n;
+        /* A burst holds its raw images until the last one is copied: at most
+         * XBOX_SHOT_BURST_MB (1536) of them, fewer images if the window is
+         * large (60 at 3440x1440 = 1.2 GB). Consecutive images, never spread. */
+        SH.burst_mb = (unsigned)shown_env_int("XBOX_SHOT_BURST_MB", 1536, 64, 65536);
+        if (SH.n > 1 && g_device_state.swap_w && g_device_state.swap_h) {
+            unsigned long long one = (unsigned long long)g_device_state.swap_w * g_device_state.swap_h * 4u;
+            unsigned long long fit = ((unsigned long long)SH.burst_mb << 20) / one;
+            if (fit < 2) fit = 2;
+            if (fit < SH.n) SH.n = (unsigned)fit;
+        }
+        SH.captured = SH.read = SH.written = SH.failed = 0;
+        SH.enc_ms = SH.enc_max = SH.t_written = 0.0;
+        SH.wic_fail = SH.own_png = 0;
+        SH.capturing = 1;
+        if (!SH.cap) SH.cap = shown_mem_cap();
+        InterlockedExchange(&SH.active, 1);
+    }
+    LeaveCriticalSection(&SH.lock);
+    if (!SH.active) return;
+    s_sh_log_n = 0;
+    s_sh_before_n = s_sh_hist_n < SHOWN_HIST ? s_sh_hist_n : SHOWN_HIST;
+    {
+        unsigned i;
+        for (i = 0; i < s_sh_before_n; i++)
+            s_sh_before[i] = s_sh_hist[(s_sh_hist_n - s_sh_before_n + i) % SHOWN_HIST];
+    }
+    s_sh_gpu_waits = s_sh_mem_waits = 0;
+    s_sh_mem_wait_ms = 0.0;
+    if (SH.n > 1) d3d8_HostToast(L"Burst: capturing");
+    {   /* XBOX_SHOT_VERIFY=1: the internal capture of the same present */
+        const char *e = NULL;
+        if (e && e[0] == '1') {
+            size_t k;
+            if (SH.n > 1) swprintf(vp, MAX_PATH, L"%ls\\000 internal.png", SH.path);
+            else {
+                lstrcpynW(vp, SH.path, MAX_PATH);
+                k = wcslen(vp);
+                if (k > 4 && !_wcsicmp(vp + k - 4, L".png")) vp[k - 4] = 0;
+                wcsncat(vp, L" internal.png", MAX_PATH - wcslen(vp) - 1);
+            }
+            d3d8_RequestScreenshot(vp);
+        }
+    }
+}
+
+/* Copy the staging images the GPU is done with into memory for the workers,
+ * in order; wait = 1 waits for the oldest. */
+static void shown_readback(D3D8DeviceState *s, int wait)
+{
+    ID3D11DeviceContext *ctx = s->d3d11_context;
+    while (SH.read < SH.captured) {
+        unsigned k = SH.read % SHOWN_SLOTS, y;
+        D3D11_MAPPED_SUBRESOURCE m;
+        ShownFrame *f = NULL;
+        BYTE *px;
+        size_t bytes, row;
+        HRESULT hr;
+        if (!s_sh_slot[k].busy || s_sh_slot[k].index != SH.read) {      /* its copy failed */
+            EnterCriticalSection(&SH.lock);
+            SH.failed++;
+            LeaveCriticalSection(&SH.lock);
+            SH.read++;
+            continue;
+        }
+        row = (size_t)s_sh_slot[k].w * 4u;
+        bytes = row * s_sh_slot[k].h;
+        hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)s_sh_slot[k].tex, 0, D3D11_MAP_READ,
+                                     wait ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) break;
+        wait = 0;                       /* one blocking map at most */
+        if (SUCCEEDED(hr)) {
+            EnterCriticalSection(&SH.lock);
+            if (SH.bytes && SH.bytes + bytes > SH.cap) {
+                double w0 = shown_now_ms();
+                s_sh_mem_waits++;
+                WakeAllConditionVariable(&SH.work);
+                while (SH.bytes && SH.bytes + bytes > SH.cap)
+                    SleepConditionVariableCS(&SH.room, &SH.lock, INFINITE);
+                s_sh_mem_wait_ms += shown_now_ms() - w0;
+            }
+            SH.bytes += bytes;
+            px = SH.pool_n && SH.pool_bytes == bytes ? SH.pool[--SH.pool_n] : NULL;
+            LeaveCriticalSection(&SH.lock);
+            f = (ShownFrame *)calloc(1, sizeof *f);
+            if (f) f->px = px ? px : (BYTE *)malloc(bytes);
+            else free(px);
+            if (f && f->px) {
+                for (y = 0; y < s_sh_slot[k].h; y++)
+                    memcpy(f->px + row * y, (const BYTE *)m.pData + (size_t)m.RowPitch * y, row);
+                f->index = SH.read;
+                f->w = s_sh_slot[k].w;
+                f->h = s_sh_slot[k].h;
+                f->bgra = s_sh_slot[k].fmt == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                          s_sh_slot[k].fmt == DXGI_FORMAT_B8G8R8X8_UNORM;
+                f->bytes = bytes;
+            } else if (f) {
+                free(f);
+                f = NULL;
+            }
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)s_sh_slot[k].tex, 0);
+        }
+        s_sh_slot[k].busy = 0;
+        EnterCriticalSection(&SH.lock);
+        if (f) {
+            if (SH.tail) SH.tail->next = f; else SH.head = f;
+            SH.tail = f;
+            WakeAllConditionVariable(&SH.work);
+        } else {
+            if (SUCCEEDED(hr)) SH.bytes -= bytes;
+            SH.failed++;
+        }
+        LeaveCriticalSection(&SH.lock);
+        SH.read++;
+    }
+}
+
+static int shown_cmp_d(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* "median / p95 / max" of n values (sorted in place). */
+static void shown_stats(double *v, unsigned n, char *out, size_t sz)
+{
+    if (!n) { snprintf(out, sz, "-"); return; }
+    qsort(v, n, sizeof *v, shown_cmp_d);
+    snprintf(out, sz, "%.2f / %.2f / %.2f", v[n / 2], v[(n * 95u) / 100u < n ? (n * 95u) / 100u : n - 1],
+             v[n - 1]);
+}
+
+/* Every file written: the description, the toast, the slots let go. */
+static void shown_finish(D3D8DeviceState *s)
+{
+    static double v[SHOWN_LOG_MAX + SHOWN_HIST];
+    unsigned i, nv, first = 0, last = 0, have = 0, consecutive = 1, nwrite = 0;
+    double cost_sum = 0.0, cost_max = 0.0, t_first = 0.0, prev;
+    unsigned written, failed;
+    char a[64], b[64], c[64];
+    WCHAR toast[96];
+    FILE *f = NULL;
+
+    EnterCriticalSection(&SH.lock);
+    written = SH.written;
+    failed = SH.failed;
+    LeaveCriticalSection(&SH.lock);
+    for (i = 0; i < s_sh_log_n; i++) {
+        if (s_sh_log[i].frame < 0) continue;
+        if (!have) { first = i; t_first = s_sh_log[i].t; }
+        else if (s_sh_log[i].present != s_sh_log[last].present + 1u) consecutive = 0;
+        last = i;
+        have = 1;
+    }
+    if (have && last + 1 - first != SH.n) consecutive = 0;
+    for (i = 0; i < s_sh_log_n; i++) {
+        cost_sum += s_sh_log[i].cost;
+        if (s_sh_log[i].cost > cost_max) cost_max = s_sh_log[i].cost;
+    }
+    if (SH.notes[0]) f = _wfopen(SH.notes, L"ab");
+    if (f) {
+        fprintf(f, "\n[image]\n");
+        fprintf(f, "what = the image shown in the window: the swap chain's back buffer after the blit "
+                   "(post effects, scaling into the window, DAC palette, black bars)\n");
+        fprintf(f, "shown = %ux%u (window client area)\n", s->swap_w, s->swap_h);
+        fprintf(f, "render = %ux%u (scene target)", s->width, s->height);
+        if (s_rs_pct != 100) fprintf(f, ", 3D at %d %% (%ux%u)", s_rs_pct, s->rs_w, s->rs_h);
+        fprintf(f, "\nscaled into the window = %s\n",
+                s->swap_w == s->width && s->swap_h == s->height ? "no (1:1)" : "yes (bilinear)");
+        fprintf(f, "dac palette = %s; post chain = %s; fullscreen = %s\n",
+                dac_active() ? "applied" : "none", d3d8_post_enabled() ? "on" : "off",
+                s_fullscreen ? "yes" : "no");
+        fprintf(f, "images = %u asked, %u captured, %u written, %u failed\n",
+                SH.n, SH.captured, written, failed);
+        if (SH.n < SH.n_asked)
+            fprintf(f, "burst limited = %u images asked, %u kept: %ux%u images, memory limit %u MB "
+                       "(XBOX_SHOT_BURST_MB)\n", SH.n_asked, SH.n, s->swap_w, s->swap_h, SH.burst_mb);
+        if (have)
+            fprintf(f, "presents = #%u to #%u: %s\n", s_sh_log[first].present, s_sh_log[last].present,
+                    consecutive ? "one image per present, none skipped" : "NOT consecutive (see the table)");
+        fprintf(f, "render thread, per present = mean %.3f ms, max %.3f ms (copy, read back, notes); "
+                   "GPU waits %u; memory waits %u (%.0f ms)\n",
+                s_sh_log_n ? cost_sum / s_sh_log_n : 0.0, cost_max, s_sh_gpu_waits, s_sh_mem_waits,
+                s_sh_mem_wait_ms);
+        fprintf(f, "encoding = %d thread(s), mean %.1f ms, max %.1f ms per image%s; last file %.0f ms "
+                   "after the first image\n",
+                SH.threads, (written + failed) ? SH.enc_ms / (written + failed) : 0.0, SH.enc_max,
+                SH.own_png ? " (built-in PNG writer, uncompressed)" : s_sh_png ? " (host PNG writer)" : " (WIC PNG)",
+                have && SH.t_written > t_first ? SH.t_written - t_first : 0.0);
+        /* present intervals: before the job, during the capture, while writing */
+        nv = 0;
+        for (i = 1; i < s_sh_before_n; i++) v[nv++] = s_sh_before[i] - s_sh_before[i - 1];
+        shown_stats(v, nv, a, sizeof a);
+        fprintf(f, "present intervals, median / p95 / max ms = before %s (%u)", a, nv);
+        nv = 0;
+        for (i = first + 1; have && i <= last; i++) v[nv++] = s_sh_log[i].t - s_sh_log[i - 1].t;
+        shown_stats(v, nv, b, sizeof b);
+        fprintf(f, "; during the capture %s (%u)", b, nv);
+        nv = 0;
+        for (i = last + 1; have && i < s_sh_log_n; i++) v[nv++] = s_sh_log[i].t - s_sh_log[i - 1].t;
+        nwrite = nv;
+        shown_stats(v, nv, c, sizeof c);
+        fprintf(f, "; while the files were written %s (%u)\n", c, nwrite);
+        fprintf(f, "\nimage  present  t_ms      interval_ms  here_ms  game\n");
+        prev = s_sh_before_n ? s_sh_before[s_sh_before_n - 1] : 0.0;
+        for (i = 0; i < s_sh_log_n; i++) {
+            const ShownLog *L = &s_sh_log[i];
+            if (L->frame >= 0)
+                fprintf(f, "%03d    #%-7u %8.2f  %11.2f  %7.3f  %s\n", L->frame, L->present,
+                        L->t - t_first, prev ? L->t - prev : 0.0, L->cost, L->info);
+            prev = L->t;
+        }
+        fclose(f);
+    }
+    if (SH.n == 1) lstrcpynW(toast, written ? L"Screenshot saved" : L"Screenshot failed", 96);
+    else if (written == SH.n) swprintf(toast, 96, L"Burst saved: %u images", written);
+    else swprintf(toast, 96, L"Burst: %u of %u images saved", written, SH.n);
+    d3d8_HostToast(toast);
+    fprintf(stderr, "[SHOT] %ls: %u of %u image(s) written, %ux%u, presents %s, render thread max %.3f ms, "
+            "GPU waits %u, memory waits %u\n", SH.path, written, SH.n, s->swap_w, s->swap_h,
+            consecutive ? "consecutive" : "NOT consecutive", cost_max, s_sh_gpu_waits, s_sh_mem_waits);
+    fflush(stderr);
+    EnterCriticalSection(&SH.lock);
+    while (SH.pool_n) free(SH.pool[--SH.pool_n]);
+    LeaveCriticalSection(&SH.lock);
+    for (i = 0; i < SHOWN_SLOTS; i++)
+        if (s_sh_slot[i].tex) { ID3D11Texture2D_Release(s_sh_slot[i].tex); memset(&s_sh_slot[i], 0, sizeof s_sh_slot[i]); }
+    InterlockedExchange(&SH.active, 0);
+}
+
+/* Render thread, at each present right after the blit into the back buffer:
+ * this image, then what the GPU has finished. */
+static void shown_shots_present(D3D8DeviceState *s)
+{
+    double t0 = shown_now_ms();
+    int frame = -1;
+    ShownLog *L;
+    s_sh_hist[s_sh_hist_n++ % SHOWN_HIST] = t0;
+    if (!SH.active) return;
+    if (SH.captured < SH.n) {
+        unsigned k = SH.captured % SHOWN_SLOTS;
+        D3D11_TEXTURE2D_DESC td;
+        if (s_sh_slot[k].busy) { s_sh_gpu_waits++; shown_readback(s, 1); }
+        ID3D11Texture2D_GetDesc(s->swap_tex, &td);
+        if (s_sh_slot[k].tex && (s_sh_slot[k].w != td.Width || s_sh_slot[k].h != td.Height ||
+                                 s_sh_slot[k].fmt != td.Format)) {
+            ID3D11Texture2D_Release(s_sh_slot[k].tex);
+            s_sh_slot[k].tex = NULL;
+        }
+        if (!s_sh_slot[k].tex) {
+            td.MipLevels = 1; td.ArraySize = 1;
+            td.SampleDesc.Count = 1; td.SampleDesc.Quality = 0;
+            td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
+            if (SUCCEEDED(ID3D11Device_CreateTexture2D(s->d3d11_device, &td, NULL, &s_sh_slot[k].tex))) {
+                s_sh_slot[k].w = td.Width;
+                s_sh_slot[k].h = td.Height;
+                s_sh_slot[k].fmt = td.Format;
+            } else {
+                s_sh_slot[k].tex = NULL;
+            }
+        }
+        if (s_sh_slot[k].tex) {
+            ID3D11DeviceContext_CopyResource(s->d3d11_context, (ID3D11Resource *)s_sh_slot[k].tex,
+                                             (ID3D11Resource *)s->swap_tex);
+            s_sh_slot[k].busy = 1;
+            s_sh_slot[k].index = SH.captured;
+        }
+        frame = (int)SH.captured++;
+        if (SH.captured == SH.n) {      /* the last one: the workers may start */
+            EnterCriticalSection(&SH.lock);
+            SH.capturing = 0;
+            WakeAllConditionVariable(&SH.work);
+            LeaveCriticalSection(&SH.lock);
+        }
+    }
+    shown_readback(s, 0);
+    if (s_sh_log_n < SHOWN_LOG_MAX) {
+        L = &s_sh_log[s_sh_log_n++];
+        L->t = t0;
+        L->frame = frame;
+        L->present = (unsigned)s_frames;
+        L->info[0] = 0;
+        if (frame >= 0 && s_sh_info_hook) s_sh_info_hook(L->info, sizeof L->info);
+        L->cost = (float)(shown_now_ms() - t0);
+    }
+    if (SH.captured == SH.n && SH.read == SH.n) {
+        int done;
+        EnterCriticalSection(&SH.lock);
+        done = SH.written + SH.failed == SH.n;
+        LeaveCriticalSection(&SH.lock);
+        if (done) shown_finish(s);
+    }
+}
+
 /* Show the finished scene: fit it, at its display aspect, into the window --
  * centred, with black bars where the window's shape differs -- then present.
  * A 1:1 fit is a plain copy, which is every automated run. Settings changed
@@ -2392,6 +3639,10 @@ static HRESULT host_present_impl(void)
     HRESULT hr;
 
     if (!s->swap_chain) return E_FAIL;
+    if (!s_video_frame) lights_apply(s);    /* fork: an image without HUD phase */
+    /* fork: render scale -- the 3D at the render size before the image is
+     * read, unless a video frame replaced it */
+    if (s_rs_bound) rs_to_screen(s, 0, !s_video_frame);
     if (ctx && s->scene_tex) {
         ID3D11Texture2D *img;
         ID3D11ShaderResourceView *img_srv;
@@ -2401,9 +3652,15 @@ static HRESULT host_present_impl(void)
         prev_frame_update(s);           /* before the post: the chrome reads the title's frame */
         if (g_gpuprof_on) gpuprof_end();
         present_source(&img, &img_srv); /* scene_tex, or the post chain's output */
+        if (s_present_image_overlay) {   /* fork: an optional overlay over the shown image (d3d8_SetPresentImageOverlay) */
+            ID3D11Texture2D *ov;
+            ID3D11ShaderResourceView *ov_srv;
+            if (s_present_image_overlay(img, &ov, &ov_srv)) { img = ov; img_srv = ov_srv; }
+        }
 
+        shown_shots_begin();            /* F12 / Shift+F12 (before the internal one) */
         /* A screenshot, if one was asked for. */
-        if (s_shot_lock_ready == 1) {
+        if (s_shot_lock_ready == 2) {
             WCHAR path[MAX_PATH];
             EnterCriticalSection(&s_shot_lock);
             lstrcpynW(path, s_shot_path, MAX_PATH);
@@ -2412,7 +3669,11 @@ static HRESULT host_present_impl(void)
             if (path[0]) {
                 HRESULT sh = save_scene_png(s, img, path);
                 d3d8_HostToast(SUCCEEDED(sh) ? L"Screenshot saved" : L"Screenshot failed");
-                fprintf(stderr, "D3D8: screenshot %ls: 0x%08lX\n", path, (unsigned long)sh);
+                if (d3d8_veil_wanted())     /* fork: which side of an A/B pair */
+                    fprintf(stderr, "D3D8: screenshot %ls: 0x%08lX (veil %s)\n", path,
+                            (unsigned long)sh, s_veil_last ? "on" : "off");
+                else
+                    fprintf(stderr, "D3D8: screenshot %ls: 0x%08lX\n", path, (unsigned long)sh);
             }
         }
 
@@ -2447,6 +3708,7 @@ static HRESULT host_present_impl(void)
                 blit_draw_lut(img_srv, s->swap_rtv, &vp, lut);
             }
             if (g_gpuprof_on) gpuprof_end();
+            shown_shots_present(s);     /* the image shown, as presented */
         }
     }
     if (g_gpuprof_on) gpuprof_frame();
@@ -2465,6 +3727,13 @@ static HRESULT host_present_impl(void)
         if (plog < 0) { const char *e = getenv("XBOX_FLIP_LOG"); plog = e && e[0] == '1'; }
         if (plog) QueryPerformanceCounter(&p0);
         hr = d3d8_sync_present(s->swap_chain, &dxgi_ms);
+        {   /* one line: the time from the start to the first image shown */
+            static int told;
+            if (!told) {
+                told = 1;
+                fprintf(stderr, "[TIME] first present at t+%.0f ms\n", d3d8_ms_since_start());
+            }
+        }
         if (g_perf_on) s_perf_dxgi_ms = dxgi_ms;
         if (plog) {     /* XBOX_FLIP_LOG=1: how long Present itself blocks */
             QueryPerformanceCounter(&p1);
@@ -2481,7 +3750,7 @@ static HRESULT host_present_impl(void)
         else if (s_split_done) s_split_stats.split++;
         else if (d3d8_post_enabled()) s_split_stats.fallback++;
         else s_split_stats.none++;
-        if (s_split_stats.presents % 600 == 0)
+        if (s_split_stats.presents % 600 == 0 && xbox_log_stats())
             fprintf(stderr, "[POST] split: %llu presents -- %llu posted at FRAME_END, "
                     "%llu fallback at present, %llu without post, %llu video; "
                     "%llu second FRAME_END skipped\n",
@@ -2560,8 +3829,24 @@ static HRESULT host_present_impl(void)
             scene_targets_create(s, 1);
         }
         d3d8_post_release();            /* the post targets follow the scene targets */
+        if (s_rs_pct != 100) rs_targets_create(s);     /* fork: and the render scale's */
         fprintf(stderr, "D3D8: anti-aliasing now %ux\n", s->msaa);
     }
+    {   /* fork: render scale changed live (diagnostics port `set rscale`) */
+        static int rs_gen;
+        int g = d3d8_rscale_generation();
+        if (ctx && s->scene_tex && g != rs_gen) {
+            rs_gen = g;
+            rs_finish(s);
+            rs_choose(s);
+            rs_targets_create(s);
+        }
+    }
+    rs_next_image(s);                   /* fork: render scale, the next image's targets */
+    /* fork: the next image jittered when this one carried markers (a race);
+     * its 3D is drawn into the target bound now (d3d8_temporal.h) */
+    d3d8_temporal_next_image(s_tmp_marked, cur_w(s), cur_h(s), s_rs_pct);
+    s_tmp_marked = 0;
     return hr;
 }
 
@@ -2594,6 +3879,7 @@ static HRESULT d3d11_create_device_and_swap_chain(
     state->guest_h = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
     state->width   = s_cfg_render_w ? s_cfg_render_w : state->guest_w;
     state->height  = s_cfg_render_h ? s_cfg_render_h : state->guest_h;
+    rs_choose(state);               /* fork: render scale of the 3D (100 % by default) */
 
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = pp->BackBufferCount ? pp->BackBufferCount : 1;
@@ -2676,6 +3962,9 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
         hr = scene_targets_create(state, 1);
         if (FAILED(hr)) return hr;
     }
+
+    /* Fork: the render scale's targets (none at 100 %). */
+    rs_targets_create(state);
 
     /* The window's output buffer. */
     hr = swap_targets_create(state);
@@ -2793,6 +4082,8 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
 
         /* Cleanup D3D11 resources */
         D3D8DeviceState *s = &g_device_state;
+        rs_targets_release(s);          /* fork: render scale */
+        d3d8_rscale_release();
         if (s->depth_srv) { ID3D11ShaderResourceView_Release(s->depth_srv); s->depth_srv = NULL; }
         if (s->default_dsv) { ID3D11DepthStencilView_Release(s->default_dsv); s->default_dsv = NULL; }
         if (s->default_depth) { ID3D11Texture2D_Release(s->default_depth); s->default_depth = NULL; }
@@ -2861,7 +4152,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
     frame_count++;
     DWORD now = GetTickCount();
     if (last_tick == 0) last_tick = now;
-    if (now - last_tick >= 2000) {
+    if (now - last_tick >= 2000 && xbox_log_stats()) {
         fprintf(stderr, "  [D3D] %.1fs: %u present (%.1f fps), %u begin, %u end, "
                 "%u clear, %u draw, %u xform, %u rs, %u tex\n",
                 (now - last_tick) / 1000.0, frame_count,
@@ -2891,7 +4182,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
         DispatchMessageA(&msg);
     }
 
-    { static unsigned c = 0; if (++c == 1 || (c % 300) == 0) { fprintf(stderr, "  [PRESENT] dev_Present #%u\n", c); fflush(stderr); } }
+    { static unsigned c = 0; if (++c == 1 || ((c % 300) == 0 && xbox_log_stats())) { fprintf(stderr, "  [PRESENT] dev_Present #%u\n", c); xbox_log_flush(); } }
     return host_present();
 }
 
@@ -2931,7 +4222,7 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
             ((Color >> 24) & 0xFF) / 255.0f,  /* A */
         };
         ID3D11DeviceContext_ClearRenderTargetView(g_device_state.d3d11_context,
-                                                   g_device_state.default_rtv,
+                                                   cur_rtv(&g_device_state),
                                                    clear_color);
     }
 
@@ -2941,7 +4232,7 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
         if (Flags & D3DCLEAR_STENCIL) clear_flags |= D3D11_CLEAR_STENCIL;
 
         ID3D11DeviceContext_ClearDepthStencilView(g_device_state.d3d11_context,
-                                                    g_device_state.default_dsv,
+                                                    cur_dsv(&g_device_state),
                                                     clear_flags, Z, (UINT8)Stencil);
     }
 
@@ -2967,7 +4258,7 @@ void d3d8_ClearRect(DWORD flags, D3DCOLOR color, float z, DWORD stencil,
     static ID3D11DeviceContext1 *ctx1 = NULL;
     static int tried = 0;
 
-    if ((flags & D3DCLEAR_TARGET) && s->default_rtv &&
+    if ((flags & D3DCLEAR_TARGET) && cur_rtv(s) &&
         !(x0 == 0 && y0 == 0 && x1 + 1 >= gw && y1 + 1 >= gh)) {
         if (!tried) {
             tried = 1;
@@ -2989,7 +4280,7 @@ void d3d8_ClearRect(DWORD flags, D3DCOLOR color, float z, DWORD stencil,
             r.bottom = (LONG)((y1 + 1) * sy + 0.5f);
             if (g_gpuprof_on) gpuprof_begin(GP_CLEAR);
             if (x0 <= x1 && y0 <= y1)
-                ID3D11DeviceContext1_ClearView(ctx1, (ID3D11View *)s->default_rtv, c, &r, 1);
+                ID3D11DeviceContext1_ClearView(ctx1, (ID3D11View *)cur_rtv(s), c, &r, 1);
             if (g_gpuprof_on) gpuprof_end();
             flags &= ~(DWORD)D3DCLEAR_TARGET;
         }
@@ -3327,7 +4618,18 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
-    ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, StartVertex);
+    {   /* the Time Challenge ghost (d3d8_nv2a.c): see-through, or not drawn */
+        int gm = d3d8_ghost_mode();
+        if (gm == 2) {
+            d3d8_ghost_pass(g_device_state.d3d11_context, 0);
+            ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, StartVertex);
+            d3d8_ghost_pass(g_device_state.d3d11_context, 1);
+            ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, StartVertex);
+            d3d8_ghost_pass(g_device_state.d3d11_context, 2);
+        } else if (gm == 0) {
+            ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, StartVertex);
+        }
+    }
     return S_OK;
 }
 
@@ -3348,7 +4650,18 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
-    ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, StartIndex, (INT)g_cur_ib_base_vertex);
+    {   /* the Time Challenge ghost (d3d8_nv2a.c): see-through, or not drawn */
+        int gm = d3d8_ghost_mode();
+        if (gm == 2) {
+            d3d8_ghost_pass(g_device_state.d3d11_context, 0);
+            ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, StartIndex, (INT)g_cur_ib_base_vertex);
+            d3d8_ghost_pass(g_device_state.d3d11_context, 1);
+            ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, StartIndex, (INT)g_cur_ib_base_vertex);
+            d3d8_ghost_pass(g_device_state.d3d11_context, 2);
+        } else if (gm == 0) {
+            ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, StartIndex, (INT)g_cur_ib_base_vertex);
+        }
+    }
     return S_OK;
 }
 
@@ -3462,7 +4775,35 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
             if (rs) ID3D11RasterizerState_Release(rs);
         }
     }
-    ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, 0);
+    {   /* the Time Challenge ghost (d3d8_nv2a.c): see-through, or not drawn; fork: the
+         * lights (d3d8_lights.h): drawn again into the emission target, or there only */
+        ID3D11DeviceContext *lctx = g_device_state.d3d11_context;
+        int gm = d3d8_ghost_mode();
+        if (gm == 2) {
+            d3d8_ghost_pass(lctx, 0);
+            ID3D11DeviceContext_Draw(lctx, vertex_count, 0);
+            d3d8_ghost_pass(lctx, 1);
+            ID3D11DeviceContext_Draw(lctx, vertex_count, 0);
+            d3d8_ghost_pass(lctx, 2);
+        } else if (gm == 0) {
+            int lr = g_d3d8_light_mark ? d3d8_lights_pre(lctx) : 0;
+            ID3D11DeviceContext_Draw(lctx, vertex_count, 0);
+            if (lr == 2) {
+                if (d3d8_lights_z_begin(lctx)) {   /* its depth, for the occlusion */
+                    ID3D11DeviceContext_Draw(lctx, vertex_count, 0);
+                    d3d8_lights_z_end(lctx);
+                }
+                d3d8_lights_mirror_end(lctx);
+            } else if (lr == 1 && d3d8_lights_mirror_begin(lctx)) {
+                ID3D11DeviceContext_Draw(lctx, vertex_count, 0);
+                if (d3d8_lights_z_begin(lctx)) {
+                    ID3D11DeviceContext_Draw(lctx, vertex_count, 0);
+                    d3d8_lights_z_end(lctx);
+                }
+                d3d8_lights_mirror_end(lctx);
+            }
+        }
+    }
 
     /* Read the vertices back out of the GPU buffer. Everything CPU-side has
      * checked out, so confirm the bytes the input assembler will actually
@@ -3600,7 +4941,18 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
-    ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, 0, 0);
+    {   /* the Time Challenge ghost (d3d8_nv2a.c): see-through, or not drawn */
+        int gm = d3d8_ghost_mode();
+        if (gm == 2) {
+            d3d8_ghost_pass(g_device_state.d3d11_context, 0);
+            ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, 0, 0);
+            d3d8_ghost_pass(g_device_state.d3d11_context, 1);
+            ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, 0, 0);
+            d3d8_ghost_pass(g_device_state.d3d11_context, 2);
+        } else if (gm == 0) {
+            ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, 0, 0);
+        }
+    }
 
     /* Cleanup temp buffers */
     ID3D11Buffer_Release(tmp_ib);
@@ -3834,7 +5186,7 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
         DispatchMessageA(&msg);
     }
 
-    { static unsigned c = 0; if (++c == 1 || (c % 300) == 0) { fprintf(stderr, "  [PRESENT] dev_BeginPush #%u\n", c); fflush(stderr); } }
+    { static unsigned c = 0; if (++c == 1 || ((c % 300) == 0 && xbox_log_stats())) { fprintf(stderr, "  [PRESENT] dev_BeginPush #%u\n", c); xbox_log_flush(); } }
     return host_present();
 }
 

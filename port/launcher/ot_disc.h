@@ -42,7 +42,8 @@ typedef enum {
     OT_DISC_OK,            /* SSX Tricky (USA) for Xbox */
     OT_DISC_NO_PATH,       /* no disc image chosen yet */
     OT_DISC_NOT_FOUND,     /* the file is gone (moved, drive unplugged) */
-    OT_DISC_WRONG          /* not an Xbox disc image, or another game / region */
+    OT_DISC_WRONG,         /* not an Xbox disc image, or another game / region */
+    OT_DISC_INCOMPLETE     /* SSX Tricky (USA), but the file ends before the disc's last file does */
 } OtDiscStatus;
 
 typedef struct {
@@ -114,8 +115,28 @@ void ot_disc_free(OtDiscAssets *a);
  * shape at any size (the launcher's HD cards). */
 bool ot_card_emblem(const OtImage *card, OtImage *out);
 
+/* Any FNTF font of the disc (e.g. "data/fonts/menu.ffn"); free it with
+ * ot_font_free. */
+bool ot_disc_font(const char *iso, const char *path, OtFont *f);
+void ot_font_free(OtFont *f);
+
 /* Text width in pixels with the title font (ASCII; others skipped). */
 int ot_font_text_width(const OtFont *f, const char *s);
+
+/* ── Raw files, for other readers ───────────────────────────────────── */
+
+typedef struct OtDiscFile OtDiscFile;
+
+OtDiscFile *ot_disc_open(const char *iso);          /* NULL: not an Xbox disc image */
+void ot_disc_close(OtDiscFile *f);
+/* A whole file (at most 64 MB), caller frees. */
+uint8_t *ot_disc_read(OtDiscFile *f, const char *path, uint32_t *len);
+/* One entry of an EA archive (BIGF or c0fb) by its full name, e.g.
+ * ("data/char/texxbx.big", "data/char/eddie_head.xsh"), unpacked; caller frees. */
+uint8_t *ot_disc_archive_entry(OtDiscFile *f, const char *archive, const char *name, uint32_t *len);
+/* One picture of a SHPX texture bank: the first, or the one named `name`
+ * (4 characters). */
+bool ot_shpx_decode(const uint8_t *d, uint32_t n, const char *name, OtImage *out);
 
 #ifdef __cplusplus
 }

@@ -22,6 +22,7 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
+#include "../kernel/xbox_logstats.h"
 #include "fpconv.h"
 
 /* ============================================================
@@ -612,16 +613,19 @@ static void se_frame(MCPXAPUState *d)
             unsigned long now = (unsigned long)GetTickCount();
             if (now - last >= 5000) {
                 last = now;
-                fprintf(stderr, "[VP] %lu pipeline frames, %ld voice-frames mixed, "
-                        "mixbin 0/1 peak %.4f; list heads 2D=%04X 3D=%04X MP=%04X, "
-                        "idle-in-list %ld\n", frames, g_vp_voice_frames, peak,
-                        (unsigned)d->regs[NV_PAPU_TVL2D], (unsigned)d->regs[NV_PAPU_TVL3D],
-                        (unsigned)d->regs[NV_PAPU_TVLMP], g_vp_idle_seen);
+                if (xbox_log_stats())      /* periodic: XBOX_LOG_STATS=1 */
+                    fprintf(stderr, "[VP] %lu pipeline frames, %ld voice-frames mixed, "
+                            "mixbin 0/1 peak %.4f; list heads 2D=%04X 3D=%04X MP=%04X, "
+                            "idle-in-list %ld\n", frames, g_vp_voice_frames, peak,
+                            (unsigned)d->regs[NV_PAPU_TVL2D], (unsigned)d->regs[NV_PAPU_TVL3D],
+                            (unsigned)d->regs[NV_PAPU_TVLMP], g_vp_idle_seen);
                 {
                     extern void apu_vp_voicelog_dump(MCPXAPUState *d);
                     apu_vp_voicelog_dump(d);
                 }
-                fflush(stderr);
+                /* no fflush here: this thread holds d->lock, which the game
+                 * takes for every VP method (the buffered log is written by
+                 * its own thread, or before a report reads it) */
             }
         }
     }

@@ -141,6 +141,13 @@ static void install_dir(char *out, size_t n)
     if (settings_install_root(u8, sizeof u8)) u8_to_path(u8, out, n);
 }
 
+void launcher_mark_running(void)
+{
+    char name[128];
+    if (settings_instance_name("Game", name, sizeof name) && !CreateMutexA(NULL, FALSE, name))
+        printf("warning: no running mark for the launcher (%lu)\n", (unsigned long)GetLastError());
+}
+
 BOOL launcher_install_root_w(WCHAR *out, size_t n)
 {
     char u8[SETTINGS_VALUE_MAX];
@@ -234,6 +241,7 @@ static void fork_defaults(LauncherConfig *c)
     c->save_backup = 1;                 /* XBOX_SAVE_BACKUP's default */
     c->smooth_motion = 1;               /* XBOX_FPS_INTERP's default */
     c->smooth_legs = 0;                 /* XBOX_FPS_SMOOTH_LEGS's default */
+    c->smooth_seams = 0;                /* the terrain variables' default: nothing hooked */
     c->unlock_all = 0;                  /* XBOX_UNLOCK_ALL's default: My save */
     c->fix_cullwind = c->fix_occlusion = c->fix_texpassthru = c->fix_gamma = 1;
     c->audio_queue = 8;
@@ -242,7 +250,12 @@ static void fork_defaults(LauncherConfig *c)
     c->fps_cap = -2;                    /* the monitor's refresh rate: 60 on a 60 Hz screen */
     c->sync = LAUNCHER_SYNC_DEFAULT;
     c->soft_shadows = 0;
+    c->shadow_width = 100;              /* the soft edge as it was first made */
     c->draw_dist = 0;
+    c->snow_look = 1;                   /* Soft (token "ps2"); 0 = the title's */
+    c->lightmap_smooth = 0;             /* the terrain's lightmap filtered as the title does */
+    c->render_scale = 100;              /* the 3D at the render size: nothing changes */
+    c->hd_hud = 0;                      /* the game's own race HUD */
     c->hd_textures = 0;
     c->hd_menus = 0;
     c->btn_icons = 0;                   /* Auto */
@@ -259,6 +272,22 @@ static const char *const k_sync_name[] = { "legacy", "off", "vsync", "adaptive" 
 static const char *const k_audioout_name[] = { "auto", "stereo", "5.1" };
 /* Draw distance, as DrawDistance and XBOX_DRAW_DISTANCE name them. */
 static const char *const k_drawdist_name[] = { "original", "far", "max" };
+/* Render scale of the 3D, the steps of RenderScale and XBOX_RENDER_SCALE (d3d8_rscale.h). */
+static int render_scale_ok(int v)
+{
+    static const int k[] = { 50, 67, 75, 85, 100, 125, 150, 175, 200 };
+    size_t i;
+    for (i = 0; i < sizeof k / sizeof k[0]; i++) if (k[i] == v) return v;
+    return 100;
+}
+/* Width of the soft shadows' edge, the steps of ShadowSoftness (XBOX_SOFT_SHADOW_WIDTH). */
+static int shadow_width_ok(int v)
+{
+    static const int k[] = { 40, 60, 80, 100, 125, 150 };
+    size_t i;
+    for (i = 0; i < sizeof k / sizeof k[0]; i++) if (k[i] == v) return v;
+    return 100;
+}
 /* Button style, as ButtonIcons and XBOX_BUTTON_ICONS name them (nv2a_btnicons.h). */
 static const char *const k_icons_name[] = { "auto", "modern", "playstation", "ps2" };
 #define N_ICONS 4
@@ -283,7 +312,7 @@ static void fork_from_settings(LauncherConfig *c, const Settings *s)
 
     i = settings_choice_index(s, S_SMAA);
     c->smaa = i > 0 ? i : 0;
-    c->fidelity        = settings_get_bool(s, S_LOOK_LIKE_XBOX);
+    c->fidelity        = 1;    /* the picture's fixes: always on (LookLikeXbox is read, not used) */
     c->fix_cullwind    = settings_get_bool(s, S_FIX_CULL_WINDING);
     c->fix_occlusion   = settings_get_bool(s, S_FIX_OCCLUSION);
     c->fix_texpassthru = settings_get_bool(s, S_FIX_TEX_PASSTHROUGH);
@@ -297,9 +326,14 @@ static void fork_from_settings(LauncherConfig *c, const Settings *s)
     if (c->fps_cap != -1 && c->fps_cap != -2 && (c->fps_cap < 60 || c->fps_cap > 1000)) c->fps_cap = 60;
     c->sync = !strcmp(vs, "off") ? LAUNCHER_SYNC_OFF : !strcmp(vs, "adaptive") ? LAUNCHER_SYNC_ADAPTIVE : LAUNCHER_SYNC_VSYNC;
     c->soft_shadows = settings_get_bool(s, S_SOFT_SHADOWS);
+    c->shadow_width = shadow_width_ok(atoi(settings_get(s, S_SHADOW_SOFTNESS)));
     i = settings_choice_index(s, S_DRAW_DISTANCE);
     c->draw_dist = i > 0 ? i : 0;
-    c->hd_textures = settings_get_bool(s, S_HD_TEXTURES);
+    c->snow_look = strcmp(settings_get(s, S_SNOW_LOOK), "original") != 0;
+    c->lightmap_smooth = settings_get_bool(s, S_LIGHTMAP_SMOOTH);
+    c->render_scale = render_scale_ok(atoi(settings_get(s, S_RENDER_SCALE)));
+    c->hd_hud = settings_get_bool(s, S_HD_HUD);
+    c->hd_textures = settings_choice_index(s, S_HD_TEXTURES) == LAUNCHER_HD_ON ? LAUNCHER_HD_ON : LAUNCHER_HD_OFF;
     c->hd_menus    = settings_get_bool(s, S_HD_TEXTURES_MENUS);
     c->menus = aspect_menus_parse(settings_get(s, S_MENUS), ASPECT_MENUS_DEFAULT);   /* "4:3" / "16:9" */
     u8_to_path(settings_get(s, S_HD_PACK_FOLDER), c->hd_path, sizeof c->hd_path);
@@ -310,6 +344,7 @@ static void fork_from_settings(LauncherConfig *c, const Settings *s)
     c->save_backup   = settings_get_bool(s, S_SAVE_BACKUP);
     c->smooth_motion = settings_get_bool(s, S_SMOOTH_MOTION);
     c->smooth_legs   = settings_get_bool(s, S_SMOOTH_LEGS);
+    c->smooth_seams  = settings_get_bool(s, S_SMOOTH_SEAMS);
     c->unlock_all    = settings_choice_index(s, S_SAVE_PROFILE) == 1;   /* "unlockall" */
 }
 
@@ -344,8 +379,15 @@ static void fork_to_settings(Settings *s, const LauncherConfig *c)
     settings_set(s, S_FPS_LIMIT, v);
     settings_set(s, S_VSYNC, c->sync == LAUNCHER_SYNC_OFF ? "off" : c->sync == LAUNCHER_SYNC_ADAPTIVE ? "adaptive" : "on");
     settings_set(s, S_SOFT_SHADOWS, c->soft_shadows ? "1" : "0");
+    snprintf(v, sizeof v, "%d", shadow_width_ok(c->shadow_width));
+    settings_set(s, S_SHADOW_SOFTNESS, v);
     settings_set(s, S_DRAW_DISTANCE, k_drawdist_name[(c->draw_dist >= 0 && c->draw_dist <= 2) ? c->draw_dist : 0]);
-    settings_set(s, S_HD_TEXTURES, c->hd_textures ? "1" : "0");
+    settings_set(s, S_SNOW_LOOK, c->snow_look ? "ps2" : "original");
+    settings_set(s, S_LIGHTMAP_SMOOTH, c->lightmap_smooth ? "1" : "0");
+    snprintf(v, sizeof v, "%d", render_scale_ok(c->render_scale));
+    settings_set(s, S_RENDER_SCALE, v);
+    settings_set(s, S_HD_HUD, c->hd_hud ? "1" : "0");
+    settings_set(s, S_HD_TEXTURES, c->hd_textures == LAUNCHER_HD_ON ? "on" : "off");
     settings_set(s, S_HD_TEXTURES_MENUS, c->hd_menus ? "1" : "0");
     settings_set(s, S_MENUS, aspect_menus_name(c->menus));
     path_to_settings(s, S_HD_PACK_FOLDER, c->hd_path);
@@ -353,6 +395,7 @@ static void fork_to_settings(Settings *s, const LauncherConfig *c)
     settings_set(s, S_SAVE_BACKUP, c->save_backup ? "1" : "0");
     settings_set(s, S_SMOOTH_MOTION, c->smooth_motion ? "1" : "0");
     settings_set(s, S_SMOOTH_LEGS, c->smooth_legs ? "1" : "0");
+    settings_set(s, S_SMOOTH_SEAMS, c->smooth_seams ? "1" : "0");
     settings_set(s, S_SAVE_PROFILE, c->unlock_all ? "unlockall" : "mine");
 }
 
@@ -395,7 +438,7 @@ static void fork_set(char *line, size_t n, const char *name, const char *value,
 
 void launcher_fork_apply(const LauncherConfig *cfg, const char *source)
 {
-    char line[768 + MAX_PATH] = "Fork:      ", q[16], cap[16], hd[MAX_PATH];
+    char line[2048 + MAX_PATH] = "Fork:      ", q[16], cap[16], rs[8], sw[8], hd[MAX_PATH];
     int on = cfg->fidelity != 0;
     int smaa = (cfg->smaa >= 0 && cfg->smaa <= 4) ? cfg->smaa : 0;
 
@@ -422,18 +465,40 @@ void launcher_fork_apply(const LauncherConfig *cfg, const char *source)
     fork_set(line, sizeof line, "XBOX_SYNC", k_sync_name[(cfg->sync >= 0 && cfg->sync <= 3) ? cfg->sync : 0], source);
     /* Visual enhancement, Off by default (as on the Xbox). */
     fork_set(line, sizeof line, "XBOX_SOFT_SHADOWS", cfg->soft_shadows ? "1" : "0", source);
+    /* the soft edge's width: only with soft shadows on; 100 = as first made */
+    snprintf(sw, sizeof sw, "%d", shadow_width_ok(cfg->shadow_width));
+    fork_set(line, sizeof line, "XBOX_SOFT_SHADOW_WIDTH", cfg->soft_shadows ? sw : NULL, source);
     /* the save backup copy and the frames in between above 60 */
     fork_set(line, sizeof line, "XBOX_SAVE_BACKUP", cfg->save_backup ? "1" : "0", source);
     fork_set(line, sizeof line, "XBOX_FPS_INTERP", cfg->smooth_motion ? "1" : "0", source);
     fork_set(line, sizeof line, "XBOX_FPS_SMOOTH_LEGS", cfg->smooth_legs ? "1" : "0", source);
+    /* Smoother terrain seams: the settled set (blend 2 over 0.75 m, clamp 2); off = nothing set,
+     * the terrain as the title draws it. Each variable keeps priority when already set. */
+    fork_set(line, sizeof line, "XBOX_TERRAIN_BLEND", cfg->smooth_seams ? "2" : NULL, source);
+    fork_set(line, sizeof line, "XBOX_TERRAIN_BLEND_WIDTH", cfg->smooth_seams ? "0.75" : NULL, source);
+    fork_set(line, sizeof line, "XBOX_TERRAIN_CLAMP", cfg->smooth_seams ? "2" : NULL, source);
     /* Save profile: Unlock all = the game's own cheat and a save folder of its own (main.c) */
     fork_set(line, sizeof line, "XBOX_UNLOCK_ALL", cfg->unlock_all ? "1" : "0", source);
     /* Original = no hook. */
     fork_set(line, sizeof line, "XBOX_DRAW_DISTANCE",
              k_drawdist_name[(cfg->draw_dist >= 0 && cfg->draw_dist <= 2) ? cfg->draw_dist : 0], source);
+    /* Snow look: Soft, token "ps2" (default) = the terrain's snow lit without the clamp
+     * that burns it white, no relief; original = the title's shader as is. */
+    fork_set(line, sizeof line, "XBOX_SNOW_LOOK", cfg->snow_look ? "ps2" : "original", source);
+    /* Lightmap smoothing (nv2a_psh.c): the terrain's lightmap read with a bounded
+     * Catmull-Rom (passes through its texels); off = the title's bilinear. */
+    fork_set(line, sizeof line, "XBOX_LIGHTMAP_FILTER", cfg->lightmap_smooth ? "catmull" : "off", source);
+    /* Render scale of the 3D: 100 = the render size, nothing made or hooked. */
+    snprintf(rs, sizeof rs, "%d", render_scale_ok(cfg->render_scale));
+    fork_set(line, sizeof line, "XBOX_RENDER_SCALE", rs, source);
     /* No pack folder: nothing; "0" = off (no index read). */
     fork_set(line, sizeof line, "XBOX_HD_TEXTURES",
              (cfg->hd_textures && hd[0]) ? hd : "0", source);
+    /* The pack's own race HUD never: the HUD is HdHud's (the files the game
+     * ships, at x2), with or without a pack. */
+    fork_set(line, sizeof line, "XBOX_HD_TEXTURES_HUD", "0", source);
+    /* HD HUD: "1" = the hd-hud folder beside the game (nv2a_hdtex.c). */
+    fork_set(line, sizeof line, "XBOX_HD_HUD", cfg->hd_hud ? "1" : "0", source);
     fork_set(line, sizeof line, "XBOX_HD_TEXTURES_MENUS", cfg->hd_menus ? "1" : "0", source);
     /* Never set: the PS2 layout; reported when a debug run sets it. */
     fork_set(line, sizeof line, "XBOX_CONTROL_SCHEME", NULL, NULL);
@@ -930,6 +995,12 @@ void launcher_enable_dpi_awareness(void)
 static BOOL to_path(const WCHAR *w, char *out, size_t n)
 {
     BOOL lossy = FALSE;
+    /* A UTF-8 system code page (Windows' "Use Unicode UTF-8" option): every
+     * path converts, and WideCharToMultiByte refuses WC_NO_BEST_FIT_CHARS and
+     * lpUsedDefaultChar for UTF-8 (ERROR_INVALID_PARAMETER), which refused
+     * every path. */
+    if (GetACP() == CP_UTF8)
+        return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL) != 0;
     if (!WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w, -1, out, (int)n, NULL, &lossy))
         return FALSE;
     if (lossy) {

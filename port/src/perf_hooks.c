@@ -5,13 +5,12 @@
  * Main loop 0xAA1A0: N ticks (InGameState vt+0x14 = 0xAD4A0), one render
  * (vt+0x18 = 0xAB610), then the wait on the frame event (0xB2750). Each hook
  * times the call and chains to the next hook of recomp_lookup_manual
- * (ticktrace, then fps_cap) or to the original function. Without
+ * (fps_cap) or to the original function. Without
  * XBOX_PERF=1, no hook is handed out.
  */
 #include <stdint.h>
 #include "recomp/recomp_types.h"
 #include "../../xboxrecomp/src/kernel/xbox_perf.h"
-#include "ticktrace.h"
 #include "fps_cap.h"
 
 void sub_000AD4A0(void);
@@ -23,7 +22,6 @@ typedef void (*fn_t)(void);
 static fn_t next_hook(unsigned va)
 {
     fn_t f = 0;
-    if (g_ticktrace_on) f = ticktrace_lookup(va);
     if (!f && g_fps_cap_on) f = fps_cap_lookup(va);
     return f;
 }

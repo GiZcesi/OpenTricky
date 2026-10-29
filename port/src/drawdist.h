@@ -41,6 +41,24 @@
  *   XBOX_DRAW_DISTANCE_FX=0  Far / Max leave the fog volume distance alone
  *                        (the behaviour before it followed the radius).
  *
+ * The second hard limit: the terrain patches of a frame take nodes
+ * from a pool of 2560 (two cursors, one going up with no bound, one going
+ * down; 0xFF260). Asking for more makes the cursors cross: nodes land in two
+ * lists, and two of them pointing at each other froze the game (aloha, Max).
+ * In Far / Max a patch that finds no node left is not drawn that frame, and
+ * a frame that asked for 2400 or more cuts the radius by one cell (logged).
+ * The same two guards hold the draw items of a frame (0x1013D0: a record of
+ * a pool of 1700 and a slot of an array of 1700, neither bounded), cut at
+ * 1594 (the same 1/16 margin).
+ *   XBOX_DRAW_DISTANCE_GUARD=0    tests only: no pool guard at all (as before).
+ *   XBOX_DRAW_DISTANCE_NODECAP=N  tests only: the guards take the pool as N
+ *                        nodes (256-2560), to see what they drop.
+ *   XBOX_DRAW_DISTANCE_NODESHRINK=N  tests only (Far / Max): the title's pool
+ *                        itself made N nodes long, to reproduce the overflow at will.
+ *   XBOX_DRAW_DISTANCE_ITEMSHRINK=N  tests only (Far / Max): only N draw items
+ *                        left per frame (the rest taken up front), to see an overflow.
+ *   With _LOG, the renderer's other per-frame pools are reported too.
+ *
  * The terrain patch cache (BoardMesh_DrawAttachedPatches 0xF8F10, LRU of
  * [0x1BD158] slots, one re-tessellation 0xF8BA0 per miss) is watched: a slot
  * filled twice in one call would mean a patch overwritten before it is drawn.
@@ -52,5 +70,6 @@ extern int g_drawdist_level;     /* 0 Original, 1 Far, 2 Max */
 
 void drawdist_init(void);        /* reads XBOX_DRAW_DISTANCE(_LOG) */
 void (*drawdist_lookup(unsigned int xbox_va))(void);
+void drawdist_item(void);        /* 0x1013D0 through its guard (called by hook_plag_001013D0) */
 
 #endif

@@ -51,7 +51,7 @@ is read-only). `SSX Tricky.exe` reads the same file; started on its own without 
 Run it again after pulling changes. The `.iso` argument can be left out once `game_files/default.xbe` exists.
 
 > [!CAUTION]
-> The build contains code translated from your copy of the game. Please don't share it: point people to the releases instead.
+> Please don't share your build: point people to the releases instead.
 
 ## A release build
 

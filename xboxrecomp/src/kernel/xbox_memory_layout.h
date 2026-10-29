@@ -465,6 +465,15 @@ BOOL xbox_IsMirrorAddress(const void *p);
  */
 int xbox_VerifyViewIntegrity(const char *tag);
 
+/*
+ * Called by the title's "wait for push-buffer space" loop between two reads of
+ * GET (generated code, fork pass fix_getwait.py): `pause` for the first
+ * XBOX_GETWAIT_SPINS rounds, then sleep until the pump publishes a new GET
+ * (or 1 ms). `seen` is the GET value the loop has just read; `spins` counts
+ * the rounds of this wait, from 0.
+ */
+void xbox_pfifo_get_wait(volatile uint32_t *get, uint32_t seen, uint32_t spins);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,20 +1,21 @@
 <!-- launcher
-version: 0.1.3
-title: Smooth on Linux, smoother music
-card: snowdream
-fixes: Very low frame rate on Linux and Steam Deck fixed
-fixes: Music fades in and out over one second, as in the original
-new: Steam Deck preset applied on the first start on a Deck
-new: Signed updates: the launcher checks the signature
+version: 0.1.4
+title: First stable release
+card: merqury
+fixes: Race HUD and Tricky meter fixed at any FPS and HUD size
+fixes: No more flicker on Garibaldi and Merqury City
+fixes: A few rare freezes and crashes fixed
+new: HD HUD, Render scale, Lightmap smoothing, Shadow softness
+new: Snow look: the smooth snow and board trails of the PS2
+better: Evenly paced frames, and riders always in full detail
 -->
 This file is the "What's new" block of the installed version, built into
 OpenTricky.exe (the launcher shows it without a network). The release zip
 also has the block alone as whatsnew.txt beside OpenTricky.exe, which the
-launcher reads first: a new text needs a new zip, not a new launcher
-(port/tools/fork_release.py). It is the same block that heads the release's
-notes on GitHub, hidden in an HTML comment (both are kept identical when a
-release is made).
+launcher reads first: a new text needs a new zip, not a new launcher. It is
+the same block that heads the release's notes on GitHub, hidden in an HTML
+comment (both are kept identical when a release is made).
 Format: port/launcher/app/ot_util.h.
 Replace it with the new release's block when the release notes are written.
-A "draft:" line (ignored by the launcher) marks a block that is not final
-yet: the release tools warn about it, and make_release.py refuses it.
+A "draft:" line (ignored by the launcher) marks a block that is not final:
+the release tools warn about it, and make_release.py refuses it.
