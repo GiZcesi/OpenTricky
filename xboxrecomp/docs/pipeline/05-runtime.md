@@ -369,7 +369,7 @@ The output is a single executable (`bin/burnout3.exe`) that links:
 - The input layer (static library)
 - The main scaffold (entry point, window creation, game loop)
 
-System dependencies: `d3d11.lib`, `dxgi.lib`, `d3dcompiler.lib`, `xinput.lib`, `ws2_32.lib`.
+System dependencies: `d3d11.lib`, `dxgi.lib`, `d3dcompiler.lib`, `xinput.lib`.
 
 ## Startup Sequence
 

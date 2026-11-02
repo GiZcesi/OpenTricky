@@ -89,6 +89,11 @@ static const SettingChoice k_draw_distance[] = {
 static const SettingChoice k_snow_look[] = {
     { "original", "Original" }, { "ps2", "Soft" },
 };
+/* XBOX_WEATHER (weather.h): the original game's snowfall fog, or the
+ * snowfall without it, as in the PS2 version. */
+static const SettingChoice k_weather[] = {
+    { "original", "Original" }, { "ps2", "PS2" },
+};
 static const SettingChoice k_speakers[] = {
     { "auto", "Auto" }, { "stereo", "Stereo" }, { "5.1", "5.1" },
 };
@@ -230,9 +235,12 @@ static const SettingDef k_reg[SETTINGS_COUNT] = {
     [S_SNOW_LOOK] = { "Graphics", "SnowLook", T_GRAPHICS, "WORLD", "Snow look",
         "Soft: smoother snow without grain, with visible board trails. Original: the original grainy snow.",
         CHOICE(k_snow_look, "ps2"), "XBOX_SNOW_LOOK", SETTING_PC, P("original", "ps2", "ps2") },
+    [S_WEATHER] = { "Graphics", "Weather", T_GRAPHICS, "WORLD", "Weather",
+        "PS2: no thick fog when it snows, the night sky stays in view, and Garibaldi, Elysium and Untracked always stay clear, as in the PS2 version. Original: the thick fog that comes with snowfall in the original game.",
+        CHOICE(k_weather, "ps2"), "XBOX_WEATHER", SETTING_PC, P("original", "ps2", "ps2") },
     [S_LIGHTMAP_SMOOTH] = { "Graphics", "LightmapSmoothing", T_GRAPHICS, "WORLD", "Lightmap smoothing",
         "Smooths the light baked into the snow and the slopes: no more diamond-shaped steps in it. The light itself stays the same.",
-        BOOL_("1"), "XBOX_LIGHTMAP_FILTER", SETTING_PC, P("0", "1", "1") },
+        BOOL_("1"), "XBOX_LIGHTMAP_FILTER", SETTING_PC, P("0", "1", "0") },
     /* The fixes of the port's picture (fog volumes, lens flares, board tops,
      * gamma): always on, no line, in no preset; the key of earlier versions is
      * still read (a file is not "not understood") but changes nothing. Each fix
@@ -257,8 +265,13 @@ static const SettingDef k_reg[SETTINGS_COUNT] = {
 
     /* ── CONTROLS ── */
     [S_BUTTON_STYLE] = { "Controls", "ButtonStyle", T_CONTROLS, "LOOK", "Button style",
-        "How buttons are drawn in the game's menus and help. Auto shows the Xbox modern buttons.",
+        "How buttons are drawn in the game's menus and help. Auto shows the Xbox modern buttons, or the PlayStation ones when you play with a PlayStation controller with the PlayStation controllers setting on.",
         CHOICE(k_button_style, "auto"), "XBOX_BUTTON_ICONS", 0, NOP },
+    /* Off: XBOX_PS_PADS is not set and the game reads XInput only (pad_sdl.h).
+     * Its id is the last one (settings.h): shown after the other CONTROLS rows. */
+    [S_PS_CONTROLLERS] = { "Controls", "PlayStationControllers", T_CONTROLS, "CONTROLLERS", "PlayStation controllers (experimental)",
+        "A DualShock 4 or DualSense works without any other tool, and with Button style Auto the game shows PlayStation buttons. Each controller keeps its player until it is unplugged. Xbox controllers are not affected. Leave it off with Steam Input, DS4Windows, or Steam open with its PlayStation support: they already make the controller work, and it would be read twice.",
+        BOOL_("0"), "XBOX_PS_PADS", SETTING_PC, NOP },
     [S_KEY_FIRST + 0]  = BIND_KEY("Cross",           "Cross",           "Space"),
     [S_KEY_FIRST + 1]  = BIND_KEY("Circle",          "Circle",          "Escape"),
     [S_KEY_FIRST + 2]  = BIND_KEY("Square",          "Square",          "C"),
@@ -305,7 +318,7 @@ static const SettingDef k_reg[SETTINGS_COUNT] = {
         "Your SSX Tricky (USA) Xbox disc image (.iso or .xiso). PLAY stays off until it is set.",
         SETTING_PATH, NULL, 0, 0, 0, "", NULL, 0, NOP },
     [S_SAVE_FOLDER] = { "Game", "SaveFolder", T_GAME, "DISC AND SAVES", "Save folder",
-        "Where your saves are kept. Automatic uses Documents\\My Games\\SSX Tricky\\Saves, or the Saves folder beside OpenTricky.exe with portable.txt, or an earlier version's hdd folder.",
+        "Where your saves are kept. Automatic uses Documents\\My Games\\SSX Tricky\\Saves, or, beside OpenTricky.exe, the Saves folder (with portable.txt) or an earlier version's hdd folder.",
         SETTING_PATH, NULL, 0, 0, 0, "", NULL, 0, NOP },
     [S_SAVE_PROFILE] = { "Game", "SaveProfile", T_GAME, "DISC AND SAVES", "Save profile",
         "My save: your own progress. Unlock all: everything open, in a separate save.",
@@ -341,10 +354,10 @@ static const SettingDef k_reg[SETTINGS_COUNT] = {
         CHOICE(k_theme, "random"), NULL, SETTING_LAUNCHER | SETTING_HIDDEN, NOP },
     [S_SMOOTH_LEGS] = { "Advanced", "SmoothLegs", T_ADVANCED, "SMOOTHING", "Smoother legs in turns",
         "Smooths the leg and board shake riders have when carving, a quirk of the original game. Visual only.",
-        BOOL_("1"), "XBOX_FPS_SMOOTH_LEGS", SETTING_PC, P("0", "1", "1") },
+        BOOL_("1"), "XBOX_FPS_SMOOTH_LEGS", SETTING_PC, P("0", "1", "0") },
     [S_SMOOTH_SEAMS] = { "Advanced", "SmoothTerrainSeams", T_ADVANCED, "SMOOTHING", "Smoother terrain seams",
         "Hides most of the lines between pieces of terrain, a quirk of the original game. Visual only.",
-        BOOL_("1"), "XBOX_TERRAIN_BLEND, XBOX_TERRAIN_BLEND_WIDTH, XBOX_TERRAIN_CLAMP", SETTING_PC, P("0", "1", "1") },
+        BOOL_("1"), "XBOX_TERRAIN_BLEND, XBOX_TERRAIN_BLEND_WIDTH, XBOX_TERRAIN_CLAMP", SETTING_PC, P("0", "1", "0") },
     [S_LOG_FILE] = { "Advanced", "LogFile", T_ADVANCED, "TROUBLESHOOTING", "Log file",
         "Keeps a log of the game for bug reports.",
         BOOL_("1"), NULL, 0, NOP },
@@ -637,13 +650,26 @@ static void keep_line(Settings *s, const char *section, const char *k, const cha
  * that matched none keeps its values (presets_upgrade: the settings it did
  * not have yet, from its closest preset). Once written again it has the mark,
  * and a value chosen since stays. Presets=3: HD HUD (on in Recommended and
- * Steam Deck), which files of revision 2 do not have yet. */
-#define SETTINGS_PRESETS_REV 3
+ * Steam Deck), which files of revision 2 do not have yet. Presets=4: Weather
+ * (PS2 in Recommended and Steam Deck), which the 0.1.4 did not have, and a
+ * lighter Steam Deck (Smoother terrain seams, Lightmap smoothing and Smoother
+ * legs in turns off, on in the 0.1.4's: at 60 fps the legs' return to the
+ * game's pose is a one-image jump; Recommended keeps the legs on): a file
+ * that matched a preset takes that preset's values,
+ * a file that matched none keeps its own and takes the Weather of the preset
+ * it is closest to (k_since_014). */
+#define SETTINGS_PRESETS_REV 4
 static const struct { int id, rev; const char *was[SETTINGS_PRESET_COUNT]; } k_presets_rev2[] = {
-    /* the revision that changed it; the values each preset gave before; "a|b" = either */
+    /* the revision that changed it; the values each preset gave before; "a|b" = either.
+     * A setting changed twice has a line for each change, the oldest first: a file is
+     * compared with the values of its own revision (preset_agrees). */
     { S_TEX_FILTER,      2, { "off", "off", "off" } },
     { S_LIGHTMAP_SMOOTH, 2, { "0", "0|1", "0" } },
     { S_HD_HUD,          3, { "0", "0", "0" } },
+    { S_WEATHER,         4, { "original", "original", "original" } },
+    { S_LIGHTMAP_SMOOTH, 4, { "0", "1", "1" } },
+    { S_SMOOTH_SEAMS,    4, { "0", "1", "1" } },
+    { S_SMOOTH_LEGS,     4, { "0", "1", "1" } },
 };
 
 /* The settings with a preset value that the 0.1.3 did not have: a file without
@@ -667,6 +693,21 @@ static int since_013(int id, int rev)
     return 0;
 }
 
+/* The same for the settings the 0.1.4 did not have (files up to revision 3):
+ * a file that matched no preset takes them from the preset it is closest to
+ * (Original Xbox at 144 fps: the original weather; Recommended at another
+ * resolution: the PS2's). */
+static const int k_since_014[] = { S_WEATHER };
+
+static int since_014(int id, int rev)
+{
+    int k;
+    if (rev >= 4) return 0;
+    for (k = 0; k < COUNT(k_since_014); k++)
+        if (k_since_014[k] == id) return 1;
+    return 0;
+}
+
 static int in_list(const char *list, const char *v)
 {
     size_t n = strlen(v);
@@ -686,19 +727,19 @@ static int preset_agrees(const Settings *s, const unsigned char *seen, int rev, 
     int j, changed = -1;
     if (!k_reg[i].preset[p]) return -1;
     if (!seen[i] && since_013(i, rev)) return -1;           /* not in the file's version: the preset's */
-    for (j = 0; j < COUNT(k_presets_rev2); j++)
+    for (j = 0; j < COUNT(k_presets_rev2) && changed < 0; j++)   /* the first change after the file's revision */
         if (k_presets_rev2[j].id == i && k_presets_rev2[j].rev > rev) changed = j;
     if (changed < 0) return !strcmp(s->v[i], k_reg[i].preset[p]);
     if (!seen[i]) return -1;
     return in_list(k_presets_rev2[changed].was[p], s->v[i]);
 }
 
-/* A file of the 0.1.3 that matched no preset (Custom) keeps its values; the
- * settings it did not have yet take those of the preset it is closest to:
- * the most settings with that preset's value, among those the presets set
- * (Original Xbox + 144 fps: the new ones off; Recommended at another
- * resolution: on). A tie goes to the first, Original Xbox, which leaves the
- * picture as it was. */
+/* A file of the 0.1.3 or the 0.1.4 that matched no preset (Custom) keeps its
+ * values; the settings it did not have yet take those of the preset it is
+ * closest to: the most settings with that preset's value, among those the
+ * presets set (Original Xbox + 144 fps: the new ones off; Recommended at
+ * another resolution: on). A tie goes to the first, Original Xbox, which
+ * leaves the picture as it was. */
 static void presets_upgrade(Settings *s, const unsigned char *seen, int rev)
 {
     int p, i, j, best = -1, best_n = -1;
@@ -720,9 +761,9 @@ static void presets_upgrade(Settings *s, const unsigned char *seen, int rev)
         }
         if (n > best_n) { best_n = n; best = p; }
     }
-    if (best >= 0 && rev < 2)
+    if (best >= 0)
         for (i = 0; i < SETTINGS_COUNT; i++)
-            if (k_reg[i].preset[best] && !seen[i] && since_013(i, rev))
+            if (k_reg[i].preset[best] && !seen[i] && (since_013(i, rev) || since_014(i, rev)))
                 settings_set(s, i, k_reg[i].preset[best]);
 }
 

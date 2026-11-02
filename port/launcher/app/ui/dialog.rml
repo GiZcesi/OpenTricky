@@ -110,20 +110,27 @@
         </div>
 
         <!-- Find my disc image (main.cpp, find_discs): the SSX Tricky (USA) disc
-             images found on this computer, one button each, for a controller too. -->
-        <div class="box wide sec" data-if="modal == 'discs'">
+             images found on this computer, one button each, for a controller too.
+             Their list scrolls when it is long (launcher.rcss, .box.list). The arrows
+             and the stick never leave a scrolled list by themselves, nor enter it from
+             outside: its last line leads down to Browse..., and Browse... and Cancel
+             lead up to it. -->
+        <div class="box wide sec list" data-if="modal == 'discs'">
             <div class="kick">DISC IMAGE</div>
             <div class="dh">FIND MY DISC IMAGE</div>
             <p data-if="disc_found.size > 0">Found on this computer and checked: SSX Tricky (USA) for Xbox. Choose one.</p>
             <p data-if="disc_found.size == 0">No SSX Tricky (USA) disc image beside OpenTricky, in Downloads, on the Desktop or in Documents.</p>
             <div class="dlist">
-                <div class="mbtn dimg" data-for="d : disc_found" data-attr-id="'disc' + it_index" data-event-click="disc_pick(it_index)">
+                <div class="mbtn dimg" data-for="d : disc_found" data-attr-id="'disc' + it_index" data-event-click="disc_pick(it_index)"
+                     data-style-nav-down="it_index + 1 == disc_found.size ? '#disc-browse' : 'auto'">
                     <span class="dn">{{d.name}}</span><span class="chip" data-if="d.cur">IN USE</span><span class="dd">{{d.dir}}</span>
                 </div>
             </div>
             <div class="btns">
-                <span class="mbtn" id="disc-browse" data-event-click="dlg('disc_browse')"><span>Browse&#x2026;</span></span>
-                <span class="mbtn ghost" id="disc-cancel" data-event-click="dlg('close')"><span>Cancel</span></span>
+                <span class="mbtn" id="disc-browse" data-event-click="dlg('disc_browse')"
+                      data-style-nav-up="disc_found.size > 0 ? '#disc' + (disc_found.size - 1) : 'none'"><span>Browse&#x2026;</span></span>
+                <span class="mbtn ghost" id="disc-cancel" data-event-click="dlg('close')"
+                      data-style-nav-up="disc_found.size > 0 ? '#disc' + (disc_found.size - 1) : 'none'"><span>Cancel</span></span>
             </div>
             <p class="small">You can also drop the file on this window.</p>
         </div>

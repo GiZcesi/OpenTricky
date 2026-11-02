@@ -765,6 +765,8 @@ static struct { uint32_t gen, off[ATLN], fmt[ATLN]; } s_atl;
 static struct {
     unsigned long long draws, terrain, moved, subst, race, stale, corner, overlays, blends, clamped;
     unsigned long long hits, misses, changed, edges;    /* the patch cache */
+    unsigned long long ovl_hist[5];                     /* blended patches by their overlay draws (1..4) */
+    unsigned long long clm_hits, clm_misses;            /* the clamp memo (XBOX_TERRAIN_SEAMS_MEMO): answered, worked out */
     ULONGLONG t0;
 } ps;
 
@@ -909,9 +911,11 @@ static void pump_report(void)
     if (t - ps.t0 < 2000) return;
     ps.t0 = t;
     fprintf(stderr, "[SEAMS] pump: draws %llu terrain %llu moved %llu substituted %llu overlays %llu blends %llu | "
-            "clamped %llu | refused: race %llu stale %llu corner %llu | cache: hits %llu misses %llu (changed %llu) edges built %llu\n",
+            "clamped %llu | refused: race %llu stale %llu corner %llu | cache: hits %llu misses %llu (changed %llu) edges built %llu"
+            " | blended patches by overlay draws 1:%llu 2:%llu 3:%llu 4:%llu | clamp memo: answered %llu worked out %llu\n",
             ps.draws, ps.terrain, ps.moved, ps.subst, ps.overlays, ps.blends, ps.clamped, ps.race, ps.stale, ps.corner,
-            ps.hits, ps.misses, ps.changed, ps.edges);
+            ps.hits, ps.misses, ps.changed, ps.edges, ps.ovl_hist[1], ps.ovl_hist[2], ps.ovl_hist[3], ps.ovl_hist[4],
+            ps.clm_hits, ps.clm_misses);
     fflush(stderr);
 }
 
@@ -966,6 +970,49 @@ static int clamp_axes(level_t *L, uint32_t p, corners_t c, double shift[2])
         m |= 1 << q;
     }
     return m;
+}
+
+/* clamp_axes of patch p of level gen, from its record rec (the one the
+ * caller read before: the noted address for the drawn patch, REC() for a
+ * neighbour) as it is now, shift[] from { 0, 0 }. XBOX_TERRAIN_SEAMS_MEMO
+ * (default 1; =0 worked out at every draw, as before): remembered with the
+ * bits of the four corners it was worked out from, and the mode (s_clamp).
+ * Everything else it reads -- the level's partner and kind tables -- is
+ * fixed for the level's number, so the same level, patch, mode and bits give
+ * the same axes and shifts; anything else works them out again. Pump only,
+ * in a table of its own (not in the level's memory, which the game thread
+ * rebuilds). Off with the pump optimizations on the XBOX_FIX_PUMP_ALT
+ * frames. XBOX_TERRAIN_SEAMS_LOG=1 counts its answers in "[SEAMS] pump". */
+#define CLM_N 8192u
+typedef struct { uint32_t gen, pidx, c[8]; double shift[2]; int m, mode; } clamp_memo;   /* gen 0: empty */
+static clamp_memo s_clm[CLM_N];
+static int s_clm_on = 1;
+int d3d8_pump_alt_off(void);
+
+static int clamp_of(level_t *L, uint32_t gen, uint32_t p, const uint8_t *rec, int memo, double shift[2])
+{
+    corners_t c;
+    int k, m;
+    shift[0] = shift[1] = 0.0;
+    if (memo) {
+        uint32_t b[8];
+        float f;
+        clamp_memo *M = &s_clm[p & (CLM_N - 1u)];
+        for (k = 0; k < 4; k++) memcpy(&b[2 * k], rec + 0x10 + 0x10 * k, 8);   /* u, v of each corner, as rec_corners */
+        if (M->gen == gen && M->pidx == p && M->mode == s_clamp && !memcmp(M->c, b, sizeof b)) {
+            if (s_log) ps.clm_hits++;
+            shift[0] = M->shift[0]; shift[1] = M->shift[1];
+            return M->m;
+        }
+        if (s_log) ps.clm_misses++;
+        for (k = 0; k < 8; k++) { memcpy(&f, &b[k], 4); c[k >> 1][k & 1] = f; }
+        m = clamp_axes(L, p, c, shift);
+        M->gen = gen; M->pidx = p; M->mode = s_clamp; memcpy(M->c, b, sizeof b);
+        M->shift[0] = shift[0]; M->shift[1] = shift[1]; M->m = m;
+        return m;
+    }
+    rec_corners(rec, c);
+    return clamp_axes(L, p, c, shift);
 }
 
 /* Edge ed of the patch in E (built, its vertices final): the copy of its
@@ -1066,7 +1113,7 @@ static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
     slot_t e;
     level_t *L;
     sc_entry *ent;
-    int moved, dbg = s_debug, m, blend = 0, clampm = 0;
+    int moved, dbg = s_debug, m, blend = 0, clampm = 0, memo;
     double shift[2] = { 0.0, 0.0 };
 
     if (s_log) { ps.draws++; pump_report(); }
@@ -1126,11 +1173,8 @@ static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
             }
         }
     }
-    {
-        corners_t c;
-        rec_corners((const uint8_t *)XBOX_PTR(e.rec), c);
-        clampm = s_clamp ? clamp_axes(L, e.pidx, c, shift) : 0;
-    }
+    memo = s_clm_on && !d3d8_pump_alt_off();
+    clampm = s_clamp ? clamp_of(L, e.lvl, e.pidx, (const uint8_t *)XBOX_PTR(e.rec), memo, shift) : 0;
     if (!moved && !dbg && !blend && !clampm) return 0;
 
     {
@@ -1205,16 +1249,15 @@ static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
             int full = L->full[e.pidx * 4u + (uint32_t)ed];
             int cmask = 0;                                         /* XBOX_TERRAIN_CLAMP: the neighbour's clamped axes */
             double qshift[2] = { 0.0, 0.0 };
-            if (s_clamp && pq >= 0) {
-                corners_t cq;
-                rec_corners(REC(L, (uint32_t)pq >> 2), cq);
-                cmask = clamp_axes(L, (uint32_t)pq >> 2, cq, qshift);
-            }
+            /* the neighbour's clamp is only read by an edge that blends: with
+             * the memo, worked out once the edge is kept (the same values) */
+            if (!memo && s_clamp && pq >= 0) cmask = clamp_of(L, e.lvl, (uint32_t)pq >> 2, REC(L, (uint32_t)pq >> 2), 0, qshift);
             if (pq >= 0 && (full || s_match != 0) &&
                 !tex_similar(rds(ent->rec + 0x1C0), rds(REC(L, (uint32_t)pq >> 2) + 0x1C0))) continue;
             if (!(L->cont[e.pidx * 4u + (uint32_t)ed] || full) || pq < 0 ||
                 !tex_find(0, rds(REC(L, (uint32_t)pq >> 2) + 0x1C0), &o0, &f0) ||
                 !tex_find(1, rds(REC(L, (uint32_t)pq >> 2) + 0x1C2), &o2, &f2)) continue;
+            if (memo && s_clamp) cmask = clamp_of(L, e.lvl, (uint32_t)pq >> 2, REC(L, (uint32_t)pq >> 2), 1, qshift);
             if (!(ent->ebuilt & (1u << ed)) || ent->ecmask[ed] != cmask ||
                 ent->eqshift[ed][0] != qshift[0] || ent->eqshift[ed][1] != qshift[1])
                 sc_edge(ent, L, e.pidx, ed, full, cmask, qshift, clampm, shift);
@@ -1262,6 +1305,7 @@ static int subst(uint32_t mode, const uint32_t *idx, uint32_t count,
             ps.overlays++;
             i = j;
         }
+        if (s_log && out->n_overlay) ps.ovl_hist[out->n_overlay > 4 ? 4 : out->n_overlay]++;
     }
     if (!dbg) return 1;
 
@@ -1389,6 +1433,8 @@ void terrain_seams_init(void)
     if (e && e[0] >= '1' && e[0] <= '3' && !e[1]) s_blend_rows = e[0] - '0';
     e = getenv("XBOX_TERRAIN_CLAMP");
     if (e && e[0] >= '0' && e[0] <= '2' && !e[1]) s_clamp = e[0] - '0';
+    e = getenv("XBOX_TERRAIN_SEAMS_MEMO");
+    s_clm_on = !(e && e[0] == '0');
     if (off) { s_b0 = s_b1 = 0; s_blend = 0; s_clamp = 0; }
     g_terrain_seams = s_b0 || s_b1 || s_debug || s_blend || s_clamp;
     if (!g_terrain_seams) { fprintf(stderr, "[SEAMS] terrain seams: off\n"); fflush(stderr); return; }
@@ -1401,7 +1447,8 @@ void terrain_seams_init(void)
     else if (s_blend) fprintf(stderr, ", texture blend over %d row(s)%s", s_blend_rows,
                               s_blend == 2 ? ", rotated / other placements too" : "");
     if (s_blend == 2 && !s_blend_tangent) fprintf(stderr, ", own tangents");
-    if (s_clamp) fprintf(stderr, ", single-repeat axes clamped (%s)", s_clamp == 1 ? "all" : "where the neighbour does not continue");
+    if (s_clamp) fprintf(stderr, ", single-repeat axes clamped (%s)%s", s_clamp == 1 ? "all" : "where the neighbour does not continue",
+                         s_clm_on ? "" : ", worked out at every draw");
     if (s_blend) fprintf(stderr, "%s", s_match == 0 ? ", loose texture match" : s_match == 2 ? ", same texture only" : ", strict texture match");
     fprintf(stderr, "\n");
     fflush(stderr);

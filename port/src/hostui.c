@@ -2,7 +2,9 @@
  * hostui.c -- the game window's own keys.
  *
  *   F12        screenshot of the image shown, into Screenshots\ in the install
- *              root (beside OpenTricky.exe), with a .txt of the same name
+ *              root (beside OpenTricky.exe; when no file can be made there,
+ *              Documents\My Games\SSX Tricky\Screenshots), with a .txt of the
+ *              same name
  *   Shift+F12  burst: the next N images shown, one per present (XBOX_SHOT_BURST,
  *              60 by default), into a folder of their own, with context.txt
  *   F11        fullscreen on/off (Alt+Enter too, handled by the runtime)
@@ -19,11 +21,12 @@
  * the scaling and the palette), written in the
  * background so the game does not stutter. The .txt says when and where
  * (track, race tick and state, version, the settings in effect: the XBOX_*
- * variables and settings.ini, without the player's paths) so the moment can
- * be found again; the runtime
+ * variables and the settings.ini this start took, if any, without the
+ * player's paths) so the moment can be found again; the runtime
  * adds the image's own lines (sizes, present times, one line per image).
  */
 #include <windows.h>
+#include <shlobj.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +36,7 @@
 #include "miniz.h"
 #include "recomp/recomp_types.h"
 #include "launcher.h"
+#include "settings.h"
 #include "controls.h"
 #include "version.h"
 #include "hostui.h"
@@ -154,6 +158,34 @@ static void put_env(FILE *f, const WCHAR *w)
     if (crashreport_private_text(u8, (size_t)(k - 1), 0, out, sizeof out)) fprintf(f, "%s\n", out);
 }
 
+/* A start from the player's settings.ini (hostui_install's persist_changes,
+ * main.c's use_config). */
+static BOOL s_ini_run;
+/* A test start's settings file: XBOX_FORK_INI as main.c found it
+ * (hostui_test_ini), in the ANSI code page as main.c opens it; "" = none. */
+static char s_test_ini[MAX_PATH];
+
+/* The settings file whose options this run took, wide, for the .txt (L""
+ * when it has no name): in a start from the player's settings, settings.ini
+ * as read at start (settings_locate, in UTF-8: any folder name); in a test
+ * start, the file main.c took from XBOX_FORK_INI. Returns how the .txt
+ * names it, "" or " (XBOX_FORK_INI)"; NULL for a test start that took none
+ * (main.c then reads no settings.ini at all). */
+static const char *settings_file(WCHAR *out, size_t n)
+{
+    char u8[SETTINGS_VALUE_MAX];
+    out[0] = 0;
+    if (!s_ini_run) {
+        if (!s_test_ini[0]) return NULL;
+        if (!MultiByteToWideChar(CP_ACP, 0, s_test_ini, -1, out, (int)n)) out[0] = 0;
+        return " (XBOX_FORK_INI)";
+    }
+    if (settings_locate(NULL, NULL, 0, u8, sizeof u8) != SETTINGS_AT_NONE &&
+        !MultiByteToWideChar(CP_UTF8, 0, u8, -1, out, (int)n))
+        out[0] = 0;
+    return "";
+}
+
 /* The game's context, first in the .txt (the runtime appends the image's).
  * Nothing that names the player: no path of the exe, the disc image or the
  * folders, no user name (the masking of the crash reports). */
@@ -162,8 +194,6 @@ static void write_context(const WCHAR *txt, unsigned n, const SYSTEMTIME *t)
     FILE *f = _wfopen(txt, L"wb");
     WCHAR exe[MAX_PATH];
     WIN32_FILE_ATTRIBUTE_DATA fa;
-    char ini[MAX_PATH];
-    const char *fork_ini = getenv("XBOX_FORK_INI");
     uint32_t race = race_obj();
     if (!f) return;
 
@@ -211,20 +241,23 @@ static void write_context(const WCHAR *txt, unsigned n, const SYSTEMTIME *t)
         for (i = 0; i < k; i++) put_env(f, list[i]);
         if (env) FreeEnvironmentStringsW(env);
     }
-    if (fork_ini && fork_ini[0]) snprintf(ini, sizeof ini, "%s", fork_ini);
-    else launcher_config_path(ini, sizeof ini);
     {   /* settings.ini, its paths hidden (crashreport_private_text) */
         static char text[24 * 1024], clean[32 * 1024];
         WCHAR wini[MAX_PATH];
         FILE *s = NULL;
         size_t len = 0;
-        if (MultiByteToWideChar(CP_UTF8, 0, ini, -1, wini, MAX_PATH) > 0) s = _wfopen(wini, L"rb");
-        if (s) {
-            len = fread(text, 1, sizeof text - 1, s);
-            fclose(s);
+        const char *as = settings_file(wini, MAX_PATH);
+        if (!as) {
+            fprintf(f, "\n[settings.ini: not used by this start (a disc image given, --direct, or output redirected), "
+                       "the code's defaults]\n");
+        } else {
+            if (wini[0]) s = _wfopen(wini, L"rb");
+            if (s) {
+                len = fread(text, 1, sizeof text - 1, s);
+                fclose(s);
+            }
+            fprintf(f, "\n[settings.ini%s%s]\n", as, s ? "" : ": not found, the code's defaults");
         }
-        fprintf(f, "\n[settings.ini%s%s]\n", fork_ini && fork_ini[0] ? " (XBOX_FORK_INI)" : "",
-                s ? "" : ": not found, the code's defaults");
         if (len) {
             size_t i, o = 0, c = crashreport_private_text(text, len, 0, clean, sizeof clean);
             for (i = 0; i < c; i++)                 /* written in binary mode: one '\n' per line */
@@ -234,6 +267,43 @@ static void write_context(const WCHAR *txt, unsigned n, const SYSTEMTIME *t)
         }
     }
     fclose(f);
+}
+
+/* A file can be made in `dir` (made first, with its parents, when missing):
+ * a probe, created then removed at once. An install in Program Files, or a
+ * folder of another user's, may have the folder but refuse files. */
+static BOOL dir_writable(const WCHAR *dir)
+{
+    WCHAR probe[MAX_PATH];
+    HANDLE h;
+    int k;
+    SHCreateDirectoryExW(NULL, dir, NULL);
+    k = _snwprintf(probe, MAX_PATH - 1, L"%ls\\write-test-%lu.tmp", dir, (unsigned long)GetCurrentProcessId());
+    probe[MAX_PATH - 1] = 0;
+    if (k < 0) return FALSE;
+    h = CreateFileW(probe, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    CloseHandle(h);
+    return TRUE;
+}
+
+/* Where the screenshots go: Screenshots\ in the install root (beside
+ * OpenTricky.exe), or, when no file can be made there,
+ * Documents\My Games\SSX Tricky\Screenshots (where settings.ini goes too in
+ * that case). FALSE: neither can be written. */
+static BOOL shot_dir(WCHAR *out, size_t n)
+{
+    PWSTR docs = NULL;
+    int k;
+    if (launcher_install_root_w(out, n) && wcslen(out) + 13 < n) {
+        wcscat(out, L"\\Screenshots");
+        if (dir_writable(out)) return TRUE;
+    }
+    if (FAILED(SHGetKnownFolderPath(&FOLDERID_Documents, 0, NULL, &docs)) || !docs) return FALSE;
+    k = _snwprintf(out, n - 1, L"%ls\\My Games\\SSX Tricky\\Screenshots", docs);
+    out[n - 1] = 0;
+    CoTaskMemFree(docs);
+    return k > 0 && dir_writable(out);
 }
 
 /* F12 (n = 1) and Shift+F12 (n = the burst count). 0 = nothing asked. */
@@ -247,9 +317,10 @@ static int take_screenshot(unsigned n)
         d3d8_HostToast(L"Screenshot: the last burst is still being saved");
         return 0;
     }
-    launcher_install_root_w(dir, MAX_PATH);
-    wcsncat(dir, L"\\Screenshots", MAX_PATH - wcslen(dir) - 1);
-    CreateDirectoryW(dir, NULL);
+    if (!shot_dir(dir, MAX_PATH)) {
+        d3d8_HostToast(L"Screenshot failed");
+        return 0;
+    }
     GetLocalTime(&t);
     swprintf(stamp, 64, L"SSX Tricky %04u-%02u-%02u %02u-%02u-%02u",
              t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
@@ -306,8 +377,13 @@ void hostui_install(LauncherConfig *cfg, BOOL persist_changes)
 {
     static const D3D8HostUiHooks hooks = { NULL, NULL, NULL, on_key, on_menu_loop };
     (void)cfg;
-    (void)persist_changes;
+    s_ini_run = persist_changes;
     d3d8_SetHostUiHooks(&hooks);
     d3d8_SetShotInfoHook(shot_info);
     d3d8_SetPngEncoder(shot_png);
+}
+
+void hostui_test_ini(const char *ini)
+{
+    snprintf(s_test_ini, sizeof s_test_ini, "%s", ini ? ini : "");
 }

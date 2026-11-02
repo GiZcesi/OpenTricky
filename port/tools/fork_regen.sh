@@ -151,6 +151,8 @@ PASSES=(
   "fork_crowdemit|$PY \"$FORK/fix_crowdemit.py\" \"$GEN\""
   "fork_fadeparity|$PY \"$FORK/fix_fadeparity.py\" \"$GEN\""
   "fork_hudgauge|$PY \"$FORK/fix_hudgauge.py\" \"$GEN\""
+  "fork_occlwait|$PY \"$FORK/fix_occlwait.py\" \"$GEN\""
+  "fork_ringget|$PY \"$FORK/fix_ringget.py\" \"$GEN\""
 )
 i=0
 for p in "${PASSES[@]}"; do

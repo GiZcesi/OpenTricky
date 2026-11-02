@@ -284,6 +284,8 @@ struct App {
      * the Button style, or with Auto the type of the controller in use. */
     int hint_style = 0;
     bool pad_is_ps = false;           /* the last controller pressed is a PlayStation one */
+    bool pad_pressed = false;         /* a controller button was pressed in the launcher */
+    bool pad_game_ps = false;         /* ... last on a PlayStation controller the game reads (pad_is_ps_game) */
     Rml::String help_title, help_text, help_extra, saved_note;
     Rml::String prev_src;             /* the help panel's picture of the value ("ot:prev/..."; empty: none) */
     Rml::String prev_old;             /* the picture it replaces, under it while it fades in (empty: none) */
@@ -353,6 +355,7 @@ struct App {
     bool mouse_click = false;      /* the click being handled comes from the mouse (not Enter / A / a test's click:) */
     float stage_w = 1280;
     bool rescaled = false;         /* the window's scale changed: texts are sized again (fit_window) */
+    bool focus_in_view = false;    /* laid out at a new scale: the focus shown is brought back into view */
 
     /* game process */
     SDL_Process *game = nullptr;
@@ -580,6 +583,8 @@ std::string row_note(int id)
         return "Your screen runs at " + std::to_string(whole) + " Hz: with VSync the game shows at most " +
                std::to_string(whole) + ".";
     }
+    case S_PS_CONTROLLERS:
+        return "DualShock 4 and DualSense only.";
     case S_SHOW_FPS:
         if (settings_get_bool(g.set, S_SHOW_FPS) && fullscreen_mode())
             return "Not seen in fullscreen: the title bar shows only in a window.";
@@ -861,6 +866,9 @@ int theme_next_track()
     return t;
 }
 
+/* The disc image chosen: it loads the documents again (load_documents), so
+ * never from inside one of their events (a choice made there waits for the
+ * main loop: dialog_chosen). */
 void set_disc(const std::string &path)
 {
     g.disc_auto = false;
@@ -879,12 +887,25 @@ void set_disc(const std::string &path)
     load_documents();
 }
 
-/* The file / folder dialogs answer on SDL's dialog thread (SDL_dialog.h:
- * "the callback may be called from a different thread"): the choice waits
- * here and the main loop applies it (dialog_poll), never the dialog thread. */
+/* A path chosen in a dialog waits here and the main loop applies it
+ * (dialog_poll), before the next input:
+ * - the file / folder dialogs answer on SDL's dialog thread (SDL_dialog.h:
+ *   "the callback may be called from a different thread"), never the main
+ *   loop's own;
+ * - a disc image of Find my disc image is chosen in a click on its line, an
+ *   event of the dialog's document: set_disc loads the documents again
+ *   (load_documents), and RmlUi would free the line's click handler while it
+ *   runs. */
 std::mutex g_dialog_mutex;
 int g_dialog_id = -1;
 std::string g_dialog_path;
+
+void dialog_chosen(int id, const std::string &path)
+{
+    std::lock_guard<std::mutex> lock(g_dialog_mutex);
+    g_dialog_id = id;
+    g_dialog_path = path;
+}
 
 void dialog_poll()
 {
@@ -911,11 +932,7 @@ void choose_path(int id)
     s_id = id;
     auto done = [](void *, const char *const *list, int) {
         if (!list || !list[0]) return;
-        {
-            std::lock_guard<std::mutex> lock(g_dialog_mutex);
-            g_dialog_id = s_id;
-            g_dialog_path = list[0];
-        }
+        dialog_chosen(s_id, list[0]);
         SDL_Event ev{};                       /* wakes the main loop (SDL_PushEvent is thread-safe) */
         ev.type = SDL_EVENT_USER;
         SDL_PushEvent(&ev);
@@ -1405,7 +1422,7 @@ void dirty_help()
  * without it there is no picture and no empty place. A value without its
  * own picture shows the nearest value's, and none at all shows nothing. */
 const int k_preview_ids[] = { S_RENDER_SCALE, S_TEX_FILTER, S_SMAA, S_SOFT_SHADOWS, S_SHADOW_SOFTNESS, S_DRAW_DISTANCE,
-                              S_LIGHTMAP_SMOOTH, S_SNOW_LOOK, S_HD_HUD };
+                              S_LIGHTMAP_SMOOTH, S_SNOW_LOOK, S_WEATHER, S_HD_HUD };
 
 bool previews_allowed() { return g.have_assets && g.disc.status == OT_DISC_OK; }
 
@@ -2043,6 +2060,12 @@ static void layout_tokens(float dp, std::vector<std::pair<std::string, std::stri
     put("--h-tog", tog); put("--m-tog", (row - tog) / 2);
     put("--h-mod", mod); put("--m-mod", (row - mod) / 2);
     put("--h-cell", cell); put("--lh-cell", line_in(cell - 2 * b, b7)); put("--m-cell", (row - cell) / 2);
+    /* The scroll bar of a list (4 dp) and its gutter (16 dp, --p16): drawn as wide, and as far from the
+     * lines, in each list, wherever its edges fall; the gutter given back where a list reaches into its
+     * panel's padding (Find my disc image). */
+    const int sb = std::max(1, px(4));
+    put("--w-sb", sb); put("--w-sb-back", -sb);
+    put("--p16-back", -px(16));
 
     /* The help: a picture's tag (20 dp). */
     const int tag = px(20);
@@ -2274,6 +2297,31 @@ void set_crash(const OtCrashReport &r, int code)
     for (const char *v : { "crash_head", "crash_when", "crash_version" }) g.model.DirtyVariable(v);
 }
 
+/* A PlayStation controller the game reads with its PlayStation controllers
+ * setting (port/src/pad_sdl.c): a DualShock 4 or a DualSense, not a
+ * DualShock 3 (the launcher's own button pictures count it too). */
+static bool pad_is_ps_game(SDL_GamepadType t)
+{
+    return t == SDL_GAMEPAD_TYPE_PS4 || t == SDL_GAMEPAD_TYPE_PS5;
+}
+
+/* The game will most likely be played with a PlayStation controller: the
+ * last controller pressed here is one the game reads, or, when none was
+ * pressed, the controllers plugged in are all such ones. */
+bool pad_in_use_is_ps()
+{
+    if (g.pad_pressed) return g.pad_game_ps;
+    int n = 0;
+    bool ps = false, other = false;
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    for (int i = 0; ids && i < n; i++) {
+        if (pad_is_ps_game(SDL_GetGamepadTypeForID(ids[i]))) ps = true;
+        else other = true;
+    }
+    SDL_free(ids);
+    return ps && !other;
+}
+
 bool play()
 {
     if (!g.have_disc || g.game) return false;
@@ -2325,6 +2373,14 @@ bool play()
     }
     SDL_Environment *env = SDL_CreateEnvironment(true);
     SDL_SetEnvironmentVariable(env, "OPENTRICKY_LAUNCHER", "1", true);   /* the crash screen is the launcher's */
+    /* Button style Auto, PlayStation controllers on (experimental): the
+     * game's buttons drawn as the controller in use. The game picks its
+     * style once, at start; a variable already set (tests) is kept. */
+    if (settings_choice_index(g.set, S_BUTTON_STYLE) == 0 && settings_get_bool(g.set, S_PS_CONTROLLERS) &&
+        pad_in_use_is_ps()) {
+        SDL_SetEnvironmentVariable(env, "XBOX_BUTTON_ICONS", "playstation", false);
+        otlog("play: button style Auto, PlayStation controller in use");
+    }
     if (g_pages.play_env) g_pages.play_env(env);
     const char *args[] = { exe.c_str(), "--play", nullptr };
     SDL_PropertiesID p = SDL_CreateProperties();
@@ -2679,6 +2735,41 @@ int focused_row()
     return -1;
 }
 
+/* Entirely in view in each list that scrolls it, as RmlUi's ScrollIntoView reads the lists (the
+ * settings, Find my disc image: they scroll up and down); a line taller than its list counts as in
+ * view, since it cannot be more. */
+bool in_view(Rml::Element *e)
+{
+    const float top = e->GetAbsoluteOffset(Rml::BoxArea::Border).y, h = e->GetBox().GetSize(Rml::BoxArea::Border).y;
+    for (Rml::Element *p = e->GetParentNode(); p; p = p->GetParentNode()) {
+        const Rml::Style::Overflow o = p->GetComputedValues().overflow_y();
+        if (o == Rml::Style::Overflow::Visible || o == Rml::Style::Overflow::Hidden || p->GetScrollHeight() <= p->GetClientHeight())
+            continue;
+        const float vt = p->GetAbsoluteOffset(Rml::BoxArea::Padding).y, vh = p->GetClientHeight();
+        if (h <= vh && (top < vt - 0.5f || top + h > vt + vh + 0.5f)) return false;
+    }
+    return true;
+}
+
+/* A press on a focus out of its list's view (the wheel or the scroll bar moved the list) only brings
+ * it back, shown: never an action on a line the player cannot see. True: the press stops here. */
+bool focus_back_in_view(Rml::Element *f)
+{
+    if (!f || f == f->GetOwnerDocument() || in_view(f)) return false;
+    f->SetPseudoClass("focus-visible", true);
+    f->ScrollIntoView(Rml::ScrollAlignment::Nearest);
+    return true;
+}
+
+/* A key or a controller's button stops what is left of the wheel's smooth scroll: RmlUi runs one smooth
+ * scroll at a time and moves its list a little each frame until it ends, whatever else scrolls the list (a
+ * focus brought into view would leave it again). A smooth scroll of nothing replaces it. */
+void stop_wheel()
+{
+    Rml::Element *e = g.ctx ? g.ctx->GetFocusElement() : nullptr;    /* any element of a document will do */
+    if (e && e->GetContext()) e->ScrollTo(Rml::Vector2f(e->GetScrollLeft(), e->GetScrollTop()), Rml::ScrollBehavior::Smooth);
+}
+
 /* One navigation input, from the keyboard, a controller or a test step. */
 enum Nav { N_UP, N_DOWN, N_LEFT, N_RIGHT, N_OK, N_BACK, N_PREV, N_NEXT };
 
@@ -2693,7 +2784,10 @@ void nav(Nav n)
         if (n == N_BACK) { show_page("home"); return; }
         if (n == N_PREV || n == N_NEXT) { set_tab(g.tab + (n == N_NEXT ? 1 : -1)); return; }
         int id = focused_row();
-        if (id >= 0 && id < SETTINGS_COUNT && (n == N_LEFT || n == N_RIGHT)) { step_value(id, n == N_RIGHT ? 1 : -1); return; }
+        if (id >= 0 && id < SETTINGS_COUNT && (n == N_LEFT || n == N_RIGHT)) {
+            if (!focus_back_in_view(focused())) step_value(id, n == N_RIGHT ? 1 : -1);
+            return;
+        }
     } else if (g_pages.owns && g_pages.owns(g.page)) {
         if (g_pages.nav && g_pages.nav(n)) return;
     } else {
@@ -2703,11 +2797,14 @@ void nav(Nav n)
     if (n < N_OK) {
         Rml::Element *f = g.ctx->GetFocusElement();
         if (f && f != f->GetOwnerDocument() && !f->IsPseudoClassSet("focus-visible")) {
-            f->SetPseudoClass("focus-visible", true);     /* first press: the focus shows where it is */
+            /* first press: the focus shows where it is, in view (the wheel or the scroll bar may have
+             * scrolled it out of its list) */
+            f->SetPseudoClass("focus-visible", true);
+            f->ScrollIntoView(Rml::ScrollAlignment::Nearest);
             return;
         }
     }
-    if (n <= N_OK) {
+    if (n <= N_OK && !focus_back_in_view(g.ctx->GetFocusElement())) {
         g.ctx->ProcessKeyDown(keys[n], 0);
         g.ctx->ProcessKeyUp(keys[n], 0);
     }
@@ -2722,6 +2819,7 @@ void set_pad_active(bool on)
 
 bool pad_button(int b)
 {
+    stop_wheel();
     set_pad_active(true);
     if (g.modal == "capture" && g.cap_col == 1) {
         if (const char *t = pad_token(b)) capture_assign(t);
@@ -2749,6 +2847,7 @@ bool pad_button(int b)
 /* Keys the launcher handles itself; others go to RmlUi. */
 bool key_down(SDL_Keycode k, SDL_Scancode sc)
 {
+    stop_wheel();
     set_pad_active(false);
     g.kbd_nav = true;
     if (g.modal == "capture") {
@@ -3010,6 +3109,11 @@ void script_step()
         }
         otlog("%s %d,%d -> %s -> modal=%s", a.c_str(), x, y, h ? h->GetAddress(false, false).c_str() : "-",
               g.modal.empty() ? "-" : g.modal.c_str());
+    } else if (a == "wheel") {
+        /* The mouse wheel, n notches down (up below 0), where the mouse is, as a player's would be: a
+         * smooth scroll that the next steps may meet before it ends. */
+        g.ctx->ProcessMouseWheel(Rml::Vector2f(0.0f, (float)atoi(b.c_str())), 0);
+        otlog("wheel %s", b.c_str());
     } else if (a == "shot") {
         g.shot_pending = b;
     } else if (a == "boxes") {
@@ -3250,7 +3354,7 @@ bool build_model()
         std::string p = g.disc_found[(size_t)i].path;
         close_modal();
         otlog("find discs: chosen %s", ot_file_name(p).c_str());
-        set_disc(p);
+        dialog_chosen(S_DISC_IMAGE, p);   /* set_disc, by the main loop: it loads this dialog again */
     });
     if (g_pages.bind) g_pages.bind(c);
     g.model = c.GetModelHandle();
@@ -3883,12 +3987,15 @@ void fit_window(int pw, int ph)
  * of every element, which computes all of its properties again, variables
  * included, with no page loaded again: the dialog open, a key being captured,
  * the unsaved settings, the tab and the focus stay as they are. Once per frame
- * at most (a drag sends many sizes). */
+ * at most (a drag sends many sizes). A scrolled list keeps its offset in
+ * pixels while its lines take their new size: once laid out (main loop), the
+ * focus shown is brought back into view. */
 void refit_texts()
 {
     if (!g.rescaled) return;
     g.rescaled = false;
     Rml::ReleaseFontResources();
+    g.focus_in_view = true;
 }
 
 } // namespace
@@ -3979,13 +4086,18 @@ int main(int argc, char **argv)
         }
     }
     {
-        /* The game in bin\ (0.1.2 and later): the copies of the program an
-         * update from 0.1.1, or a new version unzipped over an old one, left
-         * beside the launcher go now. A file in use stays until the next start. */
-        std::vector<std::string> removed, failed;
-        ot_install_tidy_root(g.base, removed, failed);
+        /* The game in bin\ (0.1.2 and later): the copies of the program that
+         * 0.1.1 had beside the launcher, left when a new version was unzipped
+         * over it, go now -- only what is exactly 0.1.1's (ot_install.h). What
+         * is in use or protected stays until the next start. */
+        std::vector<std::string> removed, kept, failed;
+        ot_install_tidy_root(g.base, removed, kept, failed);
         for (const std::string &n : removed) otlog("tidy: removed the old %s beside the launcher (the game is in bin\\)", n.c_str());
-        for (const std::string &n : failed) otlog("tidy: %s beside the launcher could not be removed (in use?): next start", n.c_str());
+        for (const std::string &n : kept) {                     /* "<name>: <why>" */
+            const size_t c = n.find(": ");
+            otlog("tidy: kept %s beside the launcher: %s", n.substr(0, c).c_str(), c == std::string::npos ? "" : n.c_str() + c + 2);
+        }
+        for (const std::string &n : failed) otlog("tidy: %s beside the launcher could not be removed (in use, or protected?): next start", n.c_str());
         g.prog = ot_program_dir(g.base);
         otlog("program folder: %s", g.prog == g.base ? "beside the launcher" : "bin\\");
     }
@@ -4172,6 +4284,7 @@ int main(int argc, char **argv)
         bool has = busy ? SDL_PollEvent(&ev)
                         : SDL_WaitEventTimeout(&ev, hidden ? 100 : (Sint32)std::min(delay * 1000.0, 100.0));
         while (has) {
+            if (!g.game) dialog_poll();           /* a path chosen by an input before is taken before this one */
             switch (ev.type) {
             case SDL_EVENT_QUIT:
                 if (!install_running()) g.quit = true;
@@ -4211,6 +4324,8 @@ int main(int argc, char **argv)
                 if (ev.gbutton.which) pad_last = ev.gbutton.which;      /* 0: a test step's button */
                 SDL_GamepadType t = SDL_GetGamepadTypeForID(ev.gbutton.which);
                 g.pad_is_ps = t == SDL_GAMEPAD_TYPE_PS3 || t == SDL_GAMEPAD_TYPE_PS4 || t == SDL_GAMEPAD_TYPE_PS5;
+                g.pad_game_ps = pad_is_ps_game(t);
+                g.pad_pressed = true;
                 update_hint_style();
                 if (!g.game) pad_button(ev.gbutton.button);
                 break;
@@ -4266,6 +4381,14 @@ int main(int argc, char **argv)
 
         g.ctx->Update();
         fit_sized_pictures();
+        if (g.focus_in_view) {
+            g.focus_in_view = false;
+            Rml::Element *f = g.ctx->GetFocusElement();
+            if (f && f->IsPseudoClassSet("focus-visible")) {   /* the keyboard's or a controller's (refit_texts) */
+                f->ScrollIntoView(Rml::ScrollAlignment::Nearest);
+                g.ctx->Update();
+            }
+        }
         if (g.focus_first_row && g.page == "settings" && g.settings && g.modal.empty()) {
             Rml::ElementList list;
             g.settings->QuerySelectorAll(list, ".row, .cell");
@@ -4278,10 +4401,15 @@ int main(int argc, char **argv)
             g.ctx->Update();
         }
         if (g.focus_modal && g.dialog) {
+            /* the first button, in view: Find my disc image's list opens again scrolled where it was left */
             Rml::ElementList list;
             g.dialog->QuerySelectorAll(list, ".sec .mbtn");
             for (Rml::Element *e : list)
-                if (e->IsVisible(true)) { e->Focus(focus_shown()); break; }
+                if (e->IsVisible(true)) {
+                    e->Focus(focus_shown());
+                    e->ScrollIntoView(Rml::ScrollAlignment::Nearest);
+                    break;
+                }
             g.focus_modal = false;
             g.ctx->Update();
         }

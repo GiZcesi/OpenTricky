@@ -68,9 +68,20 @@ void (*aspect_lookup(unsigned int xbox_va))(void);
  * the speed camera). */
 void aspect_set_camera(float fov, float distance);
 int  aspect_cam_hooks(void);
-/* 1: the frame about to be rendered is shown in a centred 16:9 frame (the
- * title's own 16:9 x-scale), 0: wide (see hud_anchor.h). */
-void aspect_frame(int boxed);
+/* The frame about to be rendered (see hud_anchor.h): ASPECT_FRAME_WIDE,
+ * ASPECT_FRAME_MENUS shown in the centred frame of the menus (the title's
+ * 16:9 x-scale, or its 4:3 one with the menus at 4:3), ASPECT_FRAME_169 in
+ * a centred 16:9 frame whatever the menus (the title's 16:9 x-scale). */
+enum { ASPECT_FRAME_WIDE, ASPECT_FRAME_MENUS, ASPECT_FRAME_169 };
+void aspect_frame(int mode);
+/* 1: a shot the title stages is on screen (a camera script: the scenes
+ * before the start and after the finish; not the replays, the race's wide
+ * image): shown whole in the title's own frame, from the title's own eye. */
+int  aspect_staged_shot(void);
+/* Counts the ticks where the views' eyes changed source (the title's eye,
+ * the follow camera's moved one): such a tick is a cut for the views'
+ * interpolation above 60 fps (fps_cap.c). */
+unsigned aspect_eye_epoch(void);
 
 enum { ASPECT_FOV_NOSTRETCH, ASPECT_FOV_BALANCED, ASPECT_FOV_FULL, ASPECT_FOV_COUNT };
 extern int g_aspect_fov;                    /* ASPECT_FOV_*, NoStretch by default */

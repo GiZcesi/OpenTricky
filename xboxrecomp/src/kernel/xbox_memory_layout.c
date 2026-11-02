@@ -16,6 +16,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "xbox_logstats.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -66,6 +67,10 @@ static void *g_gpu_mmio_base = NULL;   /* fake NV2A MMIO aperture, Xbox VA 0xFD0
  *      Confirmed the context here is the very same one: the caller passes
  *      the literal constant 0x174B30, which is exactly what gets stored
  *      at Xbox VA 0x1776C0 during device init (see sub_0016B0E0).
+ *      (+0x2304 is the NV_USER block, 0xFD800000, so +0x44 is
+ *      DMA_GET, the GPU's read pointer; context+0x0 is the write pointer
+ *      and context+0x10 / +0x14 the ring's base / end. MakeSpace reads
+ *      DMA_GET for flow control, so only the write pointer goes there.)
  *   4. A per-frame "don't get more than 2 frames ahead of the GPU" throttle
  *      (sub_001688D0): compares a producer count (context+0x2B60, bumped
  *      once per frame submitted) against a consumer count (context+0x2518,
@@ -251,18 +256,17 @@ volatile uint32_t       g_pump_beats = 0;
 static void xbox_pfifo_sync_fence(uint8_t *mem_base, uint32_t context)
 {
     uint32_t fence_target0  = *(volatile uint32_t *)(mem_base + context);
-    uint32_t fence_target10 = *(volatile uint32_t *)(mem_base + context + XBOX_GPU_CTX_FENCE_TARGET_OFF);
     uint32_t fence_struct   = *(volatile uint32_t *)(mem_base + context + XBOX_GPU_CTX_FENCE_STRUCT_OFF);
     if (fence_struct) {
-        /* Two call sites wait on this same fence-struct readback against
-         * two different target fields -- context+0x10 (sub_0016F220) and
-         * context+0x0 (sub_0016ED57). Sync both; the 1ms poll interval
-         * means whichever is actually being waited on at any instant sees
-         * its own target satisfied on the next tick regardless of which
-         * write happened last. */
+        /* Two call sites wait on this readback (NV_USER DMA_GET, the GPU's
+         * read pointer): sub_0016ED57 for context+0x0, sub_0016F220 for
+         * context+0x10 -- the ring's base, which it has just stored in
+         * context+0x0 too. context+0x0 meets both. Writing context+0x10
+         * here as well made DMA_GET read "parked at the base" for an
+         * instant, which MakeSpace (0x16B680) takes as room to write;
+         * see the pump loop below. */
         volatile uint32_t *current =
             (volatile uint32_t *)(mem_base + fence_struct + XBOX_GPU_FENCE_CURRENT_OFF);
-        *current = fence_target10;
         *current = fence_target0;
     }
 }
@@ -477,6 +481,460 @@ static void getwait_wake(void)
         WakeByAddressAll((PVOID)a);
 }
 
+/*
+ * Fork: the title's wait for a visibility test's report (LensFX's sun, the
+ * lights' tests: Render_ReadVisibilityTestResult, sub_000FBEA6) rereads the
+ * report's status word through D3DDevice_GetVisibilityTestResult (0x169010)
+ * while it reads 0xFFFFFFFF (pending), with nothing in between, at most
+ * 0x100000 times; past that bound it goes on without the result. The status
+ * is written by the pump when the GPU has counted the test
+ * (pgraph_d3d11_poll_reports): until then the game thread kept a core busy
+ * (at the sun of Pipedream, 240 fps: ~40 % of its samples).
+ *
+ * The bound is a time on the console: a round is 26 instructions (the loop's
+ * 11, 0x169010's 15), some 17 cycles of the Xbox's 733 MHz Pentium III (its
+ * decoders' pace), so 0x100000 rounds last about 24 ms there, where a report
+ * is in long before.
+ * Here a bare round takes 6 to 30 ns, by core and clock, and the thread that
+ * turns is stopped at times: the bare loop leaves after 7 to 40 ms, and when
+ * the GPU runs late it leaves without the result and the title takes the value
+ * its wait leaves in the result's place (1, one sample of the test's 128 or
+ * 256: a light's faint halo, or the sun cut, for one image).
+ *
+ * The generated loop calls this every 1024 rounds, before its own decrement
+ * (fork pass fix_occlwait.py; always, but XBOX_FIX_OCCLWAIT=0 with the developer tools). The
+ * call of the first round notes the time; the next, 1024 bare rounds later,
+ * measures their pace, and from there the wait sleeps on the status word
+ * itself until the pump writes it -- the protocol of xbox_pfifo_get_wait: the
+ * waiter publishes the word (full barrier) and WaitOnAddress compares it after
+ * registering; the pump stores the status, a full barrier, then reads the
+ * published word (xbox_occl_wake). The bound never comes before the console's
+ * time nor before the bare loop's end here (XBOX_OCCLWAIT_LOOP):
+ *  - "live" (the default): the bare loop followed. The wait sleeps by slices of
+ *    OCCLW_SLICE_MS; after each slice it gives the loop 1024 rounds, bare (the
+ *    title's own rounds, with their own reads of the status), and the next call
+ *    measures them: their pace is the loop's pace now, on this core, with the
+ *    thread's stops in them. A slice counts the rounds the bare loop would have
+ *    made in it at the slowest of the two paces measured around it and of the
+ *    static estimate's pace below; the measured rounds count as made. The
+ *    bound is reached when those rounds reach twice 0x100000 (a margin of
+ *    100 % for the stops a sleeping thread does not see: other threads that
+ *    would have stopped the turning one; XBOX_OCCLWAIT_LOOP_MARGIN=x: x), and
+ *    no sooner than OCCLW_BOUND_MS after the wait's start
+ *    (XBOX_OCCLWAIT_BOUND_MS=N: N ms);
+ *  - "static": the longer of OCCLW_BOUND_MS and an estimate made once, at the
+ *    wait's first 1024 rounds: 0x100000 rounds at the highest pace of the last
+ *    32 waits' first 1024 rounds (this wait's among them; a pace over 3 times
+ *    their median had the thread stopped in those rounds and is left out), plus
+ *    the same margin;
+ *  - "off": OCCLW_BOUND_MS alone;
+ *  - XBOX_OCCLWAIT_BOUND_MS=0 (comparison): 0x100000 rounds at the lower median
+ *    of the last 15 paces, and the rounds the bare loop would have left are
+ *    returned.
+ * At the bound 2 is returned, and the loop makes its last round exactly as
+ * without the switch (it rereads the status, then leaves on its own test, with
+ * or without the result). The loop reads the status and the result through
+ * 0x169010 as before and leaves on its own test: only the moment it sees the
+ * result changes, not what it reads. With the reports off (XBOX_FIX_OCCLUSION=0:
+ * never written) the loop turns as before.
+ *
+ * XBOX_FIX_OCCLWAIT=count (diagnostic): the bare loop, timed and counted, the
+ * clock read at every call (one QueryPerformanceCounter every 1024 rounds); it
+ * neither sleeps nor changes the rounds. It counts the waits whose report is
+ * pending at the last call, 1024 rounds before the bound, and for each of them
+ * sets against the bare loop's real end the bound the switch would have taken:
+ * the static one, and the live one played on the bare loop's own times (a slice
+ * of OCCLW_SLICE_MS, then the next 1024 rounds measured, again and again): the
+ * shadow counters of [OCCLWAIT2]. Counters, the same in every mode: [OCCLWAIT]
+ * and [OCCLWAIT2] with XBOX_LOG_STATS=1, and the first wait that reaches the
+ * bound. XBOX_OCCLWAIT_TRACE=file (diagnostic): a CSV line for each wait begun
+ * pending.
+ */
+#define OCCLW_BOUND    0x100000u    /* the title's rounds: mov edi, 0x100000 (0x000FBEAE) */
+#define OCCLW_STEP     1024u        /* rounds between two calls (fix_occlwait.py: edi & 0x3FF) */
+#define OCCLW_RATES    15           /* XBOX_OCCLWAIT_BOUND_MS=0: the lower median of the last 15 paces */
+#define OCCLW_HI       32           /* static: the last 32 waits' first 1024 rounds */
+#define OCCLW_HI_STOP  3.0          /* over 3 times their median: the thread was stopped in those rounds */
+#define OCCLW_MARGIN   1.0          /* the bare loop's rounds or estimate: + 100 % (the stops it may not see) */
+#define OCCLW_SLICE_MS 1            /* live: a slice asleep between two measured runs of 1024 bare rounds */
+#define OCCLW_BOUND_MS 24.3         /* 0x100000 rounds of 17 cycles at 733.33 MHz */
+
+enum { OCCLW_LOOP_OFF, OCCLW_LOOP_STATIC, OCCLW_LOOP_LIVE };
+static volatile uint32_t *volatile g_occlwait_addr = NULL;
+static double g_occlw_bound_ms = OCCLW_BOUND_MS;    /* 0: 0x100000 rounds at the lower median pace */
+static double g_occlw_margin = OCCLW_MARGIN;
+static int g_occlw_loop = OCCLW_LOOP_LIVE;
+static int g_occlw_count;                           /* XBOX_FIX_OCCLWAIT=count */
+static FILE *g_occlw_trace;                         /* XBOX_OCCLWAIT_TRACE */
+static struct {
+    unsigned long long calls, waits, slept, woken, bound;
+    double slept_ms, bound_ms, round_ns;
+    int bound_said;
+    /* static: the estimate, once a wait, and how often it is longer than the console's time */
+    unsigned long long loop_n, loop_longer;
+    double loop_ms, loop_max_ms, hi_ns;
+    /* live: the slices, the waits whose followed bound came (count: would have come), later than the console's */
+    unsigned long long slices, live_n, live_longer;
+    double live_ms, live_max_ms;
+    /* count: the waits at the bare loop's end, and those each bound would have left before it */
+    unsigned long long sh_n, sh_loop_short, sh_short, sh_live_short;
+    double sh_bare_ms, sh_bare_max_ms, sh_min_loop, sh_min, sh_min_live;
+    /* count: the margin each would have needed (the bare loop's real end against its count or estimate, at most) */
+    double sh_need_live, sh_need_static;
+} g_ow;
+
+/* A wait begun pending, for XBOX_OCCLWAIT_TRACE (times in ms after its start). */
+struct occlw_rec {
+    double t0, pace1, loop, bound, live, last, maxc, slept;
+    uint32_t last_rounds;
+    int cpu0, cpu_last, flags, slices, open;    /* flags: 1 at the bare loop's end (count), 2 slept, 4 woken, 8 the bound */
+};
+
+/* main(), once, unless XBOX_FIX_OCCLWAIT=0: count = 1 for XBOX_FIX_OCCLWAIT=count. The variables
+ * below are read in a build with the developer tools only. */
+void xbox_occl_wait_init(int count)
+{
+    g_occlw_count = count;
+    if (count)
+        fprintf(stderr, "[OCCLWAIT] XBOX_FIX_OCCLWAIT=count: the bare loop for a visibility test's report, timed; "
+                "the waits that reach its bound counted\n");
+    else if (g_occlw_bound_ms <= 0.0)
+        fprintf(stderr, "[OCCLWAIT] on: the wait for a visibility test's report sleeps on its status, "
+                "bound 0x100000 rounds at the loop's pace (XBOX_OCCLWAIT_BOUND_MS=0)\n");
+    else if (g_occlw_loop == OCCLW_LOOP_LIVE)
+        fprintf(stderr, "[OCCLWAIT] on: the wait for a visibility test's report sleeps on its status, "
+                "bound the later of %.2f ms and the bare loop's end here, followed (+%.0f %%)\n",
+                g_occlw_bound_ms, g_occlw_margin * 100.0);
+    else if (g_occlw_loop == OCCLW_LOOP_STATIC)
+        fprintf(stderr, "[OCCLWAIT] on: the wait for a visibility test's report sleeps on its status, "
+                "bound the longer of %.2f ms and the bare loop's time here, estimated once (+%.0f %%)\n",
+                g_occlw_bound_ms, g_occlw_margin * 100.0);
+    else
+        fprintf(stderr, "[OCCLWAIT] on: the wait for a visibility test's report sleeps on its status, "
+                "bound %.2f ms after its start\n", g_occlw_bound_ms);
+}
+
+static double occlw_now_ms(void)
+{
+    static double qpms;
+    LARGE_INTEGER t;
+    if (qpms <= 0.0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); qpms = (double)f.QuadPart / 1000.0; }
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart / qpms;
+}
+
+/* static: the bare loop's time here, from above (ms): 0x100000 rounds at the highest of the last waits' paces that is
+ * a pace (over OCCLW_HI_STOP times their median, the thread was stopped in those 1024 rounds), plus the margin. */
+static double occlw_loop_ms(const double *hi, int n, double *top_out)
+{
+    double s[OCCLW_HI], med, top = 0.0;
+    int i, j;
+    for (i = 0; i < n; i++) {
+        double v = hi[i];
+        for (j = i; j > 0 && s[j - 1] > v; j--) s[j] = s[j - 1];
+        s[j] = v;
+    }
+    med = s[(n - 1) / 2];
+    for (i = n - 1; i >= 0; i--)
+        if (s[i] <= OCCLW_HI_STOP * med) { top = s[i]; break; }
+    g_ow.hi_ns = top * 1e6;
+    *top_out = top;
+    return (double)OCCLW_BOUND * top * (1.0 + g_occlw_margin);
+}
+
+static void occlw_trace_put(struct occlw_rec *r)
+{
+    if (!r->open) return;
+    r->open = 0;
+    fprintf(g_occlw_trace, "%.4f,%d,%.2f,%.3f,%.3f,%.3f,%.4f,%u,%.2f,%d,%d,%d,%.3f\n", r->t0, r->cpu0, r->pace1 * 1e6,
+            r->loop, r->bound, r->live, r->last, r->last_rounds, r->maxc * 1e3, r->cpu_last, r->flags, r->slices,
+            r->slept);
+}
+
+/* A wait reached the bound with its report pending: the same count in every mode. */
+static void occlw_at_bound(double since_ms, double per)
+{
+    g_ow.bound++;
+    g_ow.bound_ms += since_ms;
+    if (g_ow.bound_said) return;
+    g_ow.bound_said = 1;
+    if (g_occlw_count)
+        fprintf(stderr, "[OCCLWAIT] count: a report not written within the bare loop's bound (its last call %.2f ms "
+                "after the wait's start, a round %.1f ns)\n", since_ms, per * 1e6);
+    else if (g_occlw_bound_ms > 0.0)
+        fprintf(stderr, "[OCCLWAIT] a report not written within the bound (%.2f ms after the wait's start): its last "
+                "round, as in the bare loop\n", since_ms);
+    else
+        fprintf(stderr, "[OCCLWAIT] a report not written within the loop's bound (0x100000 rounds of %.1f ns, "
+                "%.1f ms): its last round, as in the bare loop\n", per * 1e6, (double)OCCLW_BOUND * per);
+    xbox_log_flush();
+}
+
+/* live, once a wait: its followed bound came (or, with count, would have come) after `since` ms. */
+static void occlw_live_reached(double since)
+{
+    g_ow.live_n++;
+    g_ow.live_ms += since;
+    if (since > g_ow.live_max_ms) g_ow.live_max_ms = since;
+    if (since > g_occlw_bound_ms + 2.0 * OCCLW_SLICE_MS) g_ow.live_longer++;
+}
+
+uint32_t xbox_occl_wait(volatile uint32_t *status, uint32_t rounds)
+{
+    static __thread double t_first, t_prev, w_loop, rate[OCCLW_RATES], hi[OCCLW_HI];
+    static __thread double virt, p_prev, p_hi, t_run, s_pend, t_s0, t_live;   /* live: the bare loop followed */
+    static __thread int nrate, irate, nhi, ihi, measuring;
+    static __thread struct occlw_rec rec;
+    static int occ_on = -1;
+    uint32_t pending = 0xFFFFFFFFu, ret;
+    double t, per = 0.0, deadline, tmp[OCCLW_RATES], target = (double)OCCLW_BOUND * (1.0 + g_occlw_margin);
+    int i, j, first;
+    if (occ_on < 0) { const char *e = getenv("XBOX_FIX_OCCLUSION"); occ_on = !(e && e[0] == '0'); }
+    if (!occ_on) return rounds;                     /* no report is ever written: the bare loop */
+    g_ow.calls++;
+    if (rounds == OCCLW_BOUND) {                    /* a wait's first round */
+        if (g_occlw_trace) {                        /* the last wait's line, before this one's clock */
+            occlw_trace_put(&rec);
+            memset(&rec, 0, sizeof rec);
+            rec.open = 1;
+            rec.cpu0 = rec.cpu_last = (int)GetCurrentProcessorNumber();
+            rec.last_rounds = rounds;
+        }
+        t_first = t_prev = occlw_now_ms();
+        rec.t0 = t_first;
+        w_loop = t_live = p_hi = 0.0;
+        measuring = 0;
+        g_ow.waits++;
+        return rounds;
+    }
+    if (t_first <= 0.0 || rounds > OCCLW_BOUND - OCCLW_STEP) return rounds;
+    t = occlw_now_ms();
+    if (g_occlw_trace) {
+        if (t - t_prev > rec.maxc) rec.maxc = t - t_prev;
+        rec.last = t - t_first;
+        rec.last_rounds = rounds;
+        rec.cpu_last = (int)GetCurrentProcessorNumber();
+    }
+    t_prev = t;
+    first = rounds == OCCLW_BOUND - OCCLW_STEP;
+    if (first) {                                    /* its first 1024 rounds, bare: the pace of one */
+        double r = (t - t_first) / (double)OCCLW_STEP;
+        if (r > 0.0 && r < 1e-3) {                  /* over 1 us a round: the thread was stopped, not a pace */
+            rate[irate] = r;
+            irate = (irate + 1) % OCCLW_RATES;
+            if (nrate < OCCLW_RATES) nrate++;
+            hi[ihi] = r;
+            ihi = (ihi + 1) % OCCLW_HI;
+            if (nhi < OCCLW_HI) nhi++;
+        }
+        rec.pace1 = r;
+        if (nhi) {                                  /* static: the bare loop's time from above, once a wait */
+            w_loop = occlw_loop_ms(hi, nhi, &p_hi);
+            g_ow.loop_n++;
+            g_ow.loop_ms += w_loop;
+            if (w_loop > g_ow.loop_max_ms) g_ow.loop_max_ms = w_loop;
+            if (w_loop > (g_occlw_bound_ms > 0.0 ? g_occlw_bound_ms : OCCLW_BOUND_MS)) g_ow.loop_longer++;
+            rec.loop = w_loop;
+        }
+        virt = (double)OCCLW_STEP;                  /* live: those rounds made, at that pace */
+        p_prev = r > p_hi ? r : p_hi;               /* never faster than the static estimate's pace */
+        t_s0 = t;
+    }
+    if (nrate) {
+        for (i = 0; i < nrate; i++) {               /* the (lower) median: a wait slowed by an interrupt does not count */
+            double v = rate[i];
+            for (j = i; j > 0 && tmp[j - 1] > v; j--) tmp[j] = tmp[j - 1];
+            tmp[j] = v;
+        }
+        per = tmp[(nrate - 1) / 2];
+        if (per > 0.0) g_ow.round_ns = per * 1e6;
+    }
+    if (g_occlw_count) {
+        double b = g_occlw_bound_ms > 0.0 ? g_occlw_bound_ms : OCCLW_BOUND_MS;
+        /* live, played on the bare loop's own times: a slice, then the next 1024 rounds measured */
+        if (!first && t_live <= 0.0) {
+            if (measuring) {                        /* the measured rounds end here */
+                double p = (t - t_run) / (double)OCCLW_STEP;
+                if (p < p_hi) p = p_hi;
+                virt += s_pend / (p > p_prev ? p : p_prev) + (double)OCCLW_STEP;
+                p_prev = p;
+                measuring = 0;
+                t_s0 = t;
+                if (virt >= target && t - t_first >= b) {
+                    t_live = t - t_first;
+                    rec.live = t_live;
+                    occlw_live_reached(t_live);
+                }
+            } else if (t - t_s0 >= (double)OCCLW_SLICE_MS) {     /* the slice ends: the next 1024 rounds measured */
+                s_pend = t - t_s0;
+                t_run = t;
+                measuring = 1;
+                g_ow.slices++;
+            }
+        }
+        if (rounds == OCCLW_STEP && *status == pending) {
+            /* the bare loop's end: its own pace over its last 1024 rounds too */
+            double bare = (t - t_first) * (double)OCCLW_BOUND / (double)(OCCLW_BOUND - OCCLW_STEP);
+            occlw_at_bound(t - t_first, per);
+            rec.flags |= 1;
+            g_ow.sh_n++;
+            g_ow.sh_bare_ms += bare;
+            if (bare > g_ow.sh_bare_max_ms) g_ow.sh_bare_max_ms = bare;
+            if (w_loop > 0.0) {
+                if (g_ow.sh_min_loop == 0.0 || w_loop / bare < g_ow.sh_min_loop) g_ow.sh_min_loop = w_loop / bare;
+                if (w_loop < bare) g_ow.sh_loop_short++;
+                if (w_loop > b) b = w_loop;
+            }
+            if (g_ow.sh_min == 0.0 || b / bare < g_ow.sh_min) g_ow.sh_min = b / bare;
+            if (b < bare) g_ow.sh_short++;
+            rec.bound = b;
+            {   /* the margins needed: the followed count of rounds against the rounds made, the end against the
+                 * static pace's 0x100000 rounds */
+                double pl = p_prev > p_hi ? p_prev : p_hi;
+                double est = virt + (pl > 0.0 ? (t - (measuring ? t_run : t_s0)) / pl : 0.0);
+                double need = est / (double)(OCCLW_BOUND - OCCLW_STEP);
+                if (need > g_ow.sh_need_live) g_ow.sh_need_live = need;
+                rec.live = need;
+                if (p_hi > 0.0 && bare / ((double)OCCLW_BOUND * p_hi) > g_ow.sh_need_static)
+                    g_ow.sh_need_static = bare / ((double)OCCLW_BOUND * p_hi);
+            }
+            if (t_live > 0.0) {                     /* not reached by the last call: after the bare loop's end */
+                if (g_ow.sh_min_live == 0.0 || t_live / bare < g_ow.sh_min_live) g_ow.sh_min_live = t_live / bare;
+                if (t_live < bare) g_ow.sh_live_short++;
+            }
+        }
+        return rounds;
+    }
+    if (g_occlw_bound_ms > 0.0 && g_occlw_loop == OCCLW_LOOP_LIVE) {
+        if (!first) {                               /* the 1024 bare rounds given after the last slice end here */
+            double p = (t - t_run) / (double)OCCLW_STEP;
+            if (p < p_hi) p = p_hi;
+            virt += s_pend / (p > p_prev ? p : p_prev) + (double)OCCLW_STEP;
+            p_prev = p;
+        }
+        if (*status != pending) {
+            ret = rounds;                           /* the report is in: the loop takes it at its next read */
+        } else if ((virt >= target && t - t_first >= g_occlw_bound_ms) || rounds == OCCLW_STEP) {
+            /* the bound (or the loop's own: its last 1024 rounds follow) */
+            occlw_at_bound(t - t_first, per);
+            occlw_live_reached(t - t_first);
+            rec.flags |= 8;
+            rec.bound = rec.live = t - t_first;
+            ret = rounds == OCCLW_STEP ? rounds : 2u;
+        } else {                                    /* a slice asleep on the status, then 1024 bare rounds */
+            double t_in = t;
+            if (first) { g_ow.slept++; rec.flags |= 2; }
+            InterlockedExchangePointer((PVOID volatile *)&g_occlwait_addr, (PVOID)status);
+            if (*status == pending) WaitOnAddress((volatile VOID *)status, (PVOID)&pending, sizeof pending, OCCLW_SLICE_MS);
+            g_occlwait_addr = NULL;
+            t = occlw_now_ms();
+            g_ow.slept_ms += t - t_in;
+            g_ow.slices++;
+            rec.slept += t - t_in;
+            rec.slices++;
+            if (*status != pending) { g_ow.woken++; rec.flags |= 4; }
+            s_pend = t - t_in;
+            t_run = t;
+            ret = rounds;
+        }
+        if (g_occlw_trace) {
+            rec.last = t - t_first;
+            rec.last_rounds = ret;
+        }
+        return ret;
+    }
+    if (g_occlw_bound_ms > 0.0)                     /* the console's time, or the estimate if longer (static) */
+        deadline = t_first + (g_occlw_loop == OCCLW_LOOP_STATIC && w_loop > g_occlw_bound_ms ? w_loop : g_occlw_bound_ms);
+    else if (per > 0.0)
+        deadline = t_first + (double)OCCLW_BOUND * per;     /* 0x100000 rounds at the pace here */
+    else
+        return rounds;                              /* no pace yet: this wait as the bare loop */
+    rec.bound = deadline - t_first;
+    if (*status == pending && t < deadline) {
+        double t_in = t;
+        g_ow.slept++;
+        rec.flags |= 2;
+        InterlockedExchangePointer((PVOID volatile *)&g_occlwait_addr, (PVOID)status);
+        for (;;) {
+            double left;
+            if (*status != pending) { g_ow.woken++; rec.flags |= 4; break; }
+            t = occlw_now_ms();
+            left = deadline - t;
+            if (left <= 0.0) break;
+            if (left > 2.5) WaitOnAddress((volatile VOID *)status, (PVOID)&pending, sizeof pending, 1);
+            else YieldProcessor();          /* the last ~2 ms turned: a 1 ms timeout may last 2 */
+        }
+        g_occlwait_addr = NULL;
+        t = occlw_now_ms();
+        g_ow.slept_ms += t - t_in;
+        rec.slept += t - t_in;
+    }
+    if (t >= deadline) {
+        /* the bound: the loop's last round, as it makes it without the switch */
+        if (*status == pending) { occlw_at_bound(t - t_first, per); rec.flags |= 8; }
+        ret = rounds > 2u ? 2u : rounds;
+    } else if (g_occlw_bound_ms > 0.0) {
+        ret = rounds;                               /* the report is in: the loop takes it at its next read */
+    } else {    /* the rounds the bare loop would have made by now: never more than it has left */
+        double made = (t - t_first) / per;
+        uint32_t left = made >= (double)(OCCLW_BOUND - 2u) ? 2u : OCCLW_BOUND - (uint32_t)made;
+        ret = left < rounds ? left : rounds;
+    }
+    if (g_occlw_trace) {
+        rec.last = t - t_first;
+        rec.last_rounds = ret;
+        rec.cpu_last = (int)GetCurrentProcessorNumber();
+    }
+    return ret;
+}
+
+/* Pump side: a report's status was just written. */
+void xbox_occl_wake(void)
+{
+    volatile uint32_t *a;
+    MemoryBarrier();
+    a = g_occlwait_addr;
+    if (a)
+        WakeByAddressAll((PVOID)a);
+}
+
+/* With XBOX_LOG_STATS=1, after [OCCL] (pgraph_d3d11_report_occlusion). */
+void xbox_occl_wait_report(void)
+{
+    static unsigned long long last;
+    char mode[64];
+    double b = g_occlw_bound_ms > 0.0 ? g_occlw_bound_ms : OCCLW_BOUND_MS;
+    if (g_occlw_trace) fflush(g_occlw_trace);
+    if (!g_ow.calls || g_ow.calls == last) return;
+    last = g_ow.calls;
+    if (g_occlw_count) snprintf(mode, sizeof mode, "count, the bare loop");
+    else if (g_occlw_bound_ms <= 0.0) snprintf(mode, sizeof mode, "bound 0x100000 rounds at the pace here");
+    else if (g_occlw_loop == OCCLW_LOOP_LIVE)
+        snprintf(mode, sizeof mode, "bound %.2f ms or the bare loop's followed, the later", g_occlw_bound_ms);
+    else if (g_occlw_loop == OCCLW_LOOP_STATIC)
+        snprintf(mode, sizeof mode, "bound %.2f ms or the bare loop's estimate, the longer", g_occlw_bound_ms);
+    else snprintf(mode, sizeof mode, "bound %.2f ms", g_occlw_bound_ms);
+    fprintf(stderr, "[OCCLWAIT] %llu waits asleep on the report's status (%.3f ms on average), %llu woken by it, "
+            "%llu at the loop's bound; a round %.1f ns; %llu waits begun pending (%s), the bound reached "
+            "%.2f ms after their start on average\n", g_ow.slept,
+            g_ow.slept ? g_ow.slept_ms / (double)g_ow.slept : 0.0, g_ow.woken, g_ow.bound, g_ow.round_ns,
+            g_ow.waits, mode, g_ow.bound ? g_ow.bound_ms / (double)g_ow.bound : 0.0);
+    fprintf(stderr, "[OCCLWAIT2] static estimate (0x100000 rounds at the high pace %.1f ns, +%.0f %%): %.2f ms on "
+            "average, %.2f at most, longer than %.2f ms in %llu of %llu waits; followed bound (slices of %d ms, %llu): "
+            "reached by %llu waits, %.2f ms after their start on average, %.2f at most, later than %.2f ms in %llu\n",
+            g_ow.hi_ns, g_occlw_margin * 100.0, g_ow.loop_n ? g_ow.loop_ms / (double)g_ow.loop_n : 0.0,
+            g_ow.loop_max_ms, b, g_ow.loop_longer, g_ow.loop_n, OCCLW_SLICE_MS, g_ow.slices, g_ow.live_n,
+            g_ow.live_n ? g_ow.live_ms / (double)g_ow.live_n : 0.0, g_ow.live_max_ms, b, g_ow.live_longer);
+    if (g_occlw_count)
+        fprintf(stderr, "[OCCLWAIT2] shadow: %llu waits at the bare loop's end (%.2f ms on average, %.2f at most); "
+                "before it: the static estimate in %llu (lowest ratio %.3f), the static bound in %llu (lowest ratio "
+                "%.3f), the followed bound in %llu (lowest ratio %.3f); the margin needed, at most: followed "
+                "%+.1f %%, static %+.1f %%\n", g_ow.sh_n,
+                g_ow.sh_n ? g_ow.sh_bare_ms / (double)g_ow.sh_n : 0.0, g_ow.sh_bare_max_ms, g_ow.sh_loop_short,
+                g_ow.sh_min_loop, g_ow.sh_short, g_ow.sh_min, g_ow.sh_live_short, g_ow.sh_min_live,
+                100.0 * (g_ow.sh_need_live - 1.0), 100.0 * (g_ow.sh_need_static - 1.0));
+}
+
 /* The pump has gone idle (no new PUT for two passes): submit the
  * draws translated since the last submission (d3d8_IdleFlush), once. Without
  * it the scene of a frame waited in the driver until the next Present.
@@ -577,7 +1035,7 @@ static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
         {
             static int ack_early = -1;
             uint32_t context, put = 0, get_va = 0, producer = 0;
-            uint32_t ft0 = 0, ft10 = 0, fstruct = 0;
+            uint32_t ft0 = 0, fstruct = 0;
             if (ack_early < 0) {
                 const char *e = getenv("XBOX_PFIFO_ACK_LATE");
                 ack_early = (e && e[0] == '0');
@@ -593,7 +1051,6 @@ static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
                 get_va   = *(volatile uint32_t *)(mem_base + context + XBOX_GPU_CTX_GET_PTR_OFF);
                 producer = *(volatile uint32_t *)(mem_base + context + XBOX_GPU_CTX_FRAME_PRODUCER_OFF);
                 ft0      = *(volatile uint32_t *)(mem_base + context);
-                ft10     = *(volatile uint32_t *)(mem_base + context + XBOX_GPU_CTX_FENCE_TARGET_OFF);
                 fstruct  = *(volatile uint32_t *)(mem_base + context + XBOX_GPU_CTX_FENCE_STRUCT_OFF);
                 if (get_va && !pfifo_addr_ok(get_va, 4)) {
                     pfifo_bad_ptr("GPU GET pointer", get_va);
@@ -616,11 +1073,20 @@ static DWORD WINAPI xbox_pfifo_pump_thread(LPVOID param)
                         getwait_wake();
                 }
                 if (fstruct) {
-                    /* Same two targets xbox_pfifo_sync_fence syncs, but the
-                     * values sampled before translating. */
+                    /* The "fence readback" is NV_USER DMA_GET (fstruct =
+                     * 0xFD800000, +0x44): the GPU's read pointer. It gets the
+                     * write pointer sampled before translating, and nothing
+                     * else. It used to get context+0x10 first, which is the
+                     * ring's base, not a fence: for that instant the GPU
+                     * looked parked at the base, and a MakeSpace (0x16B680)
+                     * reading it then went on writing over commands the pump
+                     * had not read yet. The two waits that compare
+                     * DMA_GET with a context field are both met by the write
+                     * pointer: sub_0016ED57 compares it with context+0x0
+                     * itself, and sub_0016F220 sets context+0x0 to the base
+                     * (context+0x10) before waiting for DMA_GET to reach it. */
                     volatile uint32_t *current =
                         (volatile uint32_t *)(mem_base + fstruct + XBOX_GPU_FENCE_CURRENT_OFF);
-                    *current = ft10;
                     *current = ft0;
                 }
                 /* Fourth channel: per-frame GPU-ahead throttle (see comment

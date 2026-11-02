@@ -99,11 +99,11 @@ enum {
     /* GRAPHICS */
     S_HD_HUD, S_HD_TEXTURES, S_HD_PACK_FOLDER, S_TEX_FILTER, S_SMAA, S_SOFT_SHADOWS, S_SHADOW_SOFTNESS,
     S_DRAW_DISTANCE,
-    S_SNOW_LOOK,
+    S_SNOW_LOOK, S_WEATHER,
     S_LIGHTMAP_SMOOTH, S_LOOK_LIKE_XBOX,
     /* AUDIO */
     S_SPEAKERS, S_AUDIO_DELAY, S_LAUNCHER_MUSIC, S_LAUNCHER_SOUNDS,
-    /* CONTROLS */
+    /* CONTROLS (and S_PS_CONTROLLERS below) */
     S_BUTTON_STYLE,
     S_KEY_FIRST,
     S_PAD_FIRST = S_KEY_FIRST + SETTINGS_KEY_CONTROLS,
@@ -115,6 +115,10 @@ enum {
     /* hidden */
     S_SMOOTH_MOTION, S_HD_TEXTURES_MENUS, S_FIX_CULL_WINDING, S_FIX_OCCLUSION,
     S_FIX_TEX_PASSTHROUGH, S_FIX_GAMMA, S_FIX_KICKWAIT, S_TC_GHOST_OPACITY,
+    /* CONTROLS, added last so that no other id moves (a tab shows its
+     * settings in the order of their ids, the file writes each section's
+     * keys together) */
+    S_PS_CONTROLLERS,
     SETTINGS_COUNT
 };
 
@@ -225,8 +229,8 @@ int  settings_locate(const char *game_dir, const char *docs_dir, int for_write, 
 /* This executable's folder and Documents\My Games\SSX Tricky, in UTF-8 (Windows). 1 = found. */
 int  settings_game_dir(char *out, size_t out_sz);
 int  settings_docs_dir(char *out, size_t out_sz);
-/* The install root, in UTF-8: the folder of OpenTricky.exe, where settings.ini
- * and the player's files are (saves, logs, crash reports, screenshots). The
+/* The install root, in UTF-8: the folder of OpenTricky.exe, where settings.ini,
+ * crash reports and screenshots go when it can be written (each has a fallback). The
  * game itself is in its bin\ subfolder; an older or a developer's install has
  * everything in one folder. So: `exe_dir` itself, except when `exe_dir` is a
  * folder named "bin" without OpenTricky.exe whose parent has OpenTricky.exe,

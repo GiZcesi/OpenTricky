@@ -13,7 +13,9 @@
 
 #include "../kernel/xbox_perf.h"
 extern int d3d8_pump_cache_on(void);
+extern int d3d8_pump_alt_off(void);     /* XBOX_FIX_PUMP_ALT frame */
 #include <time.h>
+#include <intrin.h>
 #include "nv2a_pgraph_d3d11.h"
 #include "nv2a_regs.h"
 #include <stdio.h>
@@ -282,6 +284,10 @@ static struct {
     float    vconst[VSHCPU_CONSTANTS][4];
     uint32_t const_load;
     uint32_t vgen;                      /* +1 when a constant changes value (stable decals) */
+    /* Constants changed since the GPU path last took them -- set by
+     * vc_set, and all at once where constant memory may change past it (an
+     * init, a program that stores to constants: vsh_active) */
+    uint32_t vdirty[(VSHCPU_CONSTANTS + 31) / 32];
     int      prog_dirty;
     int      prog_len;                  /* decoded length, -1 = no FINAL */
     uint16_t prog_inputs;               /* bit n: the program reads v[n] */
@@ -295,14 +301,44 @@ static struct {
      * DRAW_ARRAYS of at most 256 vertices that must be assembled as one. */
     uint32_t *idx;
     uint32_t  idx_count, idx_cap;
+    uint32_t  idx_lo, idx_hi;           /* smallest / largest index in idx[0..idx_count) */
 
     /* Init flag */
     int initialized;
 } g_pg;
 
+/* (XBOX_PERF_DETAIL, with XBOX_PERF: a test on every method word, so
+ * not under XBOX_PERF alone): consecutive program draws that a merge could
+ * join -- no method other than indices, stream offsets and begin / end
+ * between them (g_mg_brk, set in pgraph_d3d11_method), both on the GPU;
+ * "plain" = also no split, mark or second pass of the fork (see
+ * draw_program). Counted only, nothing is merged. */
+static int g_mg_brk = 1, g_mg_prev_gpu, g_mg_prev_plain, g_mg_cur_plain;
+
 /* ══════════════════════════════════════════════════════════════════════
  * Float/uint32 conversion
  * ══════════════════════════════════════════════════════════════════════ */
+/* XBOX_FIX_PUMP_ARGB, default 1; 0 = the divisions as before: the
+ * pixel shader's colour constants -- 18 combiner factors and the fog colour,
+ * 88 bytes per GPU draw, each k / 255.0f -- read from a table filled once
+ * with that same division (an unsigned byte converted to float exactly, then
+ * one IEEE single division): the same floats, bit for bit. A product by
+ * 1.0f / 255.0f would not be (126 of the 256 bytes round differently). Off
+ * on the frames XBOX_FIX_PUMP_ALT turns the pump optimizations off. */
+static float g_u8f[256];
+
+static int u8f_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XBOX_FIX_PUMP_ARGB");
+        uint32_t k;
+        on = !(e && e[0] == '0');
+        for (k = 0; k < 256; k++) g_u8f[k] = k / 255.0f;
+    }
+    return on && !d3d8_pump_alt_off();
+}
+
 static float u2f(uint32_t u) {
     union { float f; uint32_t i; } x;
     x.i = u;
@@ -315,7 +351,12 @@ static void vc_set(float *dst, uint32_t param)
 {
     uint32_t old;
     memcpy(&old, dst, 4);
-    if (old != param) { memcpy(dst, &param, 4); g_pg.vgen++; }
+    if (old != param) {
+        uint32_t c = (uint32_t)(dst - &g_pg.vconst[0][0]) >> 2;   /* which constant */
+        memcpy(dst, &param, 4);
+        g_pg.vgen++;
+        g_pg.vdirty[c >> 5] |= 1u << (c & 31u);
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -335,6 +376,11 @@ void pgraph_d3d11_init(void)
     g_pg.front_face = 0x901;            /* CCW */
     g_pg.zstencil_clear = 0xFFFFFF00u;
     g_pg.clear_rect_h = g_pg.clear_rect_v = 0x0FFF0000u;   /* whole surface until set */
+    g_pg.idx_lo = 0xFFFFFFFFu;          /* empty index list */
+    g_pg.idx_hi = 0;
+    /* The constants were just cleared behind the GPU path's copy (a
+     * second init): every one counts as changed until the next GPU draw. */
+    memset(g_pg.vdirty, 0xFF, sizeof g_pg.vdirty);
     g_pg.initialized = 1;
 
     fprintf(stderr, "[PGRAPH-D3D11] Translator initialized\n");
@@ -674,7 +720,8 @@ void pgraph_d3d11_set_hud_scale(float kx, float ky)
 
 /* The 16:9 frame (fork, port/src/hud_anchor.h). Box tags: a record
  * framed in the centred 16:9 (x scaled by k about the centre) or drawn as
- * is; frame tags: the frame is wide (menus framed) or shown whole at 16:9.
+ * is; frame tags: the frame is wide (menus framed), shown whole at 16:9 (the
+ * menus' frame), or a wide one shown whole in a 16:9 frame (k169).
  * A frame tag applies to the image the frame's overlay goes into, which
  * holds the 3D of the frame before : the mode of the image is the
  * one of the previous frame tag. Pump thread only. */
@@ -682,11 +729,13 @@ static struct {
     float k;                            /* (16/9) / shape, 0 = off */
     float k2d;                          /* (4/3) / shape for framed records, 0 = k */
     float kboxed;                       /* (4/3) / the frame's shape: 0.75 (16:9 frame), 1 (4:3 frame); 0 = 0.75 */
+    float k169;                         /* (16/9) / shape for frame tag 4, 0 = none */
     int   on;                           /* the last box tag frames */
     int   img_wide;                     /* the image being drawn is wide */
     int   next_wide;                    /* the last frame tag */
+    int   img_169, next_169;            /* the same: wide, shown in a 16:9 frame (tag 4) */
     int   tagged;                       /* a frame tag since the last image */
-    unsigned long long boxed_images, wide_images;
+    unsigned long long boxed_images, wide_images, wide169_images;
 } g_box;
 
 void pgraph_d3d11_set_box(float k)
@@ -703,6 +752,11 @@ void pgraph_d3d11_set_box_race2d(float k2d)
 void pgraph_d3d11_set_box_frame(float kboxed)
 {
     g_box.kboxed = kboxed > 0.0f ? kboxed : 0.75f;
+}
+
+void pgraph_d3d11_set_box169(float k169)
+{
+    g_box.k169 = k169 > 0.0f && k169 < 1.0f ? k169 : 0.0f;
 }
 
 /* Panels edge to edge (nv2a_pgraph_d3d11.h, PGRAPH_PANEL_TAG_MAGIC). Pump
@@ -731,28 +785,32 @@ static void panel_tag_seen(uint32_t p)
 
 static void box_tag_seen(uint32_t p)
 {
-    switch (p & 3u) {
+    switch (p & 7u) {
     case 0: case 1:
         g_box.on = (int)(p & 1u);
         g_hud.on = 0;
         break;
     default:
         g_box.img_wide = g_box.next_wide;
-        g_box.next_wide = (p & 3u) == 3u;
+        g_box.img_169 = g_box.next_169;
+        g_box.next_169 = (p & 7u) == 4u && g_box.k169 > 0.0f;
+        g_box.next_wide = (p & 7u) == 3u || g_box.next_169;
         g_box.tagged = 1;
         break;
     }
 }
 
-/* Just before an image is presented: framed unless it is a wide one. */
+/* Just before an image is presented: framed unless it is a wide one, in a
+ * 16:9 frame for a wide one of tag 4. */
 static void box_image_done(void)
 {
-    int boxed;
+    int boxed, w169;
     if (!(g_box.k > 0.0f)) return;
     boxed = !(g_box.tagged && g_box.img_wide);
+    w169 = !boxed && g_box.img_169;
     g_box.tagged = 0;
-    if (boxed) g_box.boxed_images++; else g_box.wide_images++;
-    d3d8_SetPresentBox(boxed);
+    if (boxed) g_box.boxed_images++; else if (w169) g_box.wide169_images++; else g_box.wide_images++;
+    d3d8_SetPresentBox(boxed ? D3D8_PRESENT_BOX_FRAME : w169 ? D3D8_PRESENT_BOX_169 : D3D8_PRESENT_BOX_OFF);
 }
 
 static void hud_tag_seen(uint32_t p)
@@ -849,7 +907,7 @@ static struct {
 void pgraph_d3d11_set_pass_phase_callback(pgraph_pass_phase_fn fn) { g_ph.cb = fn; }
 int  pgraph_d3d11_pass_phase(void) { return g_ph.phase; }
 
-static pgraph_image_end_fn g_image_end_cb;     /* fork: online waiting banner (nv2a_pgraph_d3d11.h) */
+static pgraph_image_end_fn g_image_end_cb;     /* fork: hook of an optional module (nv2a_pgraph_d3d11.h) */
 void pgraph_d3d11_set_image_end_callback(pgraph_image_end_fn fn) { g_image_end_cb = fn; }
 
 static void phase_set(int ph, uint32_t tag)
@@ -1329,6 +1387,44 @@ static uint32_t tex_fill_pattern(uint32_t pattern, uint32_t value)
     return result;
 }
 
+/* A texel's swizzled index is tex_fill_pattern(mask_x, x) |
+ * tex_fill_pattern(mask_y, y), the two masks disjoint; one table per axis
+ * per level holds those two terms, so the decode reads the same addresses
+ * with one OR per texel instead of two bit loops. Pump thread only. */
+static uint32_t g_swz_x[4096], g_swz_y[4096];
+
+static void tex_swizzle_tables(uint32_t mask_x, uint32_t mask_y, uint32_t lw, uint32_t lh)
+{
+    uint32_t i;
+    for (i = 0; i < lw; i++) g_swz_x[i] = tex_fill_pattern(mask_x, i);
+    for (i = 0; i < lh; i++) g_swz_y[i] = tex_fill_pattern(mask_y, i);
+}
+
+/* The decoded levels of one texture, reused from one texture to
+ * the next (kept up to 16 MB). Pump thread only. */
+static uint8_t *g_tex_scratch;
+static size_t g_tex_scratch_n;
+
+static uint8_t *tex_scratch(size_t n)
+{
+    if (n > g_tex_scratch_n) {
+        uint8_t *b = (uint8_t *)realloc(g_tex_scratch, n);
+        if (!b) return NULL;
+        g_tex_scratch = b;
+        g_tex_scratch_n = n;
+    }
+    return g_tex_scratch;
+}
+
+static void tex_scratch_trim(void)
+{
+    if (g_tex_scratch_n > (16u << 20)) {
+        free(g_tex_scratch);
+        g_tex_scratch = NULL;
+        g_tex_scratch_n = 0;
+    }
+}
+
 /* One source texel -> 0xAARRGGBB. Returns 0 for a format not decoded yet. */
 static int tex_texel_to_argb(const uint8_t *p, uint32_t color, uint32_t *out)
 {
@@ -1718,20 +1814,30 @@ extern volatile long g_tex_uploads_log;
 extern volatile double g_tex_upload_ms;
 static IDirect3DTexture8 *tex_upload(IDirect3DDevice8 *dev, int stage)
 {
-    static LARGE_INTEGER f;
-    LARGE_INTEGER a, b;
+    /* The start is read from the TSC (a few cycles) rather than QPC,
+     * on every bind (~3,000 per image), and converted to ms only when an
+     * upload happened (rare), with the TSC rate measured against QPC since
+     * the first bind. Diagnostic only (XBOX_FPS_LOG). */
+    static LARGE_INTEGER f, q0;
+    static unsigned long long c0;
+    unsigned long long a;
     unsigned before = g_tc_uploads;
     IDirect3DTexture8 *t;
     double pt = g_perf_on ? perf_now() : 0.0;
-    if (!f.QuadPart) QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&a);
+    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q0); c0 = __rdtsc(); }
+    a = __rdtsc();
     t = tex_upload_impl(dev, stage);
     if (g_perf_on) perf_add(PZ_TEX, perf_now() - pt);
     if (g_tc_uploads != before) {
-        QueryPerformanceCounter(&b);
+        LARGE_INTEGER q;
+        unsigned long long b = __rdtsc();
+        double el_ms;
+        QueryPerformanceCounter(&q);
+        el_ms = (double)(q.QuadPart - q0.QuadPart) * 1000.0 / (double)f.QuadPart;
         g_tex_uploads_log++;
         if (g_perf_on) perf_count(PC_TEXUP, 1);
-        g_tex_upload_ms += (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+        if (el_ms > 0.0 && b > c0)
+            g_tex_upload_ms += (double)(b - a) * el_ms / (double)(b - c0);
     }
     return t;
 }
@@ -1746,6 +1852,7 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
     uint32_t xfmt = 0, block_bytes = 0, sig = 0;
     int fresh = hd_alt_fresh();              /* test (XBOX_HD_TEXTURES_ALT) */
     const uint8_t *src;
+    uint8_t *dec = NULL;                     /* the decoded levels, level 0 first */
     IDirect3DTexture8 *tex = NULL;
     D3DLOCKED_RECT lr;
     HRESULT hr;
@@ -1846,28 +1953,31 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
         }
     }
 
+    /* Every level is finished first (DXT: the guest's own blocks;
+     * otherwise decoded into one reused buffer), then the texture is made in
+     * one call with them as initial data (d3d8_CreateTextureWithData): the
+     * same texels in the same format as CreateTexture + LockRect / UnlockRect
+     * per level, without the level-0 copy kept for the texture's life and
+     * one UpdateSubresource per level. */
+    (void)lr;
     if (dxt) {
         uint32_t off = 0;
+        const void *bits[16];
 
         src = va_ptr(offset, total);
         if (!src) return NULL;
 
-        hr = dev->lpVtbl->CreateTexture(dev, w, h, levels, 0, xfmt, 0, &tex);
-        if (FAILED(hr) || !tex) return NULL;
-
         for (level = 0; level < levels; level++) {
-            uint32_t n = tex_level_bytes(color, w, h, level);
-            memset(&lr, 0, sizeof lr);
-            if (SUCCEEDED(tex->lpVtbl->LockRect(tex, level, &lr, NULL, 0)) && lr.pBits) {
-                memcpy(lr.pBits, src + off, n);
-                tex->lpVtbl->UnlockRect(tex, level);
-            }
-            off += n;
+            bits[level] = src + off;
+            off += tex_level_bytes(color, w, h, level);
         }
+        hr = d3d8_CreateTextureWithData(w, h, levels, xfmt, bits, &tex);
+        if (FAILED(hr) || !tex) return NULL;
     } else {
         uint32_t bpt = tex_bytes_per_texel(color);
-        uint32_t pitch, need, y, x, off = 0;
+        uint32_t pitch, need, y, x, off = 0, doff = 0, dsize = 0;
         int swizzled = tex_is_swizzled(color);
+        const void *bits[16];
 
         if (bpt == 0) return NULL;
 
@@ -1881,36 +1991,42 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
         src = va_ptr(offset, need);
         if (!src) return NULL;
 
-        hr = dev->lpVtbl->CreateTexture(dev, w, h, levels, 0, XFMT_LIN_A8R8G8B8, 0, &tex);
-        if (FAILED(hr) || !tex) return NULL;
+        for (level = 0; level < levels; level++) {
+            uint32_t lw = w >> level, lh = h >> level;
+            dsize += (lw ? lw : 1) * (lh ? lh : 1) * 4;
+        }
+        dec = tex_scratch(dsize);
+        if (!dec) return NULL;
 
         for (level = 0; level < levels; level++) {
             uint32_t lw = w >> level, lh = h >> level;
             uint32_t mask_x = 0, mask_y = 0;
+            const uint8_t *ls = src + off;
             if (!lw) lw = 1;
             if (!lh) lh = 1;
-            if (swizzled)
+            if (swizzled) {
                 tex_swizzle_masks(lw, lh, &mask_x, &mask_y);
-            memset(&lr, 0, sizeof lr);
-            if (SUCCEEDED(tex->lpVtbl->LockRect(tex, level, &lr, NULL, 0)) && lr.pBits) {
-                const uint8_t *ls = src + off;
-                for (y = 0; y < lh; y++) {
-                    uint32_t *row = (uint32_t *)((uint8_t *)lr.pBits + y * lr.Pitch);
-                    for (x = 0; x < lw; x++) {
-                        const uint8_t *p = swizzled
-                            ? ls + bpt * (tex_fill_pattern(mask_x, x)
-                                        | tex_fill_pattern(mask_y, y))
-                            : ls + y * pitch + x * bpt;
-                        uint32_t argb;
-                        if (!tex_texel_to_argb(p, color, &argb))
-                            argb = 0xFFFF00FFu;   /* undecoded format: obvious magenta */
-                        row[x] = argb;
-                    }
-                }
-                tex->lpVtbl->UnlockRect(tex, level);
+                tex_swizzle_tables(mask_x, mask_y, lw, lh);
             }
+            bits[level] = dec + doff;
+            for (y = 0; y < lh; y++) {
+                uint32_t *row = (uint32_t *)(dec + doff + (size_t)y * lw * 4);
+                uint32_t sy = swizzled ? g_swz_y[y] : 0;
+                for (x = 0; x < lw; x++) {
+                    const uint8_t *p = swizzled
+                        ? ls + bpt * (g_swz_x[x] | sy)
+                        : ls + y * pitch + x * bpt;
+                    uint32_t argb;
+                    if (!tex_texel_to_argb(p, color, &argb))
+                        argb = 0xFFFF00FFu;   /* undecoded format: obvious magenta */
+                    row[x] = argb;
+                }
+            }
+            doff += lw * lh * 4;
             off += lw * lh * bpt;
         }
+        hr = d3d8_CreateTextureWithData(w, h, levels, XFMT_LIN_A8R8G8B8, bits, &tex);
+        if (FAILED(hr) || !tex) return NULL;
     }
 
     {
@@ -1946,8 +2062,11 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
         const char *pre = getenv("XBOX_TEX_DUMP");
         static unsigned dn = 0;
         D3DLOCKED_RECT dr;
-        if (pre && tex && dn < 40 &&
-            SUCCEEDED(tex->lpVtbl->LockRect(tex, 0, &dr, NULL, 0)) && dr.pBits) {
+        /* The decoded level 0 (the texture keeps no copy to lock);
+         * DXT textures, not BGRA, are not dumped. */
+        dr.pBits = dec;
+        dr.Pitch = (INT)(w * 4);
+        if (pre && tex && dn < 40 && dec) {
             char path[512];
             FILE *f;
             unsigned row = (w * 3 + 3) & ~3u, imgsz = row * h, y, x;
@@ -1989,7 +2108,6 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
                         w, h, (unsigned)color, offset, (void *)tex, path);
                 fflush(stderr);
             }
-            tex->lpVtbl->UnlockRect(tex, 0);
         }
     }
 
@@ -2016,7 +2134,7 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
             IDirect3DTexture8 *icons = NULL;
             if (!linear && btnicons_on()) {
                 uint32_t n0 = tex_level_bytes(color, w, h, 0);
-                icons = btnicons_compose(va_ptr(offset, n0), n0, w, h, color, tex);
+                icons = btnicons_compose(va_ptr(offset, n0), n0, w, h, color, dec);
                 if (icons) {
                     tex->lpVtbl->Release(tex);
                     tex = icons;
@@ -2039,6 +2157,7 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
             }
         }
     }
+    tex_scratch_trim();
     g_pg.tex[stage].d3d        = tex;
     g_pg.tex[stage].d3d_offset = offset;
     g_pg.tex[stage].d3d_format = fmt;
@@ -2059,15 +2178,74 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
     return tex;
 }
 
-static void apply_draw_state(IDirect3DDevice8 *dev)
+/* XBOX_FIX_PUMP_RSKIP, default 1; 0 = every call as before: a D3D8
+ * render state or texture stage state that the device already holds is not
+ * set again. dev_SetRenderState and dev_SetTextureStageState (d3d8_device.c)
+ * only store the value, and the first counts the call for a log line; none
+ * of the render states set here lies in the range that marks the combiners
+ * dirty (D3DRS_PSALPHAINPUTS0..D3DRS_PSINPUTTEXTURE, 200..253). The device's
+ * own arrays are compared, so whatever else wrote them in between is seen.
+ * Decided once per draw (apply_draw_state); off on the frames
+ * XBOX_FIX_PUMP_ALT turns the pump optimizations off. */
+extern const DWORD *d3d8_GetRenderStates(void);
+extern const DWORD *d3d8_GetTSS(DWORD stage);
+static int g_rskip;
+
+static int pump_rskip_on(void)
 {
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_FOGENABLE, FALSE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_SPECULARENABLE, FALSE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILENABLE, FALSE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_COLORWRITEENABLE, 0xF);
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_RSKIP"); on = !(e && e[0] == '0'); }
+    return on && !d3d8_pump_alt_off();
+}
+
+/* 256 render states, 4 stages of 32 stage states: the arrays the device
+ * keeps (MAX_RENDER_STATES, MAX_TEXTURE_STAGES, MAX_TSS_STATES in
+ * d3d8_device.c); anything beyond them is passed on as before. */
+static void rs_set(IDirect3DDevice8 *dev, D3DRENDERSTATETYPE s, DWORD v)
+{
+    static const DWORD *rs;
+    if (g_rskip) {
+        if (!rs) rs = d3d8_GetRenderStates();
+        if (rs && (DWORD)s < 256 && rs[s] == v) {
+            if (g_perf_detail) perf_count(PC_RSKIP, 1);    /* a call per write costs about what it saves */
+            return;
+        }
+    }
+    dev->lpVtbl->SetRenderState(dev, s, v);
+}
+
+static void tss_set(IDirect3DDevice8 *dev, DWORD st, D3DTEXTURESTAGESTATETYPE t, DWORD v)
+{
+    if (g_rskip && st < 4 && (DWORD)t < 32) {
+        static const DWORD *tp[4];      /* the device's static arrays, asked once (as rs above) */
+        const DWORD *tss = tp[st] ? tp[st] : (tp[st] = d3d8_GetTSS(st));
+        if (tss && tss[t] == v) {
+            if (g_perf_detail) perf_count(PC_RSKIP, 1);    /* XBOX_PERF_DETAIL only, as above */
+            return;
+        }
+    }
+    dev->lpVtbl->SetTextureStageState(dev, st, t, v);
+}
+
+/* prog: called by draw_program, which sets ZENABLE, FOGENABLE,
+ * SPECULARENABLE, STENCILENABLE, COLORWRITEENABLE, ALPHABLENDENABLE,
+ * SRCBLEND and DESTBLEND again right after, unconditionally, before anything
+ * reads them: with XBOX_FIX_PUMP_RSKIP those eight are left to it, so
+ * that they do not change twice per draw and its own compare can skip them. */
+static void apply_draw_state_ex(IDirect3DDevice8 *dev, int prog)
+{
+    int all;
+    g_rskip = pump_rskip_on();
+    all = !(prog && g_rskip);
+    if (all) rs_set(dev, D3DRS_ZENABLE, FALSE);
+    rs_set(dev, D3DRS_LIGHTING, FALSE);
+    rs_set(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+    if (all) {
+        rs_set(dev, D3DRS_FOGENABLE, FALSE);
+        rs_set(dev, D3DRS_SPECULARENABLE, FALSE);
+        rs_set(dev, D3DRS_STENCILENABLE, FALSE);
+        rs_set(dev, D3DRS_COLORWRITEENABLE, 0xF);
+    }
     /* XBOX_TEST_NOBLEND=1 forces blending off. Every draw here uses
      * SRCALPHA/INVSRCALPHA, so a source alpha of zero makes the draw a no-op
      * and is indistinguishable from "the draw never happened" when all you can
@@ -2079,11 +2257,12 @@ static void apply_draw_state(IDirect3DDevice8 *dev)
             const char *e = getenv("XBOX_TEST_NOBLEND");
             noblend = (e && e[0] == '1') ? 1 : 0;
         }
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE,
-                                    noblend ? FALSE : TRUE);
+        if (all) rs_set(dev, D3DRS_ALPHABLENDENABLE, noblend ? FALSE : TRUE);
     }
-    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    if (all) {
+        rs_set(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        rs_set(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    }
     dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
     /* Sample the title's own texture when it has bound one. Stage 0 is
      * enabled by SET_TEXTURE_CONTROL0 bit 30; without that, or when the
@@ -2093,28 +2272,30 @@ static void apply_draw_state(IDirect3DDevice8 *dev)
         IDirect3DTexture8 *t = g_pg.tex[0].enabled ? tex_upload(dev, 0) : NULL;
         if (t) {
             dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture8 *)t);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 1, 4 /*COLOROP   = MODULATE*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 2, 2 /*COLORARG1 = TEXTURE*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 3, 0 /*COLORARG2 = DIFFUSE*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 4, 4 /*ALPHAOP   = MODULATE*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 5, 2 /*ALPHAARG1 = TEXTURE*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 6, 0 /*ALPHAARG2 = DIFFUSE*/);
+            tss_set(dev, 0, 1, 4 /*COLOROP   = MODULATE*/);
+            tss_set(dev, 0, 2, 2 /*COLORARG1 = TEXTURE*/);
+            tss_set(dev, 0, 3, 0 /*COLORARG2 = DIFFUSE*/);
+            tss_set(dev, 0, 4, 4 /*ALPHAOP   = MODULATE*/);
+            tss_set(dev, 0, 5, 2 /*ALPHAARG1 = TEXTURE*/);
+            tss_set(dev, 0, 6, 0 /*ALPHAARG2 = DIFFUSE*/);
             /* The title's own address modes (checked against xemu): clamping
              * every texture smeared the wrapped ones. */
             {
                 uint32_t au = g_pg.tex[0].address & 0xF, av = (g_pg.tex[0].address >> 8) & 0xF;
-                dev->lpVtbl->SetTextureStageState(dev, 0, 13, au >= 1 && au <= 4 ? au : 3 /*ADDRESSU*/);
-                dev->lpVtbl->SetTextureStageState(dev, 0, 14, av >= 1 && av <= 4 ? av : 3 /*ADDRESSV*/);
+                tss_set(dev, 0, 13, au >= 1 && au <= 4 ? au : 3 /*ADDRESSU*/);
+                tss_set(dev, 0, 14, av >= 1 && av <= 4 ? av : 3 /*ADDRESSV*/);
             }
         } else {
             dev->lpVtbl->SetTexture(dev, 0, NULL);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 1, 2 /*COLOROP  = SELECTARG1*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 2, 0 /*COLORARG1 = DIFFUSE*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 4, 2 /*ALPHAOP  = SELECTARG1*/);
-            dev->lpVtbl->SetTextureStageState(dev, 0, 5, 0 /*ALPHAARG1 = DIFFUSE*/);
+            tss_set(dev, 0, 1, 2 /*COLOROP  = SELECTARG1*/);
+            tss_set(dev, 0, 2, 0 /*COLORARG1 = DIFFUSE*/);
+            tss_set(dev, 0, 4, 2 /*ALPHAOP  = SELECTARG1*/);
+            tss_set(dev, 0, 5, 0 /*ALPHAARG1 = DIFFUSE*/);
         }
     }
 }
+
+static void apply_draw_state(IDirect3DDevice8 *dev) { apply_draw_state_ex(dev, 0); }
 
 /* ══════════════════════════════════════════════════════════════════════
  * Vertex-program draws
@@ -2146,6 +2327,166 @@ static void idx_push(uint32_t v)
         g_pg.idx_cap = cap;
     }
     g_pg.idx[g_pg.idx_count++] = v;
+    if (v < g_pg.idx_lo) g_pg.idx_lo = v;       /* kept for gpu_prepare */
+    if (v > g_pg.idx_hi) g_pg.idx_hi = v;
+}
+
+/* A new, empty index list (BEGIN, END). */
+static void idx_reset(void)
+{
+    g_pg.idx_count = 0;
+    g_pg.idx_lo = 0xFFFFFFFFu;
+    g_pg.idx_hi = 0;
+}
+
+/* XBOX_FIX_PUMP_IDX, default 1; 0 = one call per word as before:
+ * whole runs of index words and of transform constants in one call from the
+ * push-buffer parser (nv2a_live_pb.c) instead of one pgraph_d3d11_method per
+ * word -- about half the title's ~84,000 method words per image are index
+ * words. Same values, same order, same counters; the smallest / largest
+ * index is kept as the list grows, so gpu_prepare does not scan it again.
+ * Off on the frames XBOX_FIX_PUMP_ALT turns the pump optimizations off. */
+static int pump_idx_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_IDX"); on = !(e && e[0] == '0'); }
+    return on && !d3d8_pump_alt_off();
+}
+
+int pgraph_d3d11_index16_run(int subchannel, const uint32_t *w, uint32_t n)
+{
+    uint32_t need, i, lo, hi, *dst;
+    if (!g_pg.initialized || subchannel != 0 || n == 0 || !pump_idx_on())
+        return 0;
+    need = g_pg.idx_count + 2u * n;
+    if (need > g_pg.idx_cap) {          /* the capacities idx_push would reach */
+        uint32_t cap = g_pg.idx_cap ? g_pg.idx_cap : 4096;
+        uint32_t *nb;
+        while (cap < need) cap *= 2;
+        nb = (uint32_t *)realloc(g_pg.idx, cap * sizeof *nb);
+        if (!nb) return 0;              /* one word at a time, as before */
+        g_pg.idx = nb;
+        g_pg.idx_cap = cap;
+    }
+    dst = g_pg.idx + g_pg.idx_count;
+    lo = g_pg.idx_lo;
+    hi = g_pg.idx_hi;
+    for (i = 0; i < n; i++) {           /* two 16-bit indices per word, low half first */
+        uint32_t a = w[i] & 0xFFFFu, b = w[i] >> 16;
+        dst[2 * i] = a;
+        dst[2 * i + 1] = b;
+        if (a < lo) lo = a;
+        if (a > hi) hi = a;
+        if (b < lo) lo = b;
+        if (b > hi) hi = b;
+    }
+    g_pg.idx_count = need;
+    g_pg.idx_lo = lo;
+    g_pg.idx_hi = hi;
+    g_pg.stats.methods_handled += n;
+    return 1;
+}
+
+/* The words of an incrementing run from SET_TRANSFORM_CONSTANT + 4 * k,
+ * as pgraph_d3d11_method would take them one by one; returns how many were
+ * taken (those that stay inside the 32-word register window), 0 = none. */
+uint32_t pgraph_d3d11_xfconst_run(int subchannel, uint32_t method, const uint32_t *w, uint32_t n)
+{
+    uint32_t slot, i;
+    if (!g_pg.initialized || subchannel != 0 || n == 0 || !pump_idx_on() ||
+        method < NV097_SET_TRANSFORM_CONSTANT || method > NV097_SET_TRANSFORM_CONSTANT + 0x7C)
+        return 0;
+    slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
+    if (n > 32u - slot) n = 32u - slot;
+    for (i = 0; i < n; i++, slot++) {
+        if (g_pg.const_load < VSHCPU_CONSTANTS) {
+            vc_set(&g_pg.vconst[g_pg.const_load][slot % 4], w[i]);
+            if (slot % 4 == 3)
+                g_pg.const_load++;
+        }
+    }
+    g_pg.stats.methods_handled += n;
+    if (g_perf_detail) g_mg_brk = 1;    /* a state write (merge count, XBOX_PERF_DETAIL) */
+    return n;
+}
+
+/* A vertex stream's offset / format set (SET_VERTEX_DATA_ARRAY_OFFSET /
+ * _FORMAT + 4 * slot): one place for the word-by-word path and the runs, so
+ * that the first eight of each are logged once, as before. */
+static void va_offset_set(uint32_t slot, uint32_t param)
+{
+    static int logged = 0;
+    g_pg.vattr[slot].offset = param;
+    if (logged < 8) {
+        logged++;
+        fprintf(stderr, "[PGRAPH-D3D11] bind attr %u offset=0x%08X "
+                "(format currently 0x%08X)\n", slot, param, g_pg.vattr[slot].format);
+        fflush(stderr);
+    }
+}
+
+static void va_format_set(uint32_t slot, uint32_t param)
+{
+    static int logged = 0;
+    g_pg.vattr[slot].format = param;
+    if (logged < 8) {
+        logged++;
+        fprintf(stderr, "[PGRAPH-D3D11] attr %u format=0x%08X "
+                "(type %u size %u stride %u)\n", slot, param,
+                param & 0xF, (param >> 4) & 0xF, (param >> 8) & 0xFFFFFF);
+        fflush(stderr);
+    }
+}
+
+/* XBOX_FIX_PUMP_IDX: an incrementing run of plain register words from
+ * `method` taken in one call, as pgraph_d3d11_method would take them one by
+ * one -- transform constants and program words, vertex stream offsets and
+ * formats, attribute constants (SET_VERTEX_DATA4F_M): about a third of the
+ * title's words after the indices. Same stores in the same order, same
+ * counters and log lines. Returns how many words it took from the front of
+ * the run (those inside the method's array), 0 = none: the caller goes on
+ * word by word. */
+uint32_t pgraph_d3d11_run(int subchannel, uint32_t method, const uint32_t *w, uint32_t n)
+{
+    uint32_t i, slot;
+    if (!g_pg.initialized || subchannel != 0 || n == 0 || !pump_idx_on())
+        return 0;
+    if (method >= NV097_SET_TRANSFORM_CONSTANT && method <= NV097_SET_TRANSFORM_CONSTANT + 0x7C)
+        return pgraph_d3d11_xfconst_run(subchannel, method, w, n);
+    if (method >= NV097_SET_TRANSFORM_PROGRAM && method <= NV097_SET_TRANSFORM_PROGRAM + 0x7C) {
+        slot = (method - NV097_SET_TRANSFORM_PROGRAM) / 4;
+        if (n > 32u - slot) n = 32u - slot;
+        for (i = 0; i < n; i++, slot++) {
+            if (g_pg.prog_load < VSHCPU_SLOTS) {
+                g_pg.prog[g_pg.prog_load][slot % 4] = w[i];
+                g_pg.prog_dirty = 1;
+                if (slot % 4 == 3)
+                    g_pg.prog_load++;
+            }
+        }
+        if (g_perf_detail) g_mg_brk = 1;
+    } else if (method >= NV2A_VA_OFFSET_BASE && method < NV2A_VA_OFFSET_BASE + NV2A_VA_SLOTS * 4) {
+        slot = (method - NV2A_VA_OFFSET_BASE) >> 2;
+        if (n > NV2A_VA_SLOTS - slot) n = NV2A_VA_SLOTS - slot;
+        for (i = 0; i < n; i++)
+            va_offset_set(slot + i, w[i]);           /* stream offsets: no break of the merge count */
+    } else if (method >= NV2A_VA_FORMAT_BASE && method < NV2A_VA_FORMAT_BASE + NV2A_VA_SLOTS * 4) {
+        slot = (method - NV2A_VA_FORMAT_BASE) >> 2;
+        if (n > NV2A_VA_SLOTS - slot) n = NV2A_VA_SLOTS - slot;
+        for (i = 0; i < n; i++)
+            va_format_set(slot + i, w[i]);
+        if (g_perf_detail) g_mg_brk = 1;
+    } else if (method >= NV097_SET_VERTEX_DATA4F_M && method <= NV097_SET_VERTEX_DATA4F_M + 0xFC) {
+        slot = (method - NV097_SET_VERTEX_DATA4F_M) / 4;
+        if (n > 64u - slot) n = 64u - slot;
+        va_const_init();
+        for (i = 0; i < n; i++, slot++)
+            g_pg.vattr_const[slot / 4][slot % 4] = u2f(w[i]);
+        if (g_perf_detail) g_mg_brk = 1;
+    } else
+        return 0;
+    g_pg.stats.methods_handled += n;
+    return n;
 }
 
 /* One attribute as a vertex program reads it: absent components default to
@@ -2259,6 +2600,12 @@ static int vsh_active(void)
                 for (q = 0; q < sizeof g_pg.prog_dec[k]; q++)
                     g_pg.prog_hash = (g_pg.prog_hash ^ b[q]) * 1099511628211ull;
             }
+            /* A program that stores to constant memory runs on the CPU
+             * only (gpu_prepare) and its stores bypass vc_set: every constant
+             * counts as changed until the next GPU draw, which can only come
+             * after another program is decoded here. */
+            if (g_pg.prog_writes_c)
+                memset(g_pg.vdirty, 0xFF, sizeof g_pg.vdirty);
         }
         {
             static int log = -1;
@@ -2444,23 +2791,100 @@ static uint32_t assemble(uint32_t mode, const ProgVertex *v, const uint8_t *ok,
  * the DMA offset is the physical address). D3DDevice_GetVisibilityTestResult
  * (0x169010) reads status/value; Render_ReadVisibilityTestResult spins up to
  * 0x100000 times while the status reads "pending". These methods used to be
- * ignored: the report never landed, every test spun to its limit and read
- * 0, and the lens flare never showed.
+ * ignored, and the report pages were not allocated either: no report
+ * landed, every test read 0 at once (its wait did not turn), and the lens
+ * flare never showed.
  *
  * Each ENABLE(1)..ENABLE(0) span is one D3D11 occlusion query; GET_REPORT
  * queues a report job over the spans counted since the last clear; the pump
  * polls jobs without blocking and writes value then status when all spans
  * are done. Counts are scaled back to title pixels. XBOX_FIX_OCCLUSION=0
- * restores the old behaviour (methods ignored). */
+ * restores the old behaviour (methods ignored).
+ *
+ * Gone past: the title reads an image's reports at the start of its
+ * next image (LensFX, 0x1046A0), before that image's own tests and before
+ * its end. A report still pending when the pump reaches a test or the end of
+ * a later image was written after the title had gone past that read: its
+ * wait ran out and it took 1 pixel for the test (a faint halo, or the sun
+ * cut, for one image), or it did not wait for that report. Each is counted
+ * once; the first is logged, the total is in [OCCL] (XBOX_LOG_STATS=1). The
+ * count is a lower bound of the reports written late, and no bound of the
+ * title's waits that ran out, either way: a report written after the title
+ * went on but before the pump reached its next test or end (the poll at the
+ * head of a tick comes before the write pointer is read) is not counted, and
+ * a report the title did not wait for is. Only the title's own wait loop can
+ * count its waits that ran out. It is counted only while the title flips its
+ * surfaces (pgraph_d3d11_flipping): on the clear path (menus, videos) an
+ * image ends at every clear after draws, several to one of the title's, and
+ * the count would mean nothing there.
+ *
+ * Diagnostic: XBOX_OCCL_LOG=2 logs every report requested and every
+ * report written, with its image; [OCCL] (XBOX_LOG_STATS=1) counts the
+ * reports requested, written and pending (requested = written + pending at
+ * any time: a report lost on the way breaks it), where they were written, and
+ * the reports requested with a fence mark (O-B); a third line counts the
+ * reports that waited for an older one at their address (Order below), those
+ * whose value the scale of the moment of the write would have changed (Scale
+ * below: the value written before that fix), and the reports past their mark
+ * whose query still said "not yet" without a flush (O-B: a driver that does
+ * not have the result by then; they are written at the head, no sooner).
+ *
+ * Scale: a report's samples are scaled back to title pixels with the
+ * scale of its GET_REPORT (d3d8_OcclusionScale then: the target its spans
+ * were counted on), not with the one of the moment it is written. A change of
+ * anti-aliasing, size or render scale applied at a Present, or a later span
+ * begun on a target of another scale, no longer changes a report still
+ * pending, and its value no longer depends on where it is written.
+ *
+ * Sooner (O-B): the poll at the head of the pump's tick comes after the
+ * end of the image, its post, the Present's waits and the DXGI Present, all
+ * translated in the tick before: a report whose queries the GPU finished
+ * during those waited for them all. Each GET_REPORT now also puts a fence
+ * mark after its queries (d3d8_OcclusionMark, before the flush that sends
+ * them), and the reports whose mark the GPU is past are written at the end
+ * of the image too (occ_image_end) and just before the DXGI Present (after
+ * its waits: d3d8_sync_set_before_present), on the pump's thread. The fence
+ * is read without GetData, which under DXVK may submit when it answers "not
+ * yet"; the Signal submits what is queued, as the flush that follows it does,
+ * so no submission is added with DXVK's default settings (see
+ * d3d8_OcclusionMark for the two cases where one is). The values are those of
+ * the head's poll: a finished query's count is final, and the sum, the scale
+ * (that of the GET_REPORT, see above), the rounding and the order, value then
+ * status, are the same; only the moment they are written changes, and with
+ * it the timestamp (the QPC of the write), which the title does not read
+ * (0x169010 is called with 0 for it).
+ * On by default; XBOX_FIX_OCCL_EARLY=0 (diagnostic): at the head only, as
+ * before. With XBOX_FIX_PUMP_ALT=1 (identity test) the reports requested in
+ * one presented frame in two get a mark (those with the flush), and only they
+ * are written sooner, wherever that falls.
+ *
+ * Order: the GPU writes the reports in the order of the push buffer.
+ * Two reports pending at one address (the title went past the first one and
+ * asked again) were written in the order of the table, which a removal
+ * reshuffled (the last job took the place of the one written), and a newer
+ * report done first was written first: the older one then overwrote it. The
+ * jobs are now kept in their order, and a report waits while an older one at
+ * its address is pending, wherever it is written: at one address the last
+ * value written is the newest's, and no place can write a report ahead of an
+ * older one there (with XBOX_FIX_PUMP_ALT=1, an unmarked report is older than
+ * the marked one of the next frame). */
 #define OCC_SPANS 16
 #define OCC_JOBS  64
 typedef struct { int h; int refs; int ready; unsigned long long n; } OccSpan;
 static OccSpan  g_occ_span[256];
 static int      g_occ_open = -1;                 /* span being counted */
 static int      g_occ_cur[OCC_SPANS], g_occ_ncur;/* spans since the last clear */
-static struct { uint32_t addr; int span[OCC_SPANS]; int n; LARGE_INTEGER t0; } g_occ_job[OCC_JOBS];
+static unsigned long long g_occ_past;            /* reports gone past before they were written */
+static unsigned long long g_occ_at[3];           /* written at the tick's head, the image's end, before the DXGI Present */
+static unsigned long long g_occ_requested, g_occ_marked;   /* reports queued, and those with a fence mark */
+static unsigned long long g_occ_held, g_occ_rescaled, g_occ_notyet;   /* third [OCCL] line, see Diagnostic */
+static DWORD    g_occ_tid;                       /* the pump's thread (the jobs are its own) */
+static struct { uint32_t addr; int span[OCC_SPANS]; int n; LARGE_INTEGER t0; unsigned img; int past;
+                unsigned long long mark; float scale; int held, notyet; } g_occ_job[OCC_JOBS];
 static int      g_occ_njob;
 static unsigned long long g_occ_reports, g_occ_lat_us, g_occ_dropped;
+void xbox_occl_wake(void);              /* xbox_memory_layout.c: the title's wait asleep on a status (XBOX_FIX_OCCLWAIT) */
+void xbox_occl_wait_report(void);
 
 /* No room for a query, a span or a report: an error, written when it
  * happens (the first 20); the [OCCL] summary is a statistic. */
@@ -2493,6 +2917,32 @@ static void occ_clear(void)
     g_occ_ncur = 0;
 }
 
+/* At a test, or at the end of an image: the reports still pending from
+ * an earlier image were gone past (see above). */
+static void occ_past(void)
+{
+    int j;
+    if (!pgraph_d3d11_flipping()) return;            /* the clear path: see Gone past */
+    for (j = 0; j < g_occ_njob; j++) {
+        if (g_occ_job[j].past || g_occ_job[j].img == g_pg.frame_no) continue;
+        g_occ_job[j].past = 1;
+        if (!g_occ_past++) {
+            fprintf(stderr, "[OCCL] a visibility test's report gone past before it was written (image %u, at image %u): "
+                    "the title went on without it (its wait ran out, or it did not wait for it); counted in [OCCL] "
+                    "(XBOX_LOG_STATS=1), a lower bound\n", g_occ_job[j].img, g_pg.frame_no);
+            xbox_log_flush();
+        }
+    }
+}
+
+/* XBOX_OCCL_LOG=2 (diagnostic): every report requested and written. */
+static int occ_log_all(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_OCCL_LOG"); on = e && e[0] == '2'; }
+    return on;
+}
+
 static void occ_enable(int on)
 {
     if (on && g_occ_open < 0) {
@@ -2507,6 +2957,28 @@ static void occ_enable(int on)
         else { occ_unref(g_occ_open); occ_drop("16 spans since the last clear: span"); }
         g_occ_open = -1;
     }
+}
+
+static void occ_poll(int at);
+static void occ_before_present(void);
+void d3d8_sync_set_before_present(void (*fn)(void));    /* d3d8_sync.h */
+
+/* O-B: on by default; XBOX_FIX_OCCL_EARLY=0 (diagnostic): the reports
+ * are written at the head of the pump's tick only. First called at the first
+ * report, on the pump's thread. */
+static int occ_early_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XBOX_FIX_OCCL_EARLY");
+        on = !(e && e[0] == '0');
+        if (on) {
+            g_occ_tid = GetCurrentThreadId();
+            d3d8_sync_set_before_present(occ_before_present);
+        } else
+            fprintf(stderr, "[OCCL] XBOX_FIX_OCCL_EARLY=0: visibility reports written at the pump's next tick only\n");
+    }
+    return on;
 }
 
 static void occ_get_report(uint32_t param)
@@ -2524,39 +2996,89 @@ static void occ_get_report(uint32_t param)
         }
     }
     if ((param >> 24) != 1) return;                   /* only the zpass pixel count */
+    if (g_occ_njob) occ_past();                       /* before this test, the earlier images' reports are read */
     if (g_occ_njob >= OCC_JOBS) { occ_drop("64 reports pending: report"); return; }
     j = g_occ_njob++;
     g_occ_job[j].addr = param & 0x00FFFFFFu;
     g_occ_job[j].n = g_occ_ncur;
     for (i = 0; i < g_occ_ncur; i++) { g_occ_job[j].span[i] = g_occ_cur[i]; g_occ_span[g_occ_cur[i]].refs++; }
     QueryPerformanceCounter(&g_occ_job[j].t0);
+    g_occ_job[j].img = g_pg.frame_no;
+    g_occ_job[j].past = 0;
+    g_occ_job[j].mark = 0;
+    g_occ_job[j].scale = d3d8_OcclusionScale();       /* that of its spans, whenever it is written */
+    g_occ_job[j].held = g_occ_job[j].notyet = 0;
+    g_occ_requested++;
     {   /* Fork: the title spins on this report until the pump writes it;
          * send the queries to the GPU now rather than at the next poll.
-         * XBOX_FIX_PUMP_OCCFLUSH=0: no flush here (the old latency). */
+         * XBOX_FIX_PUMP_OCCFLUSH=0: no flush here (the old latency), and no
+         * mark: the report is written at the head of a tick only. */
         static int fl = -1;
         extern void d3d8_OcclusionFlush(void);
         extern int d3d8_pump_alt_off(void);
         if (fl < 0) { const char *e = getenv("XBOX_FIX_PUMP_OCCFLUSH"); fl = !(e && e[0] == '0'); }
-        if (fl && !d3d8_pump_alt_off()) d3d8_OcclusionFlush();
+        if (fl && !d3d8_pump_alt_off()) {
+            if (occ_early_on()) g_occ_job[j].mark = d3d8_OcclusionMark();   /* after its queries */
+            d3d8_OcclusionFlush();
+        }
     }
+    if (g_occ_job[j].mark) g_occ_marked++;
+    if (occ_log_all())      /* XBOX_OCCL_LOG=2 (diagnostic) */
+        fprintf(stderr, "[OCCL] request at %08X, image %u%s\n", g_occ_job[j].addr, g_occ_job[j].img,
+                g_occ_job[j].mark ? ", marked" : "");
+}
+
+/* The end of an image, before its Present (both paths): the reports
+ * gone past, then (O-B) the reports done are written. */
+static void occ_image_end(void)
+{
+    if (!g_occ_njob) return;
+    occ_past();
+    if (occ_early_on()) occ_poll(1);
 }
 
 /* Reports the title is (or will be) waiting for: the pump does not sleep
  * while there is one (XBOX_FIX_PUMP_OCCWAIT, xbox_memory_layout.c). */
 int pgraph_d3d11_reports_pending(void) { return g_occ_njob; }
 
-/* Pump thread, every tick: write the reports whose spans are all counted. */
-void pgraph_d3d11_poll_reports(void)
+/* 1 while a report older than job j is pending at its address (the
+ * jobs are in their order: those before j are older, and pending). */
+static int occ_older_at_addr(int j)
 {
+    int k;
+    for (k = 0; k < j; k++)
+        if (g_occ_job[k].addr == g_occ_job[j].addr) return 1;
+    return 0;
+}
+
+/* Pump thread: write the reports whose spans are all counted, in their
+ * order at each address (see Order above). at 0: the head of a tick, every
+ * report, GetData flag 0 (as before); 1, 2 (O-B): the end of an image,
+ * just before the DXGI Present, only the reports whose mark the GPU is past,
+ * GetData without its flush. */
+static void occ_poll(int at)
+{
+    unsigned long long passed = 0;
     int j = 0, i;
+    if (at && !(passed = d3d8_OcclusionMarkDone())) return;
     while (j < g_occ_njob) {
         unsigned long long sum = 0;
         int done = 1;
+        if (at && (!g_occ_job[j].mark || g_occ_job[j].mark > passed)) { j++; continue; }
+        if (occ_older_at_addr(j)) {                     /* after the older one */
+            if (!g_occ_job[j].held) { g_occ_job[j].held = 1; g_occ_held++; }
+            j++;
+            continue;
+        }
         for (i = 0; i < g_occ_job[j].n; i++) {
             OccSpan *sp = &g_occ_span[g_occ_job[j].span[i]];
             if (!sp->ready) {
-                int r = d3d8_OcclusionPoll(sp->h, &sp->n);
-                if (r == 0) { done = 0; break; }
+                int r = at ? d3d8_OcclusionPollDone(sp->h, &sp->n) : d3d8_OcclusionPoll(sp->h, &sp->n);
+                if (r == 0) {
+                    if (at && !g_occ_job[j].notyet) { g_occ_job[j].notyet = 1; g_occ_notyet++; }
+                    done = 0;
+                    break;
+                }
                 sp->ready = 1;
                 if (r < 0) sp->n = 0;
             }
@@ -2566,9 +3088,11 @@ void pgraph_d3d11_poll_reports(void)
         {
             uint8_t *p = (g_pg_mem_base && g_occ_job[j].addr + 16 <= g_pg_mem_size)
                        ? g_pg_mem_base + g_occ_job[j].addr : NULL;
-            float scale = d3d8_OcclusionScale();
+            float scale = g_occ_job[j].scale;               /* taken at its GET_REPORT */
             uint32_t v = (uint32_t)((double)sum / (scale > 0.0f ? scale : 1.0f) + 0.5);
+            float now = d3d8_OcclusionScale();             /* the scale of this moment (as before the fix) */
             LARGE_INTEGER t1, f;
+            if ((uint32_t)((double)sum / (now > 0.0f ? now : 1.0f) + 0.5) != v) g_occ_rescaled++;
             QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
             if (p) {
                 uint64_t ts = (uint64_t)t1.QuadPart;
@@ -2576,6 +3100,7 @@ void pgraph_d3d11_poll_reports(void)
                 *(volatile uint32_t *)(p + 8) = v;
                 MemoryBarrier();
                 *(volatile uint32_t *)(p + 12) = 0;          /* status: done */
+                xbox_occl_wake();                            /* the game thread, if asleep on it (XBOX_FIX_OCCLWAIT) */
             }
             {   /* XBOX_OCCL_LOG=1 (diagnostic): a sample of the values written */
                 static int logv = -1;
@@ -2586,10 +3111,30 @@ void pgraph_d3d11_poll_reports(void)
             }
             g_occ_reports++;
             g_occ_lat_us += (unsigned long long)((t1.QuadPart - g_occ_job[j].t0.QuadPart) * 1000000 / f.QuadPart);
+            g_occ_at[at]++;
+            {   /* XBOX_OCCL_LOG=2 (diagnostic): every report written, with its image */
+                static const char *const where[3] = { "at the tick's head", "at the image's end", "just before the DXGI Present" };
+                if (occ_log_all())
+                    fprintf(stderr, "[OCCL] report at %08X = %u px, image %u, written at image %u, %s%s\n",
+                            g_occ_job[j].addr, v, g_occ_job[j].img, g_pg.frame_no, where[at],
+                            g_occ_job[j].past ? ", gone past" : "");
+            }
         }
         for (i = 0; i < g_occ_job[j].n; i++) occ_unref(g_occ_job[j].span[i]);
-        g_occ_job[j] = g_occ_job[--g_occ_njob];
+        g_occ_njob--;                       /* the others keep their order */
+        memmove(&g_occ_job[j], &g_occ_job[j + 1], (size_t)(g_occ_njob - j) * sizeof g_occ_job[0]);
     }
+}
+
+/* Pump thread, every tick: write the reports whose spans are all counted. */
+void pgraph_d3d11_poll_reports(void) { occ_poll(0); }
+
+/* O-B: d3d8_sync_present, after its waits, just before the DXGI
+ * Present; on the pump's thread only (a Present from another thread leaves
+ * the reports to the pump). */
+static void occ_before_present(void)
+{
+    if (GetCurrentThreadId() == g_occ_tid && g_occ_njob) occ_poll(2);   /* the jobs: the pump's own */
 }
 
 void pgraph_d3d11_report_occlusion(void)
@@ -2597,9 +3142,17 @@ void pgraph_d3d11_report_occlusion(void)
     static unsigned long long last;
     if (g_occ_reports == last) return;
     last = g_occ_reports;
+    fprintf(stderr, "[OCCL] %llu reports requested, %llu with a fence mark; written at the tick's head %llu, "
+            "at the image's end %llu, before the DXGI Present %llu; %llu gone past before they were written "
+            "(a lower bound of the late ones)\n", g_occ_requested, g_occ_marked, g_occ_at[0], g_occ_at[1],
+            g_occ_at[2], g_occ_past);
+    fprintf(stderr, "[OCCL] %llu waited for an older report at their address; %llu whose value the scale of the "
+            "moment of the write would change; %llu past their fence mark but not yet ready without a flush\n",
+            g_occ_held, g_occ_rescaled, g_occ_notyet);
     fprintf(stderr, "[OCCL] %llu reports written, mean latency %.2f ms, %d pending, %llu dropped\n",
             g_occ_reports, g_occ_reports ? (double)g_occ_lat_us / 1000.0 / (double)g_occ_reports : 0.0,
             g_occ_njob, g_occ_dropped);
+    xbox_occl_wait_report();
 }
 
 static void drawlog_program_draw(const uint32_t *indices, uint32_t v0, uint32_t count)
@@ -2866,7 +3419,10 @@ static int gpu_prepare(Nv2aVshDraw *d, const uint32_t *indices, uint32_t start, 
     if (g_pg.prog_writes_c) GPU_NO(2);
 
     memset(d, 0, sizeof *d);
-    if (indices) {
+    if (indices == g_pg.idx && count == g_pg.idx_count && pump_idx_on()) {
+        lo = g_pg.idx_lo;               /* kept as the list was built */
+        hi = g_pg.idx_hi;
+    } else if (indices) {
         lo = hi = indices[0];
         for (i = 1; i < count; i++) {
             if (indices[i] < lo) lo = indices[i];
@@ -2980,6 +3536,8 @@ static int gpu_prepare(Nv2aVshDraw *d, const uint32_t *indices, uint32_t start, 
     d->inputs = g_pg.prog_inputs;
     d->attr_const = (const float (*)[4])g_pg.vattr_const;
     d->vconst = (const float (*)[4])g_pg.vconst;
+    d->vgen = g_pg.vgen;
+    d->vdirty = g_pg.vdirty;
     d->screen_w = (float)d3d8_GetBackbufferWidth();
     d->screen_h = (float)d3d8_GetBackbufferHeight();
     if (d->screen_w <= 0.0f) d->screen_w = 640.0f;
@@ -3936,6 +4494,9 @@ static int hud_element(float *kx, float *ax, float *ky, float *ay)
      * before's); without it (16:9, 16:10) only the 2D changes: the mode of
      * the frame being drawn (its frame tag comes first). */
     int wide = g_box.k > 0.0f ? g_box.img_wide : g_box.next_wide;
+    /* a wide image shown in a 16:9 frame (tag 4): the x-scales of a 16:9
+     * screen, the host squeezing the image by k169 */
+    float k169 = g_box.k > 0.0f && wide && g_box.img_169 && g_box.k169 > 0.0f ? g_box.k169 : 1.0f;
     if (g_panel.on && g_ph.phase == PGRAPH_PHASE_HUD) {
         /* a panel: x at the 4:3 proportions of the image (k2d; in a
          * framed image, kboxed: 0.75 when it is shown at 16:9, 1 when at
@@ -3943,7 +4504,7 @@ static int hud_element(float *kx, float *ax, float *ky, float *ay)
          * kx < 0 says so: then ky, ay are the left and right edges, in the
          * draw's pixels (hud_vertex, and the vertex shader). */
         int boxed = g_box.k > 0.0f && !wide;
-        float k = boxed ? (g_box.kboxed > 0.0f ? g_box.kboxed : 0.75f) : g_box.k2d;
+        float k = boxed ? (g_box.kboxed > 0.0f ? g_box.kboxed : 0.75f) : g_box.k2d / k169;
         if (g_panel.wide_only && !wide) return 0;
         if (!(k > 0.0f && k < 1.0f)) {
             /* 4:3 (no race 2D, no frame), or an image already at 4:3 in
@@ -3967,7 +4528,7 @@ static int hud_element(float *kx, float *ax, float *ky, float *ay)
     if (g_box.on && wide && (g_box.k2d > 0.0f || g_box.k > 0.0f) &&
         g_ph.phase == PGRAPH_PHASE_HUD) {
         /* framed: the title's 4:3 proportions, else the centred 16:9 */
-        *kx = g_box.k2d > 0.0f ? g_box.k2d : g_box.k;
+        *kx = (g_box.k2d > 0.0f ? g_box.k2d : g_box.k) / k169;
         *ky = 1.0f;
         *ax = 0.5f * sw;
         *ay = 0.0f;
@@ -3975,7 +4536,7 @@ static int hud_element(float *kx, float *ax, float *ky, float *ay)
         return 1;
     }
     if (!(g_hud.on && g_hud.kx > 0.0f && g_ph.phase == PGRAPH_PHASE_HUD)) return 0;
-    *kx = g_hud.kx;
+    *kx = g_hud.kx / k169;
     *ky = g_hud.ky;
     *ax = g_hud.ax * sw / 640.0f;
     *ay = g_hud.ay * sh / 480.0f;
@@ -4665,6 +5226,9 @@ int pgraph_d3d11_lightmap_filter(void)
     return lightmap_filter_mode();
 }
 
+extern int d3d8_pump_memo2_on(void);            /* XBOX_FIX_PUMP_MEMO2 (d3d8_nv2a.c) */
+static unsigned long long g_psh_memo2_hits;     /* pixel shader keys found in the older memo entry (XBOX_SUBST_TIME) */
+
 static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count)
 {
     static ProgVertex *vb = NULL, *tb = NULL;
@@ -4679,9 +5243,11 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
     Nv2aVshDraw gd;
     int gpu = 0;
     double pt0 = g_perf_on ? perf_now() : 0.0;
+    double pq = 0.0;                            /* XBOX_PERF_DETAIL sub-zones */
 
     if (count == 0)
         return;
+    g_mg_cur_plain = 0;
     if (g_vl_on > 0) vl_draw_seen(indices, start, g_vl_cur_view);     /* fork: distance veil */
     wide = g_pg.draw_mode >= 2 && g_pg.draw_mode <= 4 && lines_wide();
     if (count > cap) {
@@ -4712,11 +5278,13 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
          * it live as well. */
         static int pick_cpu = -1;
         int f = (int)d3d8_PresentSeq();
+        if (g_perf_detail) pq = perf_now();
         if (pick_cpu < 0) pick_cpu = getenv("XBOX_NV2A_PICK") != NULL;
         gpu = !(pick_cpu && g_drawlog_lo >= 0 && f >= g_drawlog_lo && f < g_drawlog_lo + g_drawlog_n)
               && !(g_panel.on && !g_panel.scale_only && g_ph.phase == PGRAPH_PHASE_HUD)  /* panel ends: CPU */
               && !wide                                  /* quads built on the CPU (few draws) */
               && gpu_prepare(&gd, indices, start, count);
+        if (g_perf_detail) perf_add(PZ_PREP, perf_now() - pq);
     }
     if (gpu) {
         n = gd.nindices;
@@ -4963,7 +5531,8 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
     dev = xbox_GetD3DDevice();
     if (!dev)
         return;
-    apply_draw_state(dev);
+    if (g_perf_detail) pq = perf_now();
+    apply_draw_state_ex(dev, 1);
     {
         /* apply_draw_state forces the 2D path's settings -- no depth, blend
          * always on. 3D geometry needs the title's own: opaque meshes whose
@@ -4977,16 +5546,16 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             /* XBOX_VSH_NODEPTH=1 (diagnostic) turns the depth test off. */
             static int nodepth = -1;
             if (nodepth < 0) { const char *e = getenv("XBOX_VSH_NODEPTH"); nodepth = e && e[0] == '1'; }
-            dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, (g_pg.depth_test && !nodepth) ? TRUE : FALSE);
+            rs_set(dev, D3DRS_ZENABLE, (g_pg.depth_test && !nodepth) ? TRUE : FALSE);
         }
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ZFUNC, zf);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, g_pg.depth_mask ? TRUE : FALSE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, g_pg.blend_enable ? TRUE : FALSE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, nv2a_blend_to_d3d(g_pg.blend_sfactor));
-        dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, nv2a_blend_to_d3d(g_pg.blend_dfactor));
-        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHATESTENABLE, FALSE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_FOGENABLE, FALSE);
-        dev->lpVtbl->SetRenderState(dev, D3DRS_SPECULARENABLE, FALSE);
+        rs_set(dev, D3DRS_ZFUNC, zf);
+        rs_set(dev, D3DRS_ZWRITEENABLE, g_pg.depth_mask ? TRUE : FALSE);
+        rs_set(dev, D3DRS_ALPHABLENDENABLE, g_pg.blend_enable ? TRUE : FALSE);
+        rs_set(dev, D3DRS_SRCBLEND, nv2a_blend_to_d3d(g_pg.blend_sfactor));
+        rs_set(dev, D3DRS_DESTBLEND, nv2a_blend_to_d3d(g_pg.blend_dfactor));
+        rs_set(dev, D3DRS_ALPHATESTENABLE, FALSE);
+        rs_set(dev, D3DRS_FOGENABLE, FALSE);
+        rs_set(dev, D3DRS_SPECULARENABLE, FALSE);
         {
             /* Stencil and colour mask. Character select marks
              * the spotlight's volume in the stencil buffer (quads drawn with
@@ -5005,22 +5574,22 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             static const D3DRENDERSTATETYPE op_rs[3] = { D3DRS_STENCILFAIL, D3DRS_STENCILZFAIL, D3DRS_STENCILPASS };
             uint32_t m = g_pg.color_mask;
             int k, j;
-            dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILENABLE, g_pg.stencil_test ? TRUE : FALSE);
+            rs_set(dev, D3DRS_STENCILENABLE, g_pg.stencil_test ? TRUE : FALSE);
             if (g_pg.stencil_test) {
-                dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILFUNC,
+                rs_set(dev, D3DRS_STENCILFUNC,
                     g_pg.stencil_func >= 0x200 && g_pg.stencil_func <= 0x207
                         ? g_pg.stencil_func - 0x200 + 1 : D3DCMP_ALWAYS);
-                dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILREF, g_pg.stencil_ref);
-                dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILMASK, g_pg.stencil_mask_read);
-                dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILWRITEMASK, g_pg.stencil_mask_write);
+                rs_set(dev, D3DRS_STENCILREF, g_pg.stencil_ref);
+                rs_set(dev, D3DRS_STENCILMASK, g_pg.stencil_mask_read);
+                rs_set(dev, D3DRS_STENCILWRITEMASK, g_pg.stencil_mask_write);
                 for (k = 0; k < 3; k++) {
                     DWORD v = 1;
                     for (j = 0; j < (int)(sizeof ops / sizeof ops[0]); j++)
                         if (ops[j].nv == g_pg.stencil_op[k]) v = ops[j].d3d;
-                    dev->lpVtbl->SetRenderState(dev, op_rs[k], v);
+                    rs_set(dev, op_rs[k], v);
                 }
             }
-            dev->lpVtbl->SetRenderState(dev, D3DRS_COLORWRITEENABLE,
+            rs_set(dev, D3DRS_COLORWRITEENABLE,
                 ((m >> 16) & 1 ? 1u : 0) | ((m >> 8) & 1 ? 2u : 0) |
                 (m & 1 ? 4u : 0) | ((m >> 24) & 1 ? 8u : 0));
             /* The shadow quad -- a full-surface quad, stencil
@@ -5054,11 +5623,12 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                                                        ? g_pg.stencil_func - 0x200 + 1 : D3DCMP_ALWAYS,
                                             g_pg.stencil_ref, g_pg.stencil_mask_read,
                                             x0 / (float)sw, y0 / (float)sh, x1 / (float)sw, y1 / (float)sh))
-                        dev->lpVtbl->SetRenderState(dev, D3DRS_COLORWRITEENABLE, 0);
+                        rs_set(dev, D3DRS_COLORWRITEENABLE, 0);
                 }
             }
         }
     }
+    if (g_perf_detail) { double t = perf_now(); perf_add(PZ_STATEW, t - pq); pq = t; }
 
     /* The NV2A pixel pipeline itself -- all four texture stages
      * and the register combiners, as HLSL from nv2a_psh.c. XBOX_NV2A_PSH=0
@@ -5088,6 +5658,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             ps.alpha_out[st] = g_pg.comb_alpha_ocw[st];
         }
         snow_relief_init();
+        if (g_perf_detail) { double t = perf_now(); perf_add(PZ_PSB, t - pq); pq = t; }
         for (st = 0; st < 4; st++) {
             uint32_t f = g_pg.tex[st].format, color = TEXFMT_COLOR(f), xf, bb;
             IDirect3DTexture8 *t = g_pg.tex[st].enabled ? tex_upload(dev, st) : NULL;
@@ -5097,8 +5668,8 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             {
                 uint32_t au = g_pg.tex[st].address & 0xF, av = (g_pg.tex[st].address >> 8) & 0xF;
                 uint32_t mag = (g_pg.tex[st].filter >> 24) & 0xF, min = (g_pg.tex[st].filter >> 16) & 0xFF;
-                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_ADDRESSU, au >= 1 && au <= 4 ? au : 3);
-                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_ADDRESSV, av >= 1 && av <= 4 ? av : 3);
+                tss_set(dev, st, D3DTSS_ADDRESSU, au >= 1 && au <= 4 ? au : 3);
+                tss_set(dev, st, D3DTSS_ADDRESSV, av >= 1 && av <= 4 ? av : 3);
                 /* NV2A min filters (xemu's table): 1 nearest, 2 linear,
                  * 3 nearest/mip nearest, 4 linear/mip nearest, 5 nearest/
                  * mip linear, 6 linear/mip linear. The mip half is
@@ -5115,14 +5686,14 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                  * is sampled nearest neighbour, mip levels included, so that
                  * its pixels show as they are (nv2a_btnicons.h). */
                 int pt = btnicons_point(t);
-                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MAGFILTER, (pt || mag == 1) ? 1 : 2);
-                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MINFILTER,
-                                                  (pt || min == 1 || min == 3 || min == 5) ? 1 : 2);
-                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MIPFILTER,
-                                                  (min == 3 || min == 4) ? 1 : (min == 5 || min == 6) ? (pt ? 1 : 2) : 0);
-                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MIPMAPLODBIAS, fb.u);
-                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MAXMIPLEVEL, ((c0 >> 18) & 0xFFFu) >> 8);
-                dev->lpVtbl->SetTextureStageState(dev, st, D3DTSS_MAXANISOTROPY, 1u << ((c0 >> 4) & 3u));
+                tss_set(dev, st, D3DTSS_MAGFILTER, (pt || mag == 1) ? 1 : 2);
+                tss_set(dev, st, D3DTSS_MINFILTER,
+                                 (pt || min == 1 || min == 3 || min == 5) ? 1 : 2);
+                tss_set(dev, st, D3DTSS_MIPFILTER,
+                                 (min == 3 || min == 4) ? 1 : (min == 5 || min == 6) ? (pt ? 1 : 2) : 0);
+                tss_set(dev, st, D3DTSS_MIPMAPLODBIAS, fb.u);
+                tss_set(dev, st, D3DTSS_MAXMIPLEVEL, ((c0 >> 18) & 0xFFFu) >> 8);
+                tss_set(dev, st, D3DTSS_MAXANISOTROPY, 1u << ((c0 >> 4) & 3u));
             }
             ps.tex_enabled[st] = 1;
             ps.tex_dim[st] = (uint8_t)((f >> 4) & 0xF);
@@ -5154,6 +5725,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                 }
             }
         }
+        if (g_perf_detail) { double t = perf_now(); perf_add(PZ_STATEW, t - pq); pq = t; }
         {
             /* XBOX_NV2A_TEXSTATS=1 (diagnostic): every 5 s, how many draws
              * used each texture-shader mode, per stage, with the bound
@@ -5324,6 +5896,23 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             }
         }
 
+        if (u8f_on()) {                 /* the same quotients, from the table */
+            #define ARGB4(dst, v) do { (dst)[0] = g_u8f[((v) >> 16) & 0xFF]; \
+                (dst)[1] = g_u8f[((v) >> 8) & 0xFF]; (dst)[2] = g_u8f[(v) & 0xFF]; \
+                (dst)[3] = g_u8f[((v) >> 24) & 0xFF]; } while (0)
+            for (st = 0; st < 8; st++) {
+                ARGB4(pc.c0[st], g_pg.comb_factor0[st]);
+                ARGB4(pc.c1[st], g_pg.comb_factor1[st]);
+            }
+            ARGB4(pc.c0[8], g_pg.specular_fog_factor[0]);
+            ARGB4(pc.c1[8], g_pg.specular_fog_factor[1]);
+            #undef ARGB4
+            if (g_flat_on) memcpy(pc.c0[8], g_flat_rgba, sizeof g_flat_rgba);
+            pc.fog_color[0] = g_u8f[g_pg.fog_color & 0xFF];           /* ABGR */
+            pc.fog_color[1] = g_u8f[(g_pg.fog_color >> 8) & 0xFF];
+            pc.fog_color[2] = g_u8f[(g_pg.fog_color >> 16) & 0xFF];
+            pc.fog_color[3] = g_u8f[(g_pg.fog_color >> 24) & 0xFF];
+        } else {
         #define ARGB4(dst, v) do { (dst)[0] = (((v) >> 16) & 0xFF) / 255.0f; \
             (dst)[1] = (((v) >> 8) & 0xFF) / 255.0f; (dst)[2] = ((v) & 0xFF) / 255.0f; \
             (dst)[3] = (((v) >> 24) & 0xFF) / 255.0f; } while (0)
@@ -5339,25 +5928,39 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         pc.fog_color[1] = ((g_pg.fog_color >> 8) & 0xFF) / 255.0f;
         pc.fog_color[2] = ((g_pg.fog_color >> 16) & 0xFF) / 255.0f;
         pc.fog_color[3] = ((g_pg.fog_color >> 24) & 0xFF) / 255.0f;
+        }
         pc.alpha_ref[0] = (float)(g_pg.alpha_ref & 0xFF);
 
         double ptk = g_perf_on ? perf_now() : 0.0;
+        if (g_perf_detail) perf_add(PZ_PSB, ptk - pq);
         if (d3d8_pump_cache_on()) {
             /* Same state byte for byte as the previous draw =
-             * same key (the key is a hash of these bytes). */
-            static Nv2aPshState last;
-            static uint64_t last_key;
-            static int have;
-            if (have && !memcmp(&ps, &last, sizeof ps))
-                key = last_key;
-            else {
+             * same key (the key is a hash of these bytes). XBOX_FIX_PUMP_MEMO2:
+             * as one of the last two (a terrain patch and its seam blend,
+             * alpha_t0z, take turns); the older one is replaced. */
+            static Nv2aPshState last[2];
+            static uint64_t last_key[2];
+            static int have[2], mru;
+            int two = d3d8_pump_memo2_on(), w = two ? mru : 0;
+            if (have[w] && !memcmp(&ps, &last[w], sizeof ps))
+                key = last_key[w];
+            else if (two && have[w ^ 1] && !memcmp(&ps, &last[w ^ 1], sizeof ps)) {
+                key = last_key[w ^ 1];
+                mru = w ^ 1;
+                g_psh_memo2_hits++;
+            } else {
+                w = two ? mru ^ 1 : 0;
                 key = nv2a_psh_key(&ps);
-                last = ps; last_key = key; have = 1;
+                last[w] = ps; last_key[w] = key; have[w] = 1;
+                mru = w;
             }
         } else
             key = nv2a_psh_key(&ps);
         if (g_perf_on) perf_add(PZ_PSH, perf_now() - ptk);
-        if (!d3d8_nv2a_has_ps(key)) {
+        int ps_state = d3d8_nv2a_has_ps(key);
+        if (ps_state < 0)               /* failed on its one try; */
+            return;                     /* its draws are skipped, as then */
+        if (!ps_state) {
             int len = nv2a_psh_generate(&ps, hlsl, (int)sizeof hlsl);
             {
                 /* XBOX_NV2A_PSH_DUMP=<dir> (diagnostic): write each new pixel
@@ -5371,7 +5974,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                     if (f) { fwrite(hlsl, 1, (size_t)len, f); fclose(f); }
                 }
             }
-            if (len <= 0 || !d3d8_nv2a_add_ps(key, hlsl, len)) {
+            if (!d3d8_nv2a_add_ps(key, hlsl, len)) {            /* len <= 0 included */
                 if (failures++ < 8)
                     fprintf(stderr, "[NV2A-PSH] no shader for combiners %08X stages %d prog %08X "
                             "(generate %d); draw skipped\n", g_pg.comb_control, nst,
@@ -5415,6 +6018,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                     if (fix ? g_pg.front_face == 0x901 : g_pg.front_face == 0x900) raster |= 8;
                 }
             }
+            if (g_perf_detail) pq = perf_now();
             {
                 /* Race HUD element in its own proportions. */
                 float kx, ax, ky, ay;
@@ -5431,6 +6035,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             if (gpu && g_plag.bad && !points) plag_draw(indices, start, count, gd.screen_w, gd.screen_h);
             g_d3d8_light_mark = light_draw();       /* fork: the lights (d3d8_lights.h) */
             g_d3d8_temporal_mark = temporal_draw(indices, start, count);   /* fork: temporal */
+            if (g_perf_detail) { double t = perf_now(); perf_add(PZ_HOOK, t - pq); pq = t; }
             if (gpu) {
                 gd.ps_key = key;
                 gd.ps_consts = &pc;
@@ -5544,7 +6149,13 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                     d3d8_nv2a_points_expect(tb, points_squares(vb, okb, psb, count, tb), sizeof(ProgVertex));
                 }
                 softcut_init();
-                if (g_softcut && !points && prim == D3DPT_TRIANGLELIST && softcut_class()) {
+                {
+                int sc = g_softcut && !points && prim == D3DPT_TRIANGLELIST && softcut_class();
+                if (g_perf_detail) { double t = perf_now(); perf_add(PZ_ZT, t - pq); pq = t; }
+                if (g_perf_detail)  /* a draw that a merge with its neighbour could take as is */
+                    g_mg_cur_plain =!sc && !gd.ztie_nsub && !gd.zdecal_nsub && !g_d3d8_light_mark &&
+                                     !g_d3d8_temporal_mark && !points && prim == D3DPT_TRIANGLELIST && !g_subst_host;
+                if (sc) {
                     /* Soft-edged cut-out, two passes (see softcut_class) */
                     float ref0 = pc.alpha_ref[0];
                     int lm = g_d3d8_light_mark, tm = g_d3d8_temporal_mark;
@@ -5579,6 +6190,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
                 } else
                 if (d3d8_nv2a_draw_program_gpu(&gd) && prim == D3DPT_TRIANGLELIST)
                     g_vs.prog_tris += n / 3;
+                }
             } else {
             uint32_t chunk = 18000u - (18000u % per), off;
             for (off = 0; off < n; off += chunk) {
@@ -5604,6 +6216,16 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
     if (g_perf_on) {
         perf_add(gpu ? PZ_PROGGPU : PZ_PROGCPU, perf_now() - pt0);
         if (!gpu) { perf_count(PC_CPUVTX, count); perf_count(PC_CPUDRAW, 1); }
+        if (g_perf_detail) {    /* consecutive program draws with no state method between them */
+            int plain = gpu && g_mg_cur_plain;
+            if (gpu && g_mg_prev_gpu && !g_mg_brk) {
+                perf_count(PC_MERGE, 1);
+                if (plain && g_mg_prev_plain) perf_count(PC_MERGEP, 1);
+            }
+            g_mg_prev_gpu = gpu;
+            g_mg_prev_plain = plain;
+            g_mg_brk = 0;
+        }
     }
     g_pg.stats.draw_calls++;
     g_pg.stats.vertices_submitted += count;
@@ -5854,6 +6476,35 @@ static void draw_arrays(uint32_t start, uint32_t count)
     }
 }
 
+/* XBOX_SUBST_TIME=1 with XBOX_PERF=1 (measurement only, nothing else changes):
+ * every 2 s, the pump's time per second in the substitution filter (every
+ * program draw goes through it while the filter is set), in the substituted
+ * main passes and in their overlays, with their counts; and the lookups that
+ * the older entry of the shader / input layout / pixel shader key memos
+ * answered (XBOX_FIX_PUMP_MEMO2: each spared a lookup). Each timed point is
+ * one QueryPerformanceCounter: its own cost is in the totals; the report's
+ * own reading and its print every 2 s are not (taken before the spans). */
+static int g_st_on = -1;
+static double g_st_t0, g_st_filter, g_st_main, g_st_ovl;
+static unsigned long long g_st_ncall, g_st_nsub, g_st_novl, g_st_m2[3];
+extern void d3d8_nv2a_memo2_hits(unsigned long long *vsh, unsigned long long *il);
+static void subst_time_report(void)
+{
+    double t = perf_now();
+    unsigned long long m2[3];
+    if (g_st_t0 && t - g_st_t0 < 2000.0) return;
+    d3d8_nv2a_memo2_hits(&m2[0], &m2[1]);
+    m2[2] = g_psh_memo2_hits;
+    if (!g_st_t0) { g_st_t0 = t; memcpy(g_st_m2, m2, sizeof m2); return; }
+    fprintf(stderr, "[SUBST-TIME] over %.0f ms: filter %llu calls, %.3f ms/s; main passes %llu, %.3f ms/s; overlays %llu, %.3f ms/s"
+            " | older memo entry: vs %llu layout %llu ps key %llu\n",
+            t - g_st_t0, g_st_ncall, g_st_filter * 1000.0 / (t - g_st_t0), g_st_nsub, g_st_main * 1000.0 / (t - g_st_t0),
+            g_st_novl, g_st_ovl * 1000.0 / (t - g_st_t0), m2[0] - g_st_m2[0], m2[1] - g_st_m2[1], m2[2] - g_st_m2[2]);
+    fflush(stderr);
+    g_st_t0 = t; g_st_filter = g_st_main = g_st_ovl = 0.0; g_st_ncall = g_st_nsub = g_st_novl = 0;
+    memcpy(g_st_m2, m2, sizeof m2);
+}
+
 /* A program draw handed to the substitution filter first: when it takes it,
  * the arrays that start in the replaced span read the filter's host vertices
  * (same layout and stride) and its index list is drawn instead, then the
@@ -5863,14 +6514,20 @@ static int subst_draw(void)
 {
     PgraphDrawSubst sub;
     uint32_t saved[16], saved_addr[4], a, k;
+    double st1 = 0.0;
     if (!g_subst_fn && !g_observe_fn) return 0;
+    if (g_st_on < 0) { const char *e = getenv("XBOX_SUBST_TIME"); g_st_on = e && e[0] == '1' && g_perf_on; }   /* perf_now: XBOX_PERF=1 */
     {
         uint32_t offs[16], fmts[16];
+        int taken;
         for (a = 0; a < 16; a++) { offs[a] = g_pg.vattr[a].offset; fmts[a] = g_pg.vattr[a].format; }
         if (g_observe_fn) g_observe_fn(g_pg.draw_mode, g_pg.idx, g_pg.idx_count, offs, fmts);   /* fork */
         if (!g_subst_fn) return 0;
         memset(&sub, 0, sizeof sub);
-        if (!g_subst_fn(g_pg.draw_mode, g_pg.idx, g_pg.idx_count, offs, fmts, &sub)) return 0;
+        if (g_st_on) { subst_time_report(); st1 = perf_now(); }     /* the report: before the timed spans */
+        taken = g_subst_fn(g_pg.draw_mode, g_pg.idx, g_pg.idx_count, offs, fmts, &sub);
+        if (g_st_on) { double t = perf_now(); g_st_filter += t - st1; st1 = t; g_st_ncall++; }
+        if (!taken) return 0;
     }
     if (!sub.host || !sub.size || !sub.indices || !sub.count || sub.span == 0) return 0;
     for (a = 0; a < 16; a++) {
@@ -5889,8 +6546,10 @@ static int subst_draw(void)
         }
     }
     draw_program(sub.indices, 0, sub.count);
+    if (g_st_on) { double t = perf_now(); g_st_main += t - st1; st1 = t; g_st_nsub++; }
     for (a = 0; a < 4; a++) g_pg.tex[a].address = saved_addr[a];   /* the main pass only */
     if (sub.n_overlay) {
+        g_mg_brk = 1;                   /* the overlays change state between draws */
         uint32_t mode = g_pg.draw_mode, sf = g_pg.blend_sfactor, df = g_pg.blend_dfactor;
         int be = g_pg.blend_enable, dm = g_pg.depth_mask, cu = g_pg.cull_enable;
         g_pg.draw_mode = 5;
@@ -5952,6 +6611,7 @@ static int subst_draw(void)
         g_pg.draw_mode = mode;
         g_pg.blend_enable = be; g_pg.blend_sfactor = sf; g_pg.blend_dfactor = df;
         g_pg.depth_mask = dm; g_pg.cull_enable = cu;
+        if (g_st_on) { g_st_ovl += perf_now() - st1; g_st_novl += sub.n_overlay; }
     }
     g_subst_host = NULL;
     g_subst_size = 0;
@@ -6264,6 +6924,10 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 {
     if (!g_pg.initialized)
         return 0;
+    if (g_perf_detail && method != NV097_SET_BEGIN_END && method != NV097_DRAW_ARRAYS &&
+        method != NV097_ARRAY_ELEMENT16 && method != NV097_ARRAY_ELEMENT32 &&
+        (method < NV2A_VA_OFFSET_BASE || method >= NV2A_VA_OFFSET_BASE + NV2A_VA_SLOTS * 4))
+        g_mg_brk = 1;
     {   /* XBOX_NV2A_SUBCHLOG=N (diagnostic): the first N methods sent to a
          * subchannel other than 0 -- 2D objects (surface copies, blits) that
          * this 3D translator would otherwise read as NV097 methods. */
@@ -6282,34 +6946,13 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
      * which is why no stream ever reached the draw path. */
     if (method >= NV2A_VA_OFFSET_BASE &&
         method <  NV2A_VA_OFFSET_BASE + NV2A_VA_SLOTS * 4) {
-        {
-            uint32_t slot = (method - NV2A_VA_OFFSET_BASE) >> 2;
-            static int logged = 0;
-            g_pg.vattr[slot].offset = param;
-            if (logged < 8) {
-                logged++;
-                fprintf(stderr, "[PGRAPH-D3D11] bind attr %u offset=0x%08X "
-                        "(format currently 0x%08X)\n", slot, param, g_pg.vattr[slot].format);
-                fflush(stderr);
-            }
-        }
+        va_offset_set((method - NV2A_VA_OFFSET_BASE) >> 2, param);   /* shared with the runs */
         g_pg.stats.methods_handled++;
         return 1;
     }
     if (method >= NV2A_VA_FORMAT_BASE &&
         method <  NV2A_VA_FORMAT_BASE + NV2A_VA_SLOTS * 4) {
-        {
-            uint32_t slot = (method - NV2A_VA_FORMAT_BASE) >> 2;
-            static int logged = 0;
-            g_pg.vattr[slot].format = param;
-            if (logged < 8) {
-                logged++;
-                fprintf(stderr, "[PGRAPH-D3D11] attr %u format=0x%08X "
-                        "(type %u size %u stride %u)\n", slot, param,
-                        param & 0xF, (param >> 4) & 0xF, (param >> 8) & 0xFFFFFF);
-                fflush(stderr);
-            }
-        }
+        va_format_set((method - NV2A_VA_FORMAT_BASE) >> 2, param);
         g_pg.stats.methods_handled++;
         return 1;
     }
@@ -6328,7 +6971,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
                         draw_program(g_pg.idx, 0, g_pg.idx_count);
                 } else
                     g_vs.raw_indexed++;   /* fixed-function indexed: no transform yet */
-                g_pg.idx_count = 0;
+                idx_reset();
             }
             if (g_pg.in_draw) {
                 submit_draw();
@@ -6340,7 +6983,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             g_pg.draw_mode = param;
             g_pg.d3d_prim_type = nv2a_draw_mode_to_d3d(param);
             g_pg.inline_count = 0;
-            g_pg.idx_count = 0;
+            idx_reset();
         }
         return 1;
 
@@ -6608,6 +7251,9 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         }
         peek_after("frame (flip)");
         if (g_pg.surface_offset_seen && param != g_pg.surface_color_offset) {
+            /* The surface it leaves holds a video frame the title
+             * has just written (d3d8_device.c): that frame's one present. */
+            int video = d3d8_GuestFramebufferFlip(g_pg.surface_color_offset);
             g_pg.frame_complete = 1;
             g_pg.prev_surface_offset = g_pg.surface_color_offset;
             /* A surface flip is the title's real frame boundary --
@@ -6619,12 +7265,25 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             g_pg.flip_mode = 1;
             g_pg.last_flip_ms = GetTickCount64();
             if (g_pg.draws_since_present > 0) {
+                occ_image_end();
                 g_pg.draws_since_present = 0;
                 g_pg.frame_no++;
                 pass_phase_image_done();
                 box_image_done();
                 hud_image_done();
                 if (g_image_end_cb) g_image_end_cb();
+                /* A video frame flipped after draws as well (the first frame
+                 * of eabig, at every start) is a video frame all the same: the
+                 * GPU check applies to it too (else the pump presents it). */
+                if (!video) {
+                    d3d8_NoteRenderedFrame();
+                    d3d8_PresentFrame();
+                } else if (d3d8_VideoPresentReady()) d3d8_PresentFrame();
+            } else if (video && d3d8_VideoPresentReady()) {
+                /* A video frame has no draws. Never while the GPU
+                 * is still on the previous one -- the pump then presents it
+                 * on a later tick (nv2a_live_pb.c), without blocking. */
+                pgraph_d3d11_flush();
                 d3d8_PresentFrame();
             }
         }
@@ -6684,12 +7343,14 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             if (++rc == 400) pgraph_d3d11_report_ignored();
         }
         if (g_pg.draws_since_present > 0 && !pgraph_d3d11_flipping()) {
+            occ_image_end();
             g_pg.draws_since_present = 0;
             g_pg.frame_no++;
             pass_phase_image_done();
             box_image_done();
             hud_image_done();
             if (g_image_end_cb) g_image_end_cb();
+            d3d8_NoteRenderedFrame();     /* the title's draws, not a video frame */
             d3d8_PresentFrame();
         }
         if (dev) {
@@ -7108,11 +7769,12 @@ void pgraph_d3d11_test_quad(void)
 }
 
 /* True while the title is flipping render surfaces (one seen in the last
- * 250 ms): presents then belong to the flips, not to clears or timers. */
+ * 250 ms): presents then belong to the flips, not to clears or timers --
+ * video frames included (each flips the surface it was written
+ * into; they needed timed presents before). */
 int pgraph_d3d11_flipping(void)
 {
-    return g_pg.flip_mode && GetTickCount64() - g_pg.last_flip_ms < 250
-        && !d3d8_GuestFramebufferActive();   /* video frames need timed presents */
+    return g_pg.flip_mode && GetTickCount64() - g_pg.last_flip_ms < 250;
 }
 
 /* Draws translated since the last present (XBOX_FLIP_LOG timelines). */
@@ -7186,3 +7848,6 @@ void pgraph_d3d11_perf_counts(unsigned *draws, unsigned *methods, unsigned *vert
     *methods = (unsigned)g_pg.stats.methods_handled;
     *verts = (unsigned)g_pg.stats.vertices_submitted;
 }
+
+/* Images presented by the translator (XBOX_PERF method profile). */
+unsigned pgraph_d3d11_frame_count(void) { return g_pg.frame_no; }

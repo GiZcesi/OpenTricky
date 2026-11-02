@@ -31,7 +31,6 @@
  * anything touching guest state has to say g_esp explicitly. */
 #include "recomp/recomp_types.h"
 #include "pass_tags.h"
-#include "netplay/np_net.h"
 #include "pumplag.h"
 #include "fps_cap.h"
 #include "aspect.h"
@@ -44,6 +43,7 @@
 #include "chantfix.h"
 #include "riderlod.h"
 #include "shadowvb.h"
+#include "weather.h"
 #include "../../xboxrecomp/src/kernel/xbox_perf.h"
 extern void (*perf_lookup(unsigned int xbox_va))(void);
 extern void (*frame_clock_lookup(unsigned int xbox_va))(void);
@@ -135,13 +135,15 @@ extern ptrdiff_t g_xbox_mem_offset;
  * read BEFORE the call -- the original pops its arguments.
  *
  * Only surfaces in the write-combined VRAM alias with a sane 32-bit pitch are
- * taken; this call also serves plenty of surfaces that are not the framebuffer.
+ * taken. In this XBE the call has one caller only, the video player's frame
+ * blit (0x00148B40, a lock of the back buffer before each Present: one per
+ * video frame); the filter would keep any other surface out all the same.
  */
 extern void sub_0016B1C0(void);
 void d3d8_SetGuestFramebuffer(const void *src, unsigned pitch,
                               unsigned w, unsigned h);
 void d3d8_SetGuestFramebufferAlt(const void *alt);
-void d3d8_NoteGuestFramebufferLock(void);
+void d3d8_NoteGuestFramebufferLockAt(uint32_t va, const void *p);
 
 void hook_lockrect_0016B1C0(void)
 {
@@ -161,26 +163,26 @@ void hook_lockrect_0016B1C0(void)
         static uint32_t seen_a = 0, seen_b = 0;
         unsigned w = pitch / 4;
         unsigned h = 480;                    /* the title's video mode */
-        /* Every lock of a known framebuffer, not just the first: the present
-         * shows the guest buffer only while these keep arriving. */
-        if (pbits == seen_a || pbits == seen_b) {
-            d3d8_NoteGuestFramebufferLock();
-            return;
+        if (pbits != seen_a && pbits != seen_b) {
+            if (!seen_a) {
+                seen_a = pbits;
+                d3d8_SetGuestFramebuffer(XBOX_PTR(pbits), pitch, w, h);
+                fprintf(stderr, "  [FB] guest framebuffer discovered: 0x%08X "
+                        "pitch %u (%ux%u)\n", pbits, pitch, w, h);
+                fflush(stderr);
+            } else if (!seen_b) {
+                seen_b = pbits;
+                d3d8_SetGuestFramebufferAlt(XBOX_PTR(pbits));
+                fprintf(stderr, "  [FB] second framebuffer discovered: 0x%08X "
+                        "(double buffered)\n", pbits);
+                fflush(stderr);
+            }
         }
-        d3d8_NoteGuestFramebufferLock();
-        if (!seen_a) {
-            seen_a = pbits;
-            d3d8_SetGuestFramebuffer(XBOX_PTR(pbits), pitch, w, h);
-            fprintf(stderr, "  [FB] guest framebuffer discovered: 0x%08X "
-                    "pitch %u (%ux%u)\n", pbits, pitch, w, h);
-            fflush(stderr);
-        } else if (!seen_b) {
-            seen_b = pbits;
-            d3d8_SetGuestFramebufferAlt(XBOX_PTR(pbits));
-            fprintf(stderr, "  [FB] second framebuffer discovered: 0x%08X "
-                    "(double buffered)\n", pbits);
-            fflush(stderr);
-        }
+        /* Every lock of a framebuffer, not just the first: the present shows
+         * the guest buffer only while these keep arriving. And the
+         * buffer locked is the one the title is writing a new video frame
+         * into, which its next surface flip hands over to the screen. */
+        d3d8_NoteGuestFramebufferLockAt(pbits, (const void *)XBOX_PTR(pbits));
     }
 }
 
@@ -271,6 +273,14 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
      * (XBOX_FIX_SHADOWVB, default 1; see shadowvb.h). */
     {
         recomp_func_t fn = shadowvb_lookup(xbox_va);
+        if (fn) return fn;
+    }
+
+    /* Weather (XBOX_WEATHER=ps2, see weather.h): the fog setup is a direct
+     * call, routed in every build to a hook that passes through in Original;
+     * the snowfall render's hook is handed out with ps2 only. */
+    {
+        recomp_func_t fn = weather_lookup(xbox_va);
         if (fn) return fn;
     }
 

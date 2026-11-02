@@ -28,6 +28,7 @@
 ## Contents
 
 - [What is this?](#what-is-this)
+- [What's new in 0.1.5](#whats-new-in-015)
 - [What's new in 0.1.4](#whats-new-in-014)
 - [Install and play](#install-and-play)
 - [Controls and settings](#controls-and-settings)
@@ -52,6 +53,16 @@ The goals:
 2. **A modern PC release**: modern controllers and button styles (Xbox, PlayStation, PS2 original), the original PS2 controls with all 15 grabs, full keyboard and controller remapping, any resolution, ultrawide, high frame rates, all set up in one launcher.
 3. **New options on top**: smoother edges, soft shadows, longer draw distance, optional HD textures. The *Original Xbox* preset turns them all off at once.
 
+## What's new in 0.1.5
+
+Faster when the processor is the limit, and a round of fixes.
+- **Faster**: the part of OpenTricky that turns the game's graphics commands into Direct3D 11 does less work for the same picture: on our test PC, without a frame rate limit, 24 to 31% more frames per second than 0.1.4.
+- **Closer to the original game**: the sun's glare no longer drops out when the graphics card falls behind, and the game's videos play at their own pace.
+- **Fixes**: split screen at *Draw distance Max* keeps its colours; a camera cut above 60 FPS no longer slides between the two shots; on screens wider than 16:9, the scene after the finish line is shown in a 16:9 frame instead of cropped (the Top 5 and the replay stay wide); *Find my disc image* no longer crashes the launcher; the launcher no longer deletes files that aren't its own; F12 screenshots go to `Documents\My Games\SSX Tricky\Screenshots` when the game's folder can't be written.
+- **Weather** (*Graphics*): when it snows, *PS2* leaves out the original game's thick fog, as in the PS2 version, so the night sky and the distant slopes stay in view; the falling snow itself is the original game's. *PS2* is the value of *Recommended* and *Steam Deck*; *Original Xbox* keeps the fog.
+- **PlayStation controllers (experimental)** (*Controls*, Off by default): the DualShock 4 and DualSense work without any other tool.
+- **Presets**: above 60 FPS, *Smoother legs in turns* (on in *Recommended*) now catches up with the game over one game step, without a jump; the *Steam Deck* preset turns it off, with *Smoother terrain seams* and *Lightmap smoothing*.
+
 ## What's new in 0.1.4
 
 The first stable release.
@@ -66,7 +77,7 @@ Everything else: the [release notes](https://github.com/GiZcesi/OpenTricky/relea
 ## Install and play
 
 **You need** Windows 10 or 11 (64-bit), a Direct3D 11 graphics card, and a disc image (`.iso` or `.xiso`) of your own ***SSX Tricky* Xbox disc, USA release**
-(the PS2, GameCube, PAL and Japanese versions won't work). A controller is optional: Xbox-style (XInput) controllers and the keyboard work.
+(the PS2, GameCube, PAL and Japanese versions won't work). A controller is optional: Xbox-style (XInput) controllers and the keyboard work, and the DualShock 4 and DualSense with *PlayStation controllers (experimental)* in *Controls*.
 
 1. Download `OpenTricky-<version>-win64.zip` from [**Releases**](https://github.com/GiZcesi/OpenTricky/releases) and extract it into a new, empty folder.
 2. Start **`OpenTricky.exe`**, the launcher, and choose your disc image: the launcher checks it and remembers it.
@@ -74,7 +85,7 @@ Everything else: the [release notes](https://github.com/GiZcesi/OpenTricky/relea
 
 The game itself is `bin\SSX Tricky.exe`: it also starts the game straight away, with the same settings.
 
-**Coming from 0.1.2 or 0.1.3:** let the launcher update you; your saves, settings and disc image are kept, and a preset takes its new values (your 0.1.2 or 0.1.3 launcher checks GitHub once a day: if no update shows up, close it, delete `update-cache.txt` next to `settings.ini`, and open it again). **Coming from 0.1.1:** install 0.1.4 fresh, in a new folder (the 0.1.1 launcher can't install it). Saves in `Documents\My Games\SSX Tricky\Saves` stay where they are; if your saves were inside the old folder (a `Saves` folder with `portable.txt`, or an `hdd` folder), copy that folder (and `portable.txt`) into the new one. Don't copy `settings.ini`: choose your disc image again (and your save folder, if you had chosen one), make your shortcuts again (the game is now `bin\SSX Tricky.exe`), then delete the old folder.
+**Coming from 0.1.2, 0.1.3 or 0.1.4:** let the launcher update you; your saves, settings and disc image are kept, and a preset takes its new values (if no update shows up: the 0.1.4 launcher has *Check now* in *Settings > Advanced > Updates*; a 0.1.2 or 0.1.3 launcher checks GitHub once a day, so close it, delete `update-cache.txt` next to `settings.ini`, and open it again). **Coming from 0.1.1:** install 0.1.5 fresh, in a new folder (the 0.1.1 launcher can't install it). Saves in `Documents\My Games\SSX Tricky\Saves` stay where they are; if your saves were inside the old folder (a `Saves` folder with `portable.txt`, or an `hdd` folder), copy that folder (and `portable.txt`) into the new one. Don't copy `settings.ini`: choose your disc image again (and your save folder, if you had chosen one), make your shortcuts again (the game is now `bin\SSX Tricky.exe`), then delete the old folder.
 
 > [!NOTE]
 > Windows SmartScreen may warn you because the program isn't code-signed. If you trust the download, choose **More info → Run anyway**.
@@ -107,7 +118,7 @@ The main ones, most serious first. The full list is on [opentricky.com/known-iss
 | Problem | What to do |
 |---|---|
 | **Above 60 FPS, the controls respond one game step later** (about 17 ms). | Set *Frame rate limit* to *60 (Xbox)* for the original game's exact timing. |
-| **Only Xbox-style (XInput) controllers are supported natively.** | Use Steam Input or DS4Windows, and choose *PlayStation modern* or *PS2 original* in *Button style*. |
+| **Natively, only Xbox-style (XInput) controllers are supported, and the DualShock 4 and DualSense with *PlayStation controllers (experimental)*.** | For other controllers, use Steam Input or DS4Windows, and choose *PlayStation modern* or *PS2 original* in *Button style*. |
 | **Linux / Steam Deck (Proton):** with Proton Experimental, performance may be lower. Report it with your logs. | Through Steam, pick *Proton 10* in *Properties → Compatibility*. Or, in Desktop Mode, run `OpenTricky.exe` with **PortProton** (Flatpak): WINE *PROTON_LG_10-28*, 3D API *DXVK (Newest)*, then the *Steam Deck* preset in the launcher. |
 | **At 60 FPS on a 60 Hz screen that doesn't report its refresh timing** (the Steam Deck, some laptops), frames can wait in a queue and reach the screen later than in 0.1.3. | Nothing to do. |
 

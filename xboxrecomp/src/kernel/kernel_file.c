@@ -1018,6 +1018,13 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
+    /* The fixed part of an entry has to fit before anything is written or
+     * the scan moves on: NT turns a smaller buffer away with
+     * STATUS_INFO_LENGTH_MISMATCH. Both paths below used to write that part
+     * whatever the length. The title passes 0x146 or 0x148 bytes. */
+    if (Length < sizeof(XBOX_FILE_DIRECTORY_INFORMATION))
+        return STATUS_INFO_LENGTH_MISMATCH;
+
     /* Enumerate a directory inside a mounted ISO. One entry per call, with
      * the cursor kept on the virtual handle (RestartScan rewinds it), which
      * is the same one-at-a-time contract the Win32 path below implements. */
@@ -1038,21 +1045,37 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
                 return STATUS_NO_MORE_FILES;
             }
             {
+                /* The name follows the fixed part, as far as the caller's
+                 * buffer holds it. It used to be copied whole, terminator
+                 * and all, whatever the buffer's length: a disc name is up to
+                 * 255 bytes. A longer one is now cut and reported as
+                 * STATUS_BUFFER_OVERFLOW, FileNameLength being the length
+                 * copied, so that a caller reading that many bytes stays in
+                 * its buffer. */
                 xdvdfs_entry *e = &ents[ih->enum_index++];
-                size_t name_len = strlen(e->name);
+                ULONG room = Length -
+                    (ULONG)offsetof(XBOX_FILE_DIRECTORY_INFORMATION, FileName);
+                ULONG name_len = (ULONG)strlen(e->name);
+                NTSTATUS status = STATUS_SUCCESS;
+                if (name_len > room) {
+                    name_len = room;
+                    status = STATUS_BUFFER_OVERFLOW;
+                }
                 entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
                 memset(entry, 0, sizeof(*entry));
-                entry->FileNameLength = (ULONG)name_len;
+                entry->FileNameLength = name_len;
                 memcpy(entry->FileName, e->name, name_len);
-                entry->FileName[name_len] = '\0';
+                if (name_len < room)
+                    entry->FileName[name_len] = '\0';
                 entry->EndOfFile.QuadPart     = e->size;
                 entry->AllocationSize.QuadPart = (e->size + 2047) & ~2047LL;
                 entry->FileAttributes = FILE_ATTRIBUTE_READONLY |
                     ((e->attrs & XDVDFS_ATTR_DIRECTORY) ? FILE_ATTRIBUTE_DIRECTORY
                                                         : FILE_ATTRIBUTE_NORMAL);
-                IoStatusBlock->Status = STATUS_SUCCESS;
-                IoStatusBlock->Information = sizeof(*entry);
-                return STATUS_SUCCESS;
+                IoStatusBlock->Status = status;
+                IoStatusBlock->Information =
+                    status == STATUS_SUCCESS ? sizeof(*entry) : Length;
+                return status;
             }
         }
     }
@@ -1678,6 +1701,10 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     (void)Event; (void)ApcRoutine; (void)ApcContext;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+
+    /* The fixed part of an entry has to fit, as in the Win32 version. */
+    if (Length < sizeof(XBOX_FILE_DIRECTORY_INFORMATION))
+        return STATUS_INFO_LENGTH_MISMATCH;
 
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
     EnterCriticalSection(&s_dir_cs);

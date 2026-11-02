@@ -142,7 +142,8 @@ static void test_defaults_presets(void)
     CHECK(settings_get_bool(&A, S_SAVE_BACKUP));
     CHECK(settings_get_bool(&A, S_SMOOTH_MOTION));
     CHECK(settings_def(S_SMOOTH_MOTION)->flags & SETTING_HIDDEN);
-    /* the experimental leg smoothing: shown, PC, on by default (Original Xbox preset: off) */
+    /* the leg smoothing: shown, PC, on by default and in Recommended, off in Original Xbox and
+     * Steam Deck (Advanced) */
     CHECK(settings_get_bool(&A, S_SMOOTH_LEGS));
     CHECK_STR(settings_get(&A, S_SPEAKERS), "stereo");
     CHECK(!(settings_def(S_SMOOTH_LEGS)->flags & SETTING_HIDDEN));
@@ -150,11 +151,14 @@ static void test_defaults_presets(void)
     CHECK(settings_def(S_SMOOTH_LEGS)->tab == SETTINGS_TAB_ADVANCED);
     {
         int p;
-        for (p = 0; p < SETTINGS_PRESET_COUNT; p++) CHECK_STR(settings_def(S_SMOOTH_LEGS)->preset[p], p == 0 ? "0" : "1");
+        for (p = 0; p < SETTINGS_PRESET_COUNT; p++)
+            CHECK_STR(settings_def(S_SMOOTH_LEGS)->preset[p],
+                      (p == SETTINGS_PRESET_ORIGINAL_XBOX || p == SETTINGS_PRESET_STEAM_DECK) ? "0" : "1");
+        CHECK_STR(settings_def(S_SMOOTH_LEGS)->def, "1");
     }
     /* Improvements of the original picture, each a line: Smoother terrain seams (ADVANCED >
      * SMOOTHING, with Smoother legs in turns) and Lightmap smoothing (GRAPHICS > WORLD): PC, on by
-     * default (absent key = on), off in Original Xbox only */
+     * default (absent key = on), off in Original Xbox and in Steam Deck (presets revision 4) */
     {
         static const int ids[2] = { S_SMOOTH_SEAMS, S_LIGHTMAP_SMOOTH };
         int p, k;
@@ -179,7 +183,8 @@ static void test_defaults_presets(void)
             CHECK_STR(d->def, "1");
             CHECK(!(d->flags & SETTING_PENDING));
             CHECK(d->flags & SETTING_PC);
-            for (p = 0; p < SETTINGS_PRESET_COUNT; p++) CHECK_STR(d->preset[p], p == 0 ? "0" : "1");
+            for (p = 0; p < SETTINGS_PRESET_COUNT; p++)
+                CHECK_STR(d->preset[p], (p == SETTINGS_PRESET_ORIGINAL_XBOX || p == SETTINGS_PRESET_STEAM_DECK) ? "0" : "1");
         }
         /* Look like the Xbox: no line, in no preset (the game keeps its fixes on whatever the file says) */
         CHECK(settings_find("Graphics", "LookLikeXbox") == S_LOOK_LIKE_XBOX);
@@ -187,6 +192,33 @@ static void test_defaults_presets(void)
         CHECK(settings_def(S_LOOK_LIKE_XBOX)->tab == SETTINGS_TAB_NONE);
         for (p = 0; p < SETTINGS_PRESET_COUNT; p++) CHECK(settings_def(S_LOOK_LIKE_XBOX)->preset[p] == NULL);
         CHECK(settings_get_bool(&A, S_LOOK_LIKE_XBOX));
+    }
+    /* Weather: GRAPHICS > WORLD right below Snow look, PC, Original / PS2, PS2 by default and in
+     * Recommended and Steam Deck, Original in Original Xbox (XBOX_WEATHER) */
+    {
+        const SettingDef *d = settings_def(S_WEATHER);
+        CHECK(S_WEATHER == S_SNOW_LOOK + 1);
+        CHECK(settings_find("Graphics", "Weather") == S_WEATHER);
+        CHECK_STR(d->label, "Weather");
+        CHECK_STR(d->env, "XBOX_WEATHER");
+        CHECK(d->tab == SETTINGS_TAB_GRAPHICS);
+        CHECK_STR(d->group, "WORLD");
+        CHECK(d->type == SETTING_CHOICE && d->nchoices == 2);
+        CHECK_STR(d->choices[0].token, "original");
+        CHECK_STR(d->choices[0].label, "Original");
+        CHECK_STR(d->choices[1].token, "ps2");
+        CHECK_STR(d->choices[1].label, "PS2");
+        CHECK(d->flags & SETTING_PC);
+        CHECK(!(d->flags & (SETTING_HIDDEN | SETTING_PENDING | SETTING_LAUNCHER)));
+        CHECK_STR(d->def, "ps2");
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        CHECK_STR(d->preset[SETTINGS_PRESET_ORIGINAL_XBOX], "original");
+        CHECK_STR(d->preset[SETTINGS_PRESET_RECOMMENDED], "ps2");
+        CHECK_STR(d->preset[SETTINGS_PRESET_STEAM_DECK], "ps2");
+        CHECK(settings_set(&A, S_WEATHER, "PS2") && !strcmp(settings_get(&A, S_WEATHER), "ps2"));
+        CHECK(!settings_set(&A, S_WEATHER, "xbox"));      /* not one of the choices */
+        CHECK(settings_set(&A, S_WEATHER, "original") && settings_choice_index(&A, S_WEATHER) == 0);
+        settings_defaults(&A);
     }
     /* The Time Challenge ghost: a hidden row, off in every preset (the code kept) */
     {
@@ -234,8 +266,14 @@ static void test_defaults_presets(void)
     CHECK_STR(settings_get(&A, S_HD_TEXTURES), "off");
     CHECK_STR(settings_get(&A, S_DRAW_DISTANCE), "original");
     CHECK_STR(settings_get(&A, S_SNOW_LOOK), "ps2");
+    CHECK_STR(settings_get(&A, S_WEATHER), "ps2");        /* no snowfall fog */
     CHECK_STR(settings_get(&A, S_RENDER_SCALE), "100");   /* the Deck at 100 % too */
     CHECK_STR(settings_get(&A, S_MENUS), "4:3");
+    /* the lighter Steam Deck (presets revision 4): no smoother seams nor lightmap smoothing;
+     * 16x, HD HUD and SMAA high as before */
+    CHECK(!settings_get_bool(&A, S_SMOOTH_SEAMS) && !settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+    CHECK_STR(settings_get(&A, S_TEX_FILTER), "16");
+    CHECK(settings_get_bool(&A, S_HD_HUD));
 
     settings_apply_preset(&A, SETTINGS_PRESET_ORIGINAL_XBOX);
     CHECK(settings_current_preset(&A) == SETTINGS_PRESET_ORIGINAL_XBOX);
@@ -252,6 +290,7 @@ static void test_defaults_presets(void)
     CHECK_STR(settings_get(&A, S_FPS_LIMIT), "60");
     CHECK_STR(settings_get(&A, S_TEX_FILTER), "off");
     CHECK_STR(settings_get(&A, S_SNOW_LOOK), "original");  /* the title's snow shader */
+    CHECK_STR(settings_get(&A, S_WEATHER), "original");    /* the title's snowfall fog */
     CHECK_STR(settings_get(&A, S_RACE_HUD), "xbox");      /* the console's stretched HUD */
     CHECK_STR(settings_get(&A, S_RENDER_SCALE), "100");   /* render scale of the 3D: off */
     CHECK_STR(settings_get(&A, S_HD_TEXTURES), "off");
@@ -855,10 +894,11 @@ static void test_stable(void)
         CHECK(settings_parse(&A, f013, sizeof f013 - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK_STR(settings_get(&A, S_TEX_FILTER), "16");
         CHECK(settings_current_preset(&A) == SETTINGS_PRESET_RECOMMENDED);
+        CHECK(settings_get_bool(&A, S_SMOOTH_LEGS));               /* Recommended as it is now: smoother legs */
         CHECK(settings_get_bool(&A, S_LIGHTMAP_SMOOTH) && settings_get_bool(&A, S_SMOOTH_SEAMS));
         CHECK(settings_get_bool(&A, S_HD_HUD));
         settings_format(&A, text, sizeof text);
-        CHECK(has_line(text, "Presets=3") && has_line(text, "HdHud=1"));
+        CHECK(has_line(text, "Presets=4") && has_line(text, "HdHud=1") && has_line(text, "Weather=ps2"));
         /* the mark: values chosen since stay */
         CHECK(settings_parse(&A, fmark, sizeof fmark - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK_STR(settings_get(&A, S_TEX_FILTER), "off");
@@ -875,8 +915,9 @@ static void test_stable(void)
         CHECK_STR(settings_get(&A, S_SNOW_LOOK), "original");
         CHECK(!settings_get_bool(&A, S_LIGHTMAP_SMOOTH) && !settings_get_bool(&A, S_SMOOTH_SEAMS));
         CHECK(!settings_get_bool(&A, S_HD_HUD));
+        CHECK_STR(settings_get(&A, S_WEATHER), "original");
         settings_format(&A, text, sizeof text);              /* written with the mark: still Original Xbox */
-        CHECK(has_line(text, "Presets=3") && has_line(text, "SnowLook=original"));
+        CHECK(has_line(text, "Presets=4") && has_line(text, "SnowLook=original") && has_line(text, "Weather=original"));
         CHECK(settings_parse(&B, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK(settings_current_preset(&B) == SETTINGS_PRESET_ORIGINAL_XBOX);
         with_lines(frec, sizeof frec, forig, to_rec, 10);
@@ -886,33 +927,41 @@ static void test_stable(void)
         /* Recommended stays Recommended (16x, the new settings on) */
         CHECK(settings_parse(&A, frec, strlen(frec), &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK(settings_current_preset(&A) == SETTINGS_PRESET_RECOMMENDED);
+        CHECK(settings_get_bool(&A, S_SMOOTH_LEGS));
         CHECK_STR(settings_get(&A, S_TEX_FILTER), "16");
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
         /* Custom: its own values; the new settings from the closest preset */
         CHECK(settings_parse(&A, forig144, strlen(forig144), &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
         CHECK_STR(settings_get(&A, S_FPS_LIMIT), "144");
         CHECK_STR(settings_get(&A, S_SMAA), "off");
         CHECK_STR(settings_get(&A, S_SNOW_LOOK), "original");                 /* closest: Original Xbox */
+        CHECK_STR(settings_get(&A, S_WEATHER), "original");
         CHECK(!settings_get_bool(&A, S_LIGHTMAP_SMOOTH) && !settings_get_bool(&A, S_SMOOTH_SEAMS));
         CHECK(!settings_get_bool(&A, S_HD_HUD));
         settings_format(&A, text, sizeof text);              /* written with the mark: the same values again */
         CHECK(settings_parse(&B, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK_STR(settings_get(&B, S_SNOW_LOOK), "original");
+        CHECK_STR(settings_get(&B, S_WEATHER), "original");
         CHECK(!settings_get_bool(&B, S_HD_HUD) && !settings_get_bool(&B, S_LIGHTMAP_SMOOTH));
         CHECK(settings_parse(&A, frec1080, strlen(frec1080), &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
         CHECK_STR(settings_get(&A, S_RESOLUTION), "1920x1080");
         CHECK_STR(settings_get(&A, S_TEX_FILTER), "off");                     /* its own value */
         CHECK_STR(settings_get(&A, S_SNOW_LOOK), "ps2");                      /* closest: Recommended */
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
         CHECK(settings_get_bool(&A, S_LIGHTMAP_SMOOTH) && settings_get_bool(&A, S_SMOOTH_SEAMS));
         CHECK(settings_get_bool(&A, S_HD_HUD));
         CHECK(settings_parse(&A, ftie, strlen(ftie), &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
         CHECK_STR(settings_get(&A, S_SMAA), "high");
+        CHECK(settings_get_bool(&A, S_SMOOTH_LEGS));               /* Custom: its own value */
         CHECK_STR(settings_get(&A, S_SNOW_LOOK), "original");                 /* tie: Original Xbox */
+        CHECK_STR(settings_get(&A, S_WEATHER), "original");
         CHECK(!settings_get_bool(&A, S_LIGHTMAP_SMOOTH) && !settings_get_bool(&A, S_HD_HUD));
         CHECK(settings_parse(&A, fbare, sizeof fbare - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK(settings_current_preset(&A) == SETTINGS_PRESET_RECOMMENDED);
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
     }
     /* 2b. files of revision 2 (no HdHud yet): a preset gets its HD HUD value, a custom file the default */
     {
@@ -924,13 +973,186 @@ static void test_stable(void)
         CHECK(settings_parse(&A, r2orig, sizeof r2orig - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK(settings_current_preset(&A) == SETTINGS_PRESET_ORIGINAL_XBOX);
         CHECK(!settings_get_bool(&A, S_HD_HUD));
+        CHECK_STR(settings_get(&A, S_WEATHER), "original");
         CHECK(settings_parse(&A, r2rec, sizeof r2rec - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK(settings_current_preset(&A) == SETTINGS_PRESET_RECOMMENDED);
         CHECK(settings_get_bool(&A, S_HD_HUD));
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
         CHECK(settings_parse(&A, r2cust, sizeof r2cust - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
         CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
         CHECK_STR(settings_get(&A, S_TEX_FILTER), "off");
         CHECK(settings_get_bool(&A, S_HD_HUD));
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");                        /* closest: Recommended */
+    }
+    /* 2c. files of revision 3 (the 0.1.4: no Weather yet): a preset gets its weather, a custom file
+     *     the weather of the preset it is closest to; written with the mark, a later choice stays */
+    {
+        static const char r3orig[] = "[Meta]\nVersion=1\nPresets=3\n[Display]\nRaceHud=xbox\nFrameRateLimit=60\n[Graphics]\n"
+                                     "HdHud=0\nTextureFiltering=off\nSmoothEdges=off\nSoftShadows=0\nSnowLook=original\n"
+                                     "LightmapSmoothing=0\n[Advanced]\nSmoothLegs=0\nSmoothTerrainSeams=0\n";
+        static const char r3o144[] = "[Meta]\nVersion=1\nPresets=3\n[Display]\nRaceHud=xbox\nFrameRateLimit=144\n[Graphics]\n"
+                                     "HdHud=0\nTextureFiltering=off\nSmoothEdges=off\nSoftShadows=0\nSnowLook=original\n"
+                                     "LightmapSmoothing=0\n[Advanced]\nSmoothLegs=0\nSmoothTerrainSeams=0\n";
+        static const char r3rec[] = "[Meta]\nVersion=1\nPresets=3\n[Graphics]\nTextureFiltering=16\n";
+        static const char r3r1080[] = "[Meta]\nVersion=1\nPresets=3\n[Display]\nResolution=1920x1080\n";
+        static const char r3deck[] = "[Meta]\nVersion=1\nPresets=3\n[Display]\nResolution=1280x800\nFrameRateLimit=60\n"
+                                     "[Graphics]\nSoftShadows=0\n";
+        static const char r4orig[] = "[Meta]\nVersion=1\nPresets=4\n[Display]\nRaceHud=xbox\nFrameRateLimit=60\n[Graphics]\n"
+                                     "HdHud=0\nTextureFiltering=off\nSmoothEdges=off\nSoftShadows=0\nSnowLook=original\n"
+                                     "LightmapSmoothing=0\n[Advanced]\nSmoothLegs=0\nSmoothTerrainSeams=0\n";
+        CHECK(settings_parse(&A, r3orig, sizeof r3orig - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_ORIGINAL_XBOX);
+        CHECK_STR(settings_get(&A, S_WEATHER), "original");
+        settings_format(&A, text, sizeof text);
+        CHECK(has_line(text, "Presets=4") && has_line(text, "Weather=original"));
+        CHECK(settings_parse(&B, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&B) == SETTINGS_PRESET_ORIGINAL_XBOX);
+        CHECK(settings_set(&B, S_WEATHER, "ps2"));           /* chosen since: stays */
+        settings_format(&B, text, sizeof text);
+        CHECK(settings_parse(&A, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+        CHECK(settings_parse(&A, r3o144, sizeof r3o144 - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+        CHECK_STR(settings_get(&A, S_FPS_LIMIT), "144");
+        CHECK_STR(settings_get(&A, S_WEATHER), "original");                   /* closest: Original Xbox */
+        CHECK(settings_parse(&A, r3rec, sizeof r3rec - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_RECOMMENDED);
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        CHECK(settings_parse(&A, r3r1080, sizeof r3r1080 - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");                        /* closest: Recommended */
+        CHECK(settings_parse(&A, r3deck, sizeof r3deck - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_STEAM_DECK);
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        CHECK(!settings_get_bool(&A, S_SMOOTH_SEAMS) && !settings_get_bool(&A, S_LIGHTMAP_SMOOTH));   /* the lighter Deck */
+        /* revision 4 without a Weather line (written by hand): the default, PS2, so not Original Xbox */
+        CHECK(settings_parse(&A, r4orig, sizeof r4orig - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+    }
+    /* 2d. the lighter Steam Deck of revision 4 (Smoother terrain seams and Lightmap smoothing off):
+     *     the 0.1.4's Steam Deck file, every shown line written as its launcher does, is moved to it,
+     *     and so are the Steam Deck files of revision 2 and of the 0.1.3; a Steam Deck its player
+     *     changed (Custom) keeps its own seams and lightmap and takes the Weather of the preset it
+     *     is closest to; Recommended keeps both on; written with the mark, a later choice stays */
+    {
+        static char d014[64 * 1024], d120[64 * 1024], dseams[64 * 1024], rec014[64 * 1024], rec014l[64 * 1024];
+        static const char *const to_014[] = { "Presets=4", "Presets=3", "SmoothTerrainSeams=0", "SmoothTerrainSeams=1",
+                                              "LightmapSmoothing=0", "LightmapSmoothing=1", "Weather=ps2", "",
+                                              "SmoothLegs=0", "SmoothLegs=1" };
+        static const char *const to_120[] = { "FrameRateLimit=60", "FrameRateLimit=120" };
+        static const char *const to_seams_off[] = { "SmoothTerrainSeams=1", "SmoothTerrainSeams=0" };
+        static const char *const rec_to_014[] = { "Presets=4", "Presets=3", "Weather=ps2", "" };
+        static const char *const to_legs_off[] = { "SmoothLegs=1", "SmoothLegs=0" };
+        static const char r2deck[] = "[Meta]\nVersion=1\nPresets=2\n[Display]\nResolution=1280x800\nFrameRateLimit=60\n"
+                                     "[Graphics]\nSoftShadows=0\nLightmapSmoothing=1\n[Advanced]\nSmoothTerrainSeams=1\n";
+        static const char r1deck[] = "[Meta]\nVersion=1\n[Display]\nResolution=1280x800\nFrameRateLimit=60\n"
+                                     "[Graphics]\nSoftShadows=0\nTextureFiltering=off\n";
+        /* a Steam Deck without the mark from a development build that wrote Lightmap smoothing: read with
+         * the values of its own revision (Off, before revision 2), not those of revision 3 */
+        static const char r1deckl[] = "[Meta]\nVersion=1\n[Display]\nResolution=1280x800\nFrameRateLimit=60\n"
+                                      "[Graphics]\nSoftShadows=0\nTextureFiltering=off\nLightmapSmoothing=0\n";
+        /* the 0.1.4's Steam Deck: this Steam Deck written, then as the 0.1.4 had it */
+        settings_defaults(&B);
+        settings_apply_preset(&B, SETTINGS_PRESET_STEAM_DECK);
+        settings_format(&B, text, sizeof text);
+        CHECK(has_line(text, "Presets=4") && has_line(text, "Weather=ps2"));
+        CHECK(has_line(text, "SmoothTerrainSeams=0") && has_line(text, "LightmapSmoothing=0"));
+        with_lines(d014, sizeof d014, text, to_014, 10);
+        CHECK(has_line(d014, "Presets=3") && has_line(d014, "SmoothTerrainSeams=1") && has_line(d014, "LightmapSmoothing=1"));
+        CHECK(!strstr(d014, "Weather=") && has_line(d014, "SmoothLegs=1"));
+        CHECK(settings_parse(&A, d014, strlen(d014), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_STEAM_DECK);
+        CHECK(!settings_get_bool(&A, S_SMOOTH_SEAMS) && !settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+        CHECK(!settings_get_bool(&A, S_SMOOTH_LEGS));             /* the game's legs, as in the Steam Deck now */
+        CHECK_STR(settings_get(&A, S_TEX_FILTER), "16");          /* the rest of the Deck as it was */
+        CHECK_STR(settings_get(&A, S_SNOW_LOOK), "ps2");
+        CHECK(settings_get_bool(&A, S_HD_HUD));
+        CHECK_STR(settings_get(&A, S_SMAA), "high");
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        settings_format(&A, text, sizeof text);                   /* written with the mark */
+        CHECK(has_line(text, "Presets=4") && has_line(text, "SmoothTerrainSeams=0") && has_line(text, "LightmapSmoothing=0"));
+        CHECK(settings_parse(&B, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&B) == SETTINGS_PRESET_STEAM_DECK);
+        CHECK(settings_set(&B, S_SMOOTH_SEAMS, "1"));             /* turned back on since: stays, Custom */
+        settings_format(&B, text, sizeof text);
+        CHECK(settings_parse(&A, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_get_bool(&A, S_SMOOTH_SEAMS) && !settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+        /* the 0.1.4's Steam Deck at 120 fps (Custom): its own seams and lightmap, the Weather of
+         * the preset it is closest to (Steam Deck: PS2); written with the mark, the same again */
+        with_lines(d120, sizeof d120, d014, to_120, 2);
+        CHECK(settings_parse(&A, d120, strlen(d120), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+        CHECK_STR(settings_get(&A, S_FPS_LIMIT), "120");
+        CHECK(settings_get_bool(&A, S_SMOOTH_SEAMS) && settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+        CHECK(settings_get_bool(&A, S_SMOOTH_LEGS));              /* Custom: its own legs too */
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        settings_format(&A, text, sizeof text);
+        CHECK(settings_parse(&B, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&B) == SETTINGS_PRESET_CUSTOM);
+        CHECK(settings_get_bool(&B, S_SMOOTH_SEAMS) && settings_get_bool(&B, S_LIGHTMAP_SMOOTH));
+        /* the 0.1.4's Steam Deck with the seams turned off by its player (Custom): kept as they are */
+        with_lines(dseams, sizeof dseams, d014, to_seams_off, 2);
+        CHECK(settings_parse(&A, dseams, strlen(dseams), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+        CHECK(!settings_get_bool(&A, S_SMOOTH_SEAMS) && settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        /* the Steam Deck of revision 2 and of the 0.1.3 (no mark, 0.1.3's Off filtering): the lighter Deck */
+        CHECK(settings_parse(&A, r2deck, sizeof r2deck - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_STEAM_DECK);
+        CHECK(!settings_get_bool(&A, S_SMOOTH_SEAMS) && !settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+        CHECK(settings_get_bool(&A, S_HD_HUD));
+        CHECK(settings_parse(&A, r1deck, sizeof r1deck - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_STEAM_DECK);
+        CHECK(!settings_get_bool(&A, S_SMOOTH_SEAMS) && !settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+        CHECK_STR(settings_get(&A, S_TEX_FILTER), "16");
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        CHECK(settings_parse(&A, r1deckl, sizeof r1deckl - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_STEAM_DECK);
+        CHECK(!settings_get_bool(&A, S_SMOOTH_SEAMS) && !settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+        /* the 0.1.4's Recommended, every shown line written: Recommended, both on, the legs on */
+        settings_defaults(&B);
+        settings_apply_preset(&B, SETTINGS_PRESET_RECOMMENDED);
+        settings_format(&B, text, sizeof text);
+        with_lines(rec014, sizeof rec014, text, rec_to_014, 4);
+        CHECK(has_line(rec014, "Presets=3") && has_line(rec014, "SmoothTerrainSeams=1") && !strstr(rec014, "Weather="));
+        CHECK(has_line(rec014, "SmoothLegs=1"));
+        CHECK(settings_parse(&A, rec014, strlen(rec014), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_RECOMMENDED);
+        CHECK(settings_get_bool(&A, S_SMOOTH_SEAMS) && settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+        CHECK(settings_get_bool(&A, S_SMOOTH_LEGS));
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        settings_format(&A, text, sizeof text);                   /* written with the mark: On, Recommended */
+        CHECK(has_line(text, "Presets=4") && has_line(text, "SmoothLegs=1"));
+        CHECK(settings_parse(&B, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(settings_current_preset(&B) == SETTINGS_PRESET_RECOMMENDED);
+        CHECK(settings_set(&B, S_SMOOTH_LEGS, "0"));              /* turned off since: stays, Custom */
+        settings_format(&B, text, sizeof text);
+        CHECK(settings_parse(&A, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(!settings_get_bool(&A, S_SMOOTH_LEGS));
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+        /* the 0.1.4's Recommended with Smoother legs turned off by its player (Custom in the 0.1.4):
+         * its own Off kept, the Weather of the preset it is closest to (Recommended); still Custom */
+        with_lines(rec014l, sizeof rec014l, rec014, to_legs_off, 2);
+        CHECK(settings_parse(&A, rec014l, strlen(rec014l), &bad) == SETTINGS_LOAD_OK && bad == 0);
+        CHECK(!settings_get_bool(&A, S_SMOOTH_LEGS));
+        CHECK_STR(settings_get(&A, S_WEATHER), "ps2");
+        CHECK(settings_get_bool(&A, S_SMOOTH_SEAMS) && settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+        CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+        /* the 0.1.4's Steam Deck with Smoother legs turned off by its player (Custom in the 0.1.4):
+         * kept as it is (its seams and lightmap on, its legs off), as the seams above */
+        {
+            static char d014l[64 * 1024];
+            with_lines(d014l, sizeof d014l, d014, to_legs_off, 2);
+            CHECK(settings_parse(&A, d014l, strlen(d014l), &bad) == SETTINGS_LOAD_OK && bad == 0);
+            CHECK(!settings_get_bool(&A, S_SMOOTH_LEGS));
+            CHECK(settings_get_bool(&A, S_SMOOTH_SEAMS) && settings_get_bool(&A, S_LIGHTMAP_SMOOTH));
+            CHECK(settings_current_preset(&A) == SETTINGS_PRESET_CUSTOM);
+        }
+        settings_defaults(&A);
+        settings_defaults(&B);
     }
 
     /* 3. a development file with Modern, its effects on, a smooth stick and the player's own
@@ -989,10 +1211,50 @@ static void test_stable(void)
     for (p = 0; p < SETTINGS_PRESET_COUNT; p++) {
         settings_apply_preset(&A, p);
         CHECK(settings_current_preset(&A) == p);
-        CHECK(settings_get_bool(&A, S_LIGHTMAP_SMOOTH) == (p != SETTINGS_PRESET_ORIGINAL_XBOX));
-        CHECK(settings_get_bool(&A, S_SMOOTH_SEAMS) == (p != SETTINGS_PRESET_ORIGINAL_XBOX));
+        CHECK(settings_get_bool(&A, S_LIGHTMAP_SMOOTH) == (p != SETTINGS_PRESET_ORIGINAL_XBOX && p != SETTINGS_PRESET_STEAM_DECK));
+        CHECK(settings_get_bool(&A, S_SMOOTH_SEAMS) == (p != SETTINGS_PRESET_ORIGINAL_XBOX && p != SETTINGS_PRESET_STEAM_DECK));
     }
     settings_defaults(&A);
+}
+
+/* ── PlayStation controllers: CONTROLS > CONTROLLERS, PC, off by default, in no preset (a preset
+ *    never turns it on or off), XBOX_PS_PADS; written in [Controls], read back ── */
+static void test_ps_controllers(void)
+{
+    static char text[65536];
+    static const char f_on[] = "[Meta]\nVersion=1\n[Controls]\nPlayStationControllers=1\n";
+    const SettingDef *d = settings_def(S_PS_CONTROLLERS);
+    const char *controls, *line, *next;
+    int p, bad = 0;
+    settings_defaults(&A);
+    CHECK(settings_find("Controls", "PlayStationControllers") == S_PS_CONTROLLERS);
+    CHECK(S_PS_CONTROLLERS == SETTINGS_COUNT - 1);          /* the last id: no other one moved */
+    CHECK(!settings_get_bool(&A, S_PS_CONTROLLERS));
+    CHECK_STR(d->def, "0");
+    CHECK(d->type == SETTING_BOOL);
+    CHECK(d->tab == SETTINGS_TAB_CONTROLS);
+    CHECK_STR(d->group, "CONTROLLERS");
+    CHECK_STR(d->env, "XBOX_PS_PADS");
+    CHECK(d->flags == SETTING_PC);
+    for (p = 0; p < SETTINGS_PRESET_COUNT; p++) CHECK(d->preset[p] == NULL);
+    for (p = 0; p < SETTINGS_PRESET_COUNT; p++) {
+        settings_set(&A, S_PS_CONTROLLERS, "1");
+        settings_apply_preset(&A, p);
+        CHECK(settings_get_bool(&A, S_PS_CONTROLLERS));
+    }
+    /* written in [Controls], after ButtonStyle, before the next section */
+    settings_format(&A, text, sizeof text);
+    controls = strstr(text, "\n[Controls]\n");
+    line = strstr(text, "\nPlayStationControllers=1\n");
+    next = controls ? strstr(controls + 1, "\n[") : NULL;
+    CHECK(controls && line && line > controls && (!next || line < next));
+    CHECK(line && strstr(text, "\nButtonStyle=") && strstr(text, "\nButtonStyle=") < line);
+    CHECK(settings_parse(&B, text, strlen(text), &bad) == SETTINGS_LOAD_OK && bad == 0);
+    CHECK(settings_get_bool(&B, S_PS_CONTROLLERS));
+    CHECK(settings_parse(&B, f_on, sizeof f_on - 1, &bad) == SETTINGS_LOAD_OK && bad == 0);
+    CHECK(settings_get_bool(&B, S_PS_CONTROLLERS));
+    settings_defaults(&A);
+    settings_defaults(&B);
 }
 
 int main(int argc, char **argv)
@@ -1006,6 +1268,7 @@ int main(int argc, char **argv)
     test_files(root);
     test_install_root(root);
     test_first_start(root);
+    test_ps_controllers();
     printf("%s: %d checks, %d failed\n", s_fail ? "FAIL" : "PASS", s_checks, s_fail);
     return s_fail ? 1 : 0;
 }

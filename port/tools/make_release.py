@@ -52,10 +52,11 @@ Start
   directly; to see the launcher again, hold Shift (or Back / Select on a
   controller) while you start OpenTricky.exe.
 
-Coming from 0.1.2 or 0.1.3
+Coming from 0.1.2, 0.1.3 or 0.1.4
   Let the launcher update you: your saves, settings and disc image are kept (a
-  preset takes its new values). Your 0.1.2 or 0.1.3 launcher checks GitHub
-  once a day: if no update shows up, close it, delete update-cache.txt next to
+  preset takes its new values). If no update shows up, the 0.1.4 launcher
+  has Check now (Settings > Advanced > Updates); a 0.1.2 or 0.1.3 launcher
+  checks GitHub once a day: close it, delete update-cache.txt next to
   settings.ini, and open it again.
 
 Coming from 0.1.1
@@ -73,7 +74,9 @@ Coming from 0.1.1
   "SSX Tricky.exe").
 
 In the game
-  F12          screenshot (Screenshots folder beside OpenTricky.exe)
+  F12          screenshot (Screenshots folder beside OpenTricky.exe, or
+               Documents\\My Games\\SSX Tricky\\Screenshots when the folder
+               of OpenTricky.exe can't be written)
   Shift+F12    a burst of screenshots
   Alt+Enter    window / fullscreen (F11 too)
   Alt+F4       quit

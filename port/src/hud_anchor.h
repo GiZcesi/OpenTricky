@@ -44,10 +44,19 @@
  *     and end-screen menus) is drawn in the centred 16:9 frame: its x is
  *     scaled by (16/9) / shape about the centre, as the title draws it at
  *     16:9 -- by (4/3) / shape with XBOX_FIX_RACE2D (below). Quads over the whole width touching the top or the bottom
- *     (fades, letterbox) stay stretched.
+ *     (fades, letterbox) stay stretched ;
+ *   - but the shots the title stages in a race (the scene after the finish
+ *     line: aspect_staged_shot; not the replays) are shown as on a 16:9 screen,
+ *     whatever the menus: the title's 16:9 x-scale, in a centred 16:9
+ *     frame, the race's 2D over them at the 4:3 proportions of that frame
+ *     (the panels to its edges); whole and never widened, from the title's
+ *     own eye ; hud_anchor_image_wide says it for the tick. On a screen of
+ *     16:9 or narrower they are the race's image, as before.
  * A frame tag after each FRAME_BEGIN says which; the translator applies
  * it to the image the frame's overlay goes into (the 3D of the frame
- * before), so a switch never shows a frame drawn for the other one.
+ * before). The race's render chooses its frame when it starts, before its
+ * camera's projection, and RenderFrame keeps that choice: a switch within
+ * a race never shows a frame drawn for the other one.
  *   XBOX_WIDE_MENUS=0   off: everything stretched as before (tests).
  *   Menus at 4:3 (aspect.h, ASPECT_MENUS_*): the same, with a centred 4:3
  *   frame from 16:9 up and the title's 4:3 x-scale for the framed image.
@@ -116,6 +125,7 @@ enum { HUD_SIZE_COUNT = 5 };                /* 100, 90, 85, 80, 70 % */
 #define HUD_BOX_ON          1u      /* record framed in the centred 16:9 */
 #define HUD_BOX_FRAME_BOXED 2u      /* frame tag: the whole frame shown at 16:9 */
 #define HUD_BOX_FRAME_WIDE  3u      /* frame tag: wide 3D, menus framed */
+#define HUD_BOX_FRAME_169   4u      /* frame tag: the whole frame shown at 16:9, its 2D as a race's at 16:9 */
 /* Panels edge to edge, PGRAPH_PANEL_TAG_* there. First tag: bits 0-13 =
  * the panel's left edge (1/16 pixel of the 640x480 screen) ; second tag:
  * bits 0-13 = its right edge. */
@@ -149,6 +159,9 @@ void hud_anchor_set(double shape, int mode, int size);
 uint32_t hud_anchor_tag(uint32_t obj, uint32_t view, uint32_t *tag_y);
 /* At each H1: the frame tag to write after FRAME_BEGIN (0 = none). */
 uint32_t hud_anchor_frame(void);
+/* 1: the image is the race's wide 3D (a race on screen, no staged shot):
+ * the follow camera's back-off is for such an image only (aspect.c). */
+int hud_anchor_image_wide(void);
 /* At each H1, with the HD HUD: the image's HD gate bits (HUD_HDGATE_*). */
 uint32_t hud_anchor_hd_gate(void);
 /* The block of 0xC44E0 that draws the Tricky gauge starts (1) / ends (0):

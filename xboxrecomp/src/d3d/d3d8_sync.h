@@ -13,7 +13,8 @@
  *                      stays slower than the refresh rate (or than the frame
  *                      rate limit, d3d8_sync_set_pace) over ~0.5 s, rather
  *                      than waiting for the next refresh; a load (no frame
- *                      for 60 ms) is not taken for a slow game
+ *                      for 60 ms) is not taken for a slow game, nor a video
+ *                      (its frames come at the file's rate: VSync)
  *   XBOX_SYNC_LATENCY=N  (flip model) frames queued at most, 1..3, default 2;
  *                      wait on the latency object before each Present
  *   XBOX_RENDER_GATE=N (flip model, off by default) the wait moves to the
@@ -53,6 +54,17 @@ UINT d3d8_sync_swap_flags(void);
 void d3d8_sync_window_changed(void);
 /* Latency wait + Present + measurements. *dxgi_ms = duration of the Present alone. */
 HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms);
+/* O-B: fn is called by d3d8_sync_present after its waits, just
+ * before the DXGI Present, on the presenting thread (NULL: none). */
+void d3d8_sync_set_before_present(void (*fn)(void));
+/* The next d3d8_sync_present carries a frame of the title's video
+ * player (d3d8_device.c), which comes at the file's rate (29.97 fps), once per
+ * frame -- not one of the game's frames at its frame rate limit. That present
+ * only; presenting thread, right before it. */
+void d3d8_sync_video_frame(int on);
+/* 1 when the last d3d8_sync_present left its frame out (60 Hz displays: two
+ * of the game's frames on one refresh), 0 when it presented it. */
+int  d3d8_sync_left_out(void);
 /* Any thread: 1 while frames are shown as soon as they are presented (VSync
  * off, or the late frames of Adaptive while the game is slower than its pace;
  * tearing allowed; flipped on their own, not composed by the desktop), 0

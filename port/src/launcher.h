@@ -58,6 +58,7 @@ typedef struct LauncherConfig {
     int  launcher_music;  /* the game's title music, quietly, in the launcher ([Launcher] LauncherMusic, 1) */
     int  draw_dist;       /* XBOX_DRAW_DISTANCE: 0 Original (default), 1 Far, 2 Max */
     int  snow_look;       /* XBOX_SNOW_LOOK: 0 Original, 1 Soft = "ps2" (default) */
+    int  weather;         /* XBOX_WEATHER: 0 Original, 1 PS2 = "ps2" (default) */
     int  lightmap_smooth; /* XBOX_LIGHTMAP_FILTER: 0 off (default), 1 = catmull (terrain lightmap) */
     int  render_scale;    /* XBOX_RENDER_SCALE: the 3D in percent, 50..200, 100 (default) = off */
     int  hd_hud;          /* XBOX_HD_HUD: 1 = the race HUD from the HD HUD files the game ships
@@ -75,11 +76,15 @@ typedef struct LauncherConfig {
     int  smooth_motion;   /* XBOX_FPS_INTERP: 1 = frames in between interpolated above 60 (default);
                            * a hidden setting, for troubleshooting */
     int  smooth_legs;     /* XBOX_FPS_SMOOTH_LEGS: 1 = legs and board smoothed in a carve (display only;
-                           * ADVANCED > SMOOTHING "Smoother legs in turns", default 1, 0 in Original Xbox) */
+                           * ADVANCED > SMOOTHING "Smoother legs in turns", default 1: on in Recommended,
+                           * 0 in Original Xbox and Steam Deck) */
     int  smooth_seams;    /* XBOX_TERRAIN_BLEND=2 + _WIDTH=0.75 + XBOX_TERRAIN_CLAMP=2 (terrain_seams.c): 1 = softer lines between
                            * terrain pieces (display only; hidden SmoothTerrainSeams, default 1, 0 in Original Xbox) */
     int  unlock_all;      /* XBOX_UNLOCK_ALL: 1 = SaveProfile=unlockall, the game's own unlock-everything
                            * cheat on and the saves in <save folder>\UnlockAll (default 0, My save) */
+    int  ps_pads;         /* XBOX_PS_PADS: 1 = PlayStation controllers through SDL3 (pad_sdl.h;
+                           * CONTROLS "PlayStation controllers", experimental, default 0); last, so
+                           * that no other field moves */
 } LauncherConfig;
 
 /* XBOX_UNLOCK_ALL as the game runs with it (after launcher_fork_apply). */
@@ -124,8 +129,8 @@ void launcher_migrate_saves(const char *save_u8);
  * to the install root (settings_install_root, the folder of OpenTricky.exe),
  * not to the working folder; an absolute one or "" is copied as it is. */
 void launcher_resolve_path(const char *path, char *out, size_t out_sz);
-/* The install root, wide, without a trailing separator: where the game keeps
- * what it writes (CrashReports\, Screenshots\) and finds OpenTricky.exe. */
+/* The install root, wide, without a trailing separator: the folder of OpenTricky.exe,
+ * where CrashReports\ and Screenshots\ go when it can be written (each has a fallback). */
 BOOL launcher_install_root_w(WCHAR *out, size_t n);
 /* A player's game of this install is running (a named mutex, settings.h
  * settings_instance_name): the launcher's PLAY says so instead of starting a

@@ -52,13 +52,13 @@
 #include "version.h"
 #include "hostui.h"
 #include "controls.h"
+#include "pad_sdl.h"
 #include "crashreport.h"
 /* NV2A DAC palette trap (nv2a/nv2a_mmio_hook.c). */
 #include <stdbool.h>
 bool nv2a_dac_trap_install(unsigned char *mem_base);
 bool nv2a_dac_handle_mmio(PCONTEXT ctx, unsigned int fault_xbox_va, int is_write);
 #include "pass_tags.h"
-#include "netplay/np_net.h"
 /* Fork: read by the generated code (fix_deadflags.py), set in main(). One bit per
  * revived branch: 0x1 sub_00019468, 0x2 sub_000BE680, 0x4 sub_001281DB. */
 int g_fix_deadflags = 0x7;
@@ -66,6 +66,9 @@ int g_fix_deadflags = 0x7;
 int g_fix_kickwait = 1;
 /* Fork: read by the generated code (fix_getwait.py), set in main(). */
 int g_fix_getwait = 1;
+/* Fork: read by the generated code (fix_occlwait.py), set in main(); on always (1). With the
+ * developer tools, XBOX_FIX_OCCLWAIT=0: the original bare loop; =count (2): the diagnostic. */
+int g_fix_occlwait = 1;
 /* Read by the generated code (fix_riderlist.py), set in main(). */
 int g_fix_riderlist = 1;
 /* Fork: read by the generated code (fix_speechhold.py), set in main(). */
@@ -114,6 +117,7 @@ void fork_riderlist_note(uint32_t kind, uint32_t race, uint32_t tick, uint32_t r
 #include "strmwalk.h"
 #include "chantfix.h"
 #include "riderlod.h"
+#include "weather.h"
 #include "hud_anchor.h"
 #include "nv2a/nv2a_hdtex.h"
 #include "pumplag.h"
@@ -131,11 +135,11 @@ int  d3d8_post_wanted(void);        /* fork: the phase callback is wanted (d3d8_
 int  d3d8_rscale_wanted(void);      /* fork: render scale of the 3D (d3d8_rscale.h) */
 void d3d8_PassPhaseChanged(int old_phase, int new_phase, unsigned tag);
 void pgraph_d3d11_set_pass_phase_callback(void (*fn)(int, int, unsigned));
-void pgraph_d3d11_set_image_end_callback(void (*fn)(void));
 void d3d8_SetAnisotropy(int n);
 void d3d8_SetShowFps(int on);
 int  d3d8_bloom_wanted(void);
 int  d3d8_temporal_wanted(void);       /* fork: d3d8_temporal.h */
+static void ps_pads_exit(void) { padsdl_quit(200); }     /* run by d3d8_HostExit (pad_sdl.h) */
 
 /* Where this run's log goes (empty: no log), and whether a crash should be
  * explained in a message box -- only for the player, never in a test run,
@@ -802,12 +806,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     AddVectoredExceptionHandler(1, veh_handler);
 
 
-    /* Online multiplayer (netplay/np_net.h). Off by default, and
-     * empty stubs in a build without it; exclusive with the ghost (which is
-     * switched off). */
-    np_net_init();
-    /* Name tags over the other players' riders (online mode only; nothing offline). */
-    np_tags_init();
 
     /* Ask for a 1 ms scheduler tick.
      *
@@ -1039,10 +1037,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 printf("XBOX_FORK_INI: %s not found, fork defaults\n", ini);
             launcher_fork_load(&fc, ini);
             launcher_fork_apply(&fc, "XBOX_FORK_INI");
+            hostui_test_ini(ini);                       /* the .txt of F12 shows it */
         } else {
             launcher_fork_apply(&launch_cfg, NULL);     /* report only */
         }
     }
+    /* PlayStation controllers (experimental, XBOX_PS_PADS=1 just above;
+     * pad_sdl.h): their motors stopped when the window closes the game.
+     * Off: nothing. */
+    if (padsdl_on()) d3d8_SetHostExitHook(ps_pads_exit);
 
     /* Pass tags (XBOX_PASS_TAGS). Off by default, and then
      * recomp_lookup_manual() hands out none of its hooks. */
@@ -1088,6 +1091,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Riders always drawn with their most detailed model set
      * (XBOX_RIDER_LOD_MAX, on by default; see riderlod.h). */
     riderlod_init();
+    /* Weather PS2: the snowfall without the Xbox's fog, as in the PS2 version
+     * (XBOX_WEATHER=ps2, or Weather in the .ini through the launcher above);
+     * unset, the original game (see weather.h). */
+    weather_init();
     /* HD textures (XBOX_HD_TEXTURES, or HdTextures + HdTexturesPath
      * in the .ini through the launcher above). Off by default: the translator
      * never looks at the index. The index the game carries is a resource. */
@@ -1137,6 +1144,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         const char *e = getenv("XBOX_FIX_GETWAIT");
         g_fix_getwait = !(e && e[0] == '0');
+    }
+    /* Fork: the wait for a visibility test's report (sub_000FBEA6) asleep on the
+     * report's status, its bound never before the console's time nor before the
+     * bare loop's end here, the loop followed while the wait sleeps; on always. With the
+     * developer tools only: XBOX_FIX_OCCLWAIT=0, the original bare loop;
+     * XBOX_OCCLWAIT_BOUND_MS: the console's time in ms, 0 = the bound 0x100000 rounds
+     * at the loop's lower median pace; XBOX_OCCLWAIT_LOOP=live (default) | static | off;
+     * XBOX_OCCLWAIT_LOOP_MARGIN: the margin over the bare loop's rounds;
+     * XBOX_FIX_OCCLWAIT=count (diagnostic): the bare loop, timed, its waits that reach
+     * the bound counted and set against the bounds the wait would take;
+     * XBOX_OCCLWAIT_TRACE=file: a line per wait. The call is in the generated code (fork
+     * pass fix_occlwait.py), the wait in xbox_occl_wait (xbox_memory_layout.c). */
+    {
+        if (g_fix_occlwait) xbox_occl_wait_init(g_fix_occlwait == 2);
     }
     /* Bounded walk of the AI and Player lists in sub_0002F800
      * (XBOX_FIX_RIDERLIST, default 1). The guards are in the generated code (fork pass
@@ -1194,14 +1215,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * The render scale of the 3D uses it too: the first HUD group of an
      * image brings the 3D to the render size (d3d8_rscale.h); 100 % = not
      * registered for it. The bloom and the temporal inputs too: one
-     * condition, d3d8_post_wanted(); every post effect off = no callback.
-     * The online name tags take the callback first: np_tags_phase runs the
-     * post at FRAME_END itself, then draws the tags. */
-    if (g_np_tags_on) {     /* online name tags: drawn at FRAME_END, after the post (np_tags_phase calls it) */
-        pgraph_d3d11_set_pass_phase_callback(np_tags_phase);
-        pgraph_d3d11_set_image_end_callback(np_tags_image_end);    /* the waiting banner, over the HUD */
-    }
-    else if (d3d8_post_wanted())
+     * condition, d3d8_post_wanted(); every post effect off = no callback. */
+    if (d3d8_post_wanted())
         pgraph_d3d11_set_pass_phase_callback(d3d8_PassPhaseChanged);
     fprintf(stderr, "[POST] phase callback %s (split %d, render scale %d %%, bloom %d, temporal %d)\n",
             d3d8_post_wanted() ? "on" : "off", d3d8_post_split_wanted(), d3d8_rscale_wanted(),

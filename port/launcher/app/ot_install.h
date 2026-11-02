@@ -98,15 +98,22 @@ void ot_install_cleanup(const std::string &base);
 /* Where the game and the interface files are: base + "bin\" when it holds
  * ui\ (the game too, normally), else base (everything in one folder). */
 std::string ot_program_dir(const std::string &base);
-/* At start, once the game is in bin\: removes the copies of the program left
- * beside OpenTricky.exe (SSX Tricky.exe, ui\, THIRD-PARTY-LICENSES.txt) by the
- * update from 0.1.1 or by unzipping a new version over an old one. Nothing
- * else: never old\ nor a player's file. A file in use stays (`failed`) and is
- * tried again at the next start. */
-void ot_install_tidy_root(const std::string &base, std::vector<std::string> &removed, std::vector<std::string> &failed);
+/* At start, once the game is in bin\: removes the copies of the program that
+ * an install of 0.1.1 left beside OpenTricky.exe (SSX Tricky.exe, ui\,
+ * THIRD-PARTY-LICENSES.txt) when a new version was unzipped over it -- only
+ * the files that are exactly 0.1.1's, then their folders left empty. Never
+ * old\ nor a player's file, never through a junction or a link: anything else
+ * of those names stays (`kept`, with why). What cannot be removed now (a
+ * file or a folder in use, or protected) stays (`failed`) without being read,
+ * and is tried again at the next start. */
+void ot_install_tidy_root(const std::string &base, std::vector<std::string> &removed, std::vector<std::string> &kept,
+                          std::vector<std::string> &failed);
 
 /* Exposed for the tests. */
 std::string ot_sha256_file(const std::string &path);
 bool ot_unzip(const std::string &zip, const std::string &dir, std::string &error);
+/* What an update from the unpacked zip `stage` would do in `base`, one line
+ * per entry in order: "+ <name>" put in place, "- <name>" removed. */
+std::vector<std::string> ot_install_plan(const std::string &stage, const std::string &base);
 
 #endif /* OT_INSTALL_H */

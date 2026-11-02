@@ -56,6 +56,14 @@ void controls_keep_essential(ControlMap *m);
 void controls_set_current(const ControlMap *m);
 void controls_get_current(ControlMap *m);
 
+/* PlayStation controllers (pad_sdl.h; experimental, XBOX_PS_PADS=1): each
+ * controller, Xbox or PlayStation, keeps its port (player) until it is
+ * unplugged (controls.c). Only with the option on: off, controls_ps_on is
+ * FALSE, the two others do nothing, and each port is XInput's own index. */
+BOOL controls_ps_on(void);
+BOOL controls_port_present(DWORD port);                          /* a controller plays on port */
+void controls_port_rumble(DWORD port, WORD left, WORD right);    /* to it (XInput motor speeds) */
+
 /* Physical controller `port` through the mapping. FALSE if none is there. */
 BOOL controls_read_pad(DWORD port, ControlsPad *out);
 /* OR the keyboard's held bindings into `io` (port 0). */

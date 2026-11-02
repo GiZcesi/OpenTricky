@@ -846,6 +846,13 @@ IDirect3DTexture8 *d3d8_PrevFrameTexture(void);
  * the host makes once and only samples (HD replacements). */
 HRESULT d3d8_CreateTextureFromLevels(UINT Width, UINT Height, UINT Levels,
                                      const void *const *level_bits, IDirect3DTexture8 **ppTex);
+/* The texture CreateTexture makes (same format, levels and view),
+ * created in one call with its finished levels as initial data, level i =
+ * max(w >> i, 1) x max(h >> i, 1) at the format's row pitch (DXT: blocks per
+ * row x block bytes). It keeps no system-memory copy, so it cannot be
+ * locked: for the textures the push-buffer pump decodes once and samples. */
+HRESULT d3d8_CreateTextureWithData(UINT Width, UINT Height, UINT Levels, D3DFORMAT Format,
+                                   const void *const *level_bits, IDirect3DTexture8 **ppTex);
 /* NV2A window clip as a scissor rectangle for game draws. */
 void d3d8_SetWindowClip(int on, long x0, long y0, long x1, long y1);
 int d3d8_WindowClipOn(void);
@@ -866,10 +873,12 @@ void d3d8_GetGuestScale(float *sx, float *sy);
  * frame at this shape. d3d8_HostAspect returns the shape in use. */
 void   d3d8_SetHostAspect(double aspect);
 double d3d8_HostAspect(void);
-/* Fork: 1 = the next image is shown in a centred 16:9 frame (black
- * bars) on a wider screen ; the translator sets it per image. Captures and
- * screenshots show it the same way. */
-void   d3d8_SetPresentBox(int on);
+/* Fork: the next image is shown in a centred frame (black bars) on a wider
+ * screen: D3D8_PRESENT_BOX_FRAME the menus' frame (d3d8_SetPresentBoxShape),
+ * D3D8_PRESENT_BOX_169 a 16:9 one whatever the menus ; the translator sets
+ * it per image. Captures and screenshots show it the same way. */
+enum { D3D8_PRESENT_BOX_OFF, D3D8_PRESENT_BOX_FRAME, D3D8_PRESENT_BOX_169 };
+void   d3d8_SetPresentBox(int mode);
 /* The frame's shape (16:9 default, 4:3 with XBOX_WIDE_MENUS=43). */
 void   d3d8_SetPresentBoxShape(double shape);
 /* The zoom the narrowed field of view puts on the 3D (1 = none).
@@ -909,13 +918,20 @@ int  d3d8_HostIsWidescreen(void);
 void d3d8_HostSetClientSize(unsigned w, unsigned h);
 void d3d8_HostToast(const wchar_t *text);
 void d3d8_HostExit(void);
-void d3d8_SetHostExitHook(void (*fn)(void));   /* run by d3d8_HostExit first (online: BYE) */
+void d3d8_SetHostExitHook(void (*fn)(void));   /* adds one (at most 4), run by d3d8_HostExit first
+                                                 * (PlayStation pads: motors off; optional modules) */
 /* Occlusion queries for the NV2A zpass counter (fork), pump thread only. */
 int   d3d8_OcclusionBegin(void);                         /* handle, -1 on failure */
 void  d3d8_OcclusionEnd(int h);
 int   d3d8_OcclusionPoll(int h, unsigned long long *samples);   /* 1 ready, 0 pending, -1 bad */
 void  d3d8_OcclusionRelease(int h);
 float d3d8_OcclusionScale(void);                         /* scene samples per title pixel */
+/* O-B: a fence mark after the commands recorded so far (0: no
+ * fence), the last mark the GPU is past, and the poll of a query the GPU is
+ * past, without the flush of flag 0. */
+unsigned long long d3d8_OcclusionMark(void);
+unsigned long long d3d8_OcclusionMarkDone(void);
+int   d3d8_OcclusionPollDone(int h, unsigned long long *samples);   /* as d3d8_OcclusionPoll, DONOTFLUSH */
 void d3d8_SetMsaa(int samples);          /* 1, 2, 4, 8; applied between frames */
 int  d3d8_GetMsaa(void);
 void d3d8_SetAnisotropy(int n);          /* 0 = the title's own, or 2..16 */
@@ -951,7 +967,8 @@ void d3d8_SetShotInfoHook(void (*fn)(char *buf, size_t n));
  * PNG out (NULL = failed: the built-in writer is used). */
 void d3d8_SetPngEncoder(void *(*fn)(const unsigned char *rgb, unsigned w, unsigned h, size_t *len));
 /* NV2A-native draws (d3d8_nv2a.c): pixel shaders generated from the
- * register combiners, keyed by nv2a_psh_key(). */
+ * register combiners, keyed by nv2a_psh_key(). has_ps: 1 compiled, 0 never
+ * tried, -1 tried and failed (add_ps tries each key once). */
 int d3d8_nv2a_has_ps(unsigned long long key);
 int d3d8_nv2a_add_ps(unsigned long long key, const char *hlsl, int len);
 HRESULT d3d8_nv2a_draw(D3DPRIMITIVETYPE prim, UINT prim_count, const void *verts, UINT stride,
@@ -975,3 +992,9 @@ int d3d8_GuestFramebufferActive(void);
 /* 0 while the GPU has not finished the previous movie present. */
 int d3d8_VideoPresentReady(void);
 void d3d8_SetGuestFramebufferAlt(const void *alt);
+/* One present per video frame, at the title's flip (d3d8_device.c). */
+void d3d8_NoteGuestFramebufferLockAt(uint32_t va, const void *p);
+int d3d8_GuestFramebufferFlip(uint32_t offset);
+int d3d8_VideoFramePending(void);
+void d3d8_NoteRenderedFrame(void);
+double d3d8_MsSincePresentQpc(void);

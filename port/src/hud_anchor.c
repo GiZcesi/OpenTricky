@@ -22,6 +22,7 @@ void d3d8_SetPresentBoxShape(double shape);           /* d3d8_xbox.h */
 extern int g_aspect_menus43;                          /* aspect.h */
 void pgraph_d3d11_set_box_race2d(float k2d);           /* nv2a_pgraph_d3d11.h */
 void pgraph_d3d11_set_box_frame(float kboxed);          /* nv2a_pgraph_d3d11.h */
+void pgraph_d3d11_set_box169(float k169);              /* nv2a_pgraph_d3d11.h */
 void sub_000D2D80(void);    /* finish banner overlay, vtable 0x19C600 [1] (thiscall, ret) */
 
 #define GFX_GLOBAL      0x001BA7A0u     /* the GfxContext (RenderFrame's this) */
@@ -39,6 +40,7 @@ void sub_000D2D80(void);    /* finish banner overlay, vtable 0x19C600 [1] (thisc
 int g_hud_anchor_on;
 int g_panel_on;                     /* XBOX_FIX_PANEL_EDGES: the panels' bars edge to edge */
 int g_box_on;
+static int s_box169;                /* the frame on and the screen wider than 16:9: staged shots at 16:9 */
 int g_race2d_on;
 static int   s_race2d;              /* XBOX_FIX_RACE2D: 0 off, 1 on (default), 2 + banner as race HUD */
 static int   s_mode = HUD_SHAPE_PROPORTIONAL;
@@ -114,6 +116,9 @@ void hud_anchor_set(double shape, int mode, int size)
         d3d8_SetPresentBoxShape(fr);
         pgraph_d3d11_set_box(g_box_on ? (float)(fr / shape) : 0.0f);
         pgraph_d3d11_set_box_frame(m43 ? 1.0f : 0.75f);     /* the panels' content in a framed image */
+        /* the shots the title stages in a race, wider than 16:9: at 16:9 */
+        s_box169 = g_box_on && shape > 16.0 / 9.0 + 0.005;
+        pgraph_d3d11_set_box169(s_box169 ? (float)((16.0 / 9.0) / shape) : 0.0f);
     }
     /* The race's own 2D outside the race HUD (finish banner, pause, end
      * screens) at the title's 4:3 proportions, like the race HUD: on any
@@ -806,12 +811,76 @@ static int frame_in_race(int st)
     return st >= 2;                 /* not before: the level loading, the riders' intro scenes (PreRace) */
 }
 
+/* The race's wide 3D: a race on screen, and no shot the title stages (the
+ * scene after the finish line: aspect_staged_shot; the replays are wide, as
+ * the race). Otherwise
+ * the title's own frame (16:9 at most for a staged shot), from the title's
+ * own eye: one rule for the frame (hud_anchor_frame, before each
+ * RenderFrame) and for the follow camera's back-off (aspect.c, when each
+ * tick builds its views). */
+static int image_wide(int st)
+{
+    return frame_in_race(st) && !aspect_staged_shot();
+}
+
+int hud_anchor_image_wide(void)
+{
+    return image_wide(race_state());
+}
+
 static int s_frame_wide;            /* this RenderFrame is a race on screen */
 static int s_frame_state = -1;      /* its race state, -1 out of a level */
 
+/* The frame of an image from the race state st: ASPECT_FRAME_*. */
+static int frame_mode(int st)
+{
+    int wide = frame_in_race(st), staged = g_box_on && wide && !image_wide(st);
+    return !g_box_on ? ASPECT_FRAME_WIDE : !wide ? ASPECT_FRAME_MENUS :
+           staged && s_box169 ? ASPECT_FRAME_169 : ASPECT_FRAME_WIDE;
+}
+
+/* One frame per render, chosen before any of its projections. The race's
+ * render (InGameState 0xAB610) sets up its camera (0xFE770: the projection
+ * the 3D of its image is drawn with, from the renderer's x-scale) before
+ * RenderFrame starts. Chosen at H1, each switch of frame showed one image
+ * drawn for the frame before: after the intro, the first wide image was
+ * drawn with the x-scale of the frame (stretched, x2.67 at 32:9); after
+ * the finish, the first image of the scene in its 16:9 frame was drawn
+ * wide (squeezed). The frame is now chosen when the race's render starts
+ * (hook_frame_000AB610), and its H1 takes that choice for the frame tag;
+ * the renders of the other states, whose frame never switches, choose at
+ * H1. Game thread. */
+static int s_render_state = -2;     /* the race state the render's frame was chosen from, -2: not chosen */
+static int s_render_mode;
+
+static void render_begin(void)
+{
+    s_render_state = race_state();
+    s_render_mode = frame_mode(s_render_state);
+    aspect_frame(s_render_mode);
+}
+
+void sub_000AB610(void);            /* InGameState render (vt+0x18) */
+static recomp_func_t s_render_next; /* the next hook on it (fps_cap, perf, ticktrace) or none */
+static int s_render_resolving;
+
+static void hook_frame_000AB610(void)
+{
+    static int resolved;
+    if (!resolved) {                /* first call: the title runs, every hook decision is taken */
+        s_render_resolving = 1;
+        s_render_next = recomp_lookup_manual(0x000AB610u);
+        s_render_resolving = 0;
+        resolved = 1;
+    }
+    render_begin();
+    if (s_render_next) s_render_next(); else sub_000AB610();
+    s_render_state = -2;            /* a render without RenderFrame (frame skip) leaves nothing behind */
+}
+
 uint32_t hud_anchor_frame(void)
 {
-    int wide;
+    int wide, mode;
     s_frame++;
     s_frame_wide = 0;
     s_frame_state = -1;
@@ -819,23 +888,38 @@ uint32_t hud_anchor_frame(void)
         if (g_panel_on) s_frame_state = race_state();   /* 4:3: the panels only */
         return 0;
     }
-    s_frame_state = race_state();
+    /* The shots the title stages in a race are shown whole, never widened:
+     * wider than 16:9, as on a 16:9 screen (a centred 16:9 frame, the
+     * race's 2D over them at its proportions); at 16:9 and narrower, as the
+     * race (no frame at all: tests). The race's renders chose their frame
+     * when they started (hook_frame_000AB610). */
+    if (s_render_state != -2) {
+        s_frame_state = s_render_state;
+        mode = s_render_mode;
+        s_render_state = -2;
+    } else {
+        s_frame_state = race_state();
+        mode = frame_mode(s_frame_state);
+    }
     s_frame_wide = wide = frame_in_race(s_frame_state);
-    if (g_box_on) aspect_frame(!wide);  /* 16:9 or 16:10: the race's 2D only, the image as before */
+    if (g_box_on) aspect_frame(mode);   /* 16:9 or 16:10: the race's 2D only, the image as before */
     if (s_diag) {
-        static uint32_t last[4];
-        uint32_t app = MEM32(0x001E3C7Cu), st = 0, lvl = 0, race = 0, rs = 0, cur[4];
+        static uint32_t last[5];
+        uint32_t app = MEM32(0x001E3C7Cu), st = 0, lvl = 0, race = 0, rs = 0, cur[5];
         if (app >= 0x1000u) { st = MEM32(app + 4u); lvl = MEM32(app + 0x72Cu); }
         if (lvl >= 0x1000u) race = MEM32(lvl + 0x1Cu);
         if (race >= 0x1000u) rs = MEM32(race + 0x1Cu);
         cur[0] = st >= 0x1000u ? MEM32(st) : 0; cur[1] = lvl != 0; cur[2] = race != 0; cur[3] = rs;
+        cur[4] = (uint32_t)mode;
         if (memcmp(cur, last, sizeof cur)) {
             fprintf(stderr, "[HUDDIAG] frame %u state vt %08X level %u race %u race state %u -> %s\n",
-                    s_frame, cur[0], cur[1], cur[2], cur[3], wide ? "wide" : "16:9 frame");
+                    s_frame, cur[0], cur[1], cur[2], cur[3],
+                    mode == ASPECT_FRAME_169 ? "staged, 16:9 frame" : wide ? "wide" : "menus' frame");
             memcpy(last, cur, sizeof cur);
         }
     }
-    return (HUD_TAG_MAGIC_BOX << 16) | (wide ? HUD_BOX_FRAME_WIDE : HUD_BOX_FRAME_BOXED);
+    return (HUD_TAG_MAGIC_BOX << 16) | (mode == ASPECT_FRAME_169 ? HUD_BOX_FRAME_169 :
+                                        wide ? HUD_BOX_FRAME_WIDE : HUD_BOX_FRAME_BOXED);
 }
 
 /* A quad over the whole width that touches the top or the bottom (fades,
@@ -1213,6 +1297,8 @@ uint32_t hud_anchor_tag(uint32_t obj, uint32_t view, uint32_t *tag_y)
 
 void (*hud_anchor_lookup(unsigned int xbox_va))(void)
 {
+    /* the frame chosen when the race's render starts: wherever the frame switches (g_box_on), the x-scale with it */
+    if (xbox_va == 0x000AB610u && g_box_on && g_aspect_hook_on && !s_render_resolving) return hook_frame_000AB610;
     if (xbox_va == 0x000C6730u) return hook_hud_000C6730;
     if (xbox_va == 0x000C44E0u) return hook_hud_000C44E0;
     if (xbox_va == 0x000C9BB0u) return hook_hud_000C9BB0;

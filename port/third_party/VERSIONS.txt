@@ -9,6 +9,8 @@ keeps its licence file.
              variable changes (6.3 kept the old value unless the font size changed).
   sdl3/      SDL release-3.4.8    https://github.com/libsdl-org/SDL           zlib (LICENSE.txt)
              (CMakeLists.txt, cmake, include, src, wayland-protocols, build-scripts/*.cmake)
+             (also in the game, SSX Tricky.exe: the PlayStation controllers option,
+             port/src/pad_sdl.c)
   freetype/  FreeType 2.14.3      https://github.com/freetype/freetype        FTL or GPLv2 (LICENSE.TXT, docs/FTL.TXT)
              (used under the FTL, which asks for a credit in the documentation)
   miniz/     miniz 3.1.2          https://github.com/richgel999/miniz         MIT (LICENSE)
@@ -21,7 +23,8 @@ keeps its licence file.
              4.0.2 tree -- hence "version __git__" in the file headers)
 
 Parts of these sources under their own licence, compiled into the launcher
-(their licences are in THIRD-PARTY-LICENSES.txt too):
+(SDL's into the game as well; their licences are in THIRD-PARTY-LICENSES.txt
+too):
   sdl3/      src/hidapi: HIDAPI 0.14.0 (GPL 3.0, BSD or its original licence,
              LICENSE.txt; used under the original one, LICENSE-orig.txt);
              src/video/stb_image.h: stb_image 2.30 (MIT or Unlicense);

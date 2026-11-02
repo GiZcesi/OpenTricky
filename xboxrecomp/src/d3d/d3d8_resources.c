@@ -589,6 +589,75 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
     return S_OK;
 }
 
+/* See d3d8_xbox.h. The texture d3d8_CreateTextureImpl makes, with
+ * the same description and view, but its levels given as initial data: no
+ * level-0 copy in system memory and no UpdateSubresource afterwards. Level i
+ * is max(Width >> i, 1) x max(Height >> i, 1) at d3d8_row_pitch, the pitch
+ * UnlockRect uploads with. */
+HRESULT d3d8_CreateTextureWithData(UINT Width, UINT Height, UINT Levels, D3DFORMAT Format,
+                                   const void *const *level_bits, IDirect3DTexture8 **ppTex)
+{
+    D3D11_SUBRESOURCE_DATA init[16];
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
+    D3D8Texture *tex;
+    HRESULT hr;
+    UINT i;
+
+    if (!ppTex || !level_bits || !Width || !Height || !Levels || Levels > 16) return E_INVALIDARG;
+    *ppTex = NULL;
+    for (i = 0; i < Levels; i++) {
+        UINT lw = Width >> i ? Width >> i : 1, lh = Height >> i ? Height >> i : 1;
+        UINT pitch = d3d8_row_pitch(Format, lw);
+        UINT rows = d3d8_format_is_compressed(Format) ? (lh + 3) / 4 : lh;
+        init[i].pSysMem = level_bits[i];
+        init[i].SysMemPitch = pitch;
+        init[i].SysMemSlicePitch = pitch * rows;
+    }
+
+    tex = (D3D8Texture *)calloc(1, sizeof(*tex));
+    if (!tex) return E_OUTOFMEMORY;
+    tex->d3d8_format = Format;
+    tex->dxgi_format = d3d8_to_dxgi_format(Format);
+    tex->width = Width;
+    tex->height = Height;
+    tex->levels = Levels;
+    tex->pitch = d3d8_row_pitch(Format, Width);
+
+    memset(&td, 0, sizeof(td));
+    td.Width = Width;
+    td.Height = Height;
+    td.MipLevels = tex->levels;
+    td.ArraySize = 1;
+    td.Format = tex->dxgi_format;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, init, &tex->d3d11_texture);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: CreateTexture2D (data) failed: 0x%08lX (fmt=%d %ux%u)\n", hr, Format, Width, Height);
+        free(tex);
+        return hr;
+    }
+
+    memset(&srvd, 0, sizeof(srvd));
+    srvd.Format = tex->dxgi_format;
+    srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvd.Texture2D.MipLevels = tex->levels;
+    hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
+        (ID3D11Resource *)tex->d3d11_texture, &srvd, &tex->srv);
+    if (FAILED(hr)) {
+        ID3D11Texture2D_Release(tex->d3d11_texture);
+        free(tex);
+        return hr;
+    }
+
+    tex->iface.lpVtbl = &g_tex_vtbl;
+    tex->ref_count = 1;
+    *ppTex = &tex->iface;
+    return S_OK;
+}
+
 /* See d3d8_xbox.h. One CreateTexture2D with every level as initial
  * data; no level-0 copy is kept in system memory (an HD texture is 4 to 64
  * times the guest one), which is why LockRect refuses it. */

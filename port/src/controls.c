@@ -23,6 +23,7 @@
 
 #include "controls.h"
 #include "settings.h"
+#include "pad_sdl.h"
 
 HWND d3d8_GetHostWindow(void);   /* xboxrecomp d3d8_device.c */
 
@@ -216,6 +217,160 @@ void controls_get_current(ControlMap *m)
 void controls_set_suspended(BOOL on) { InterlockedExchange(&s_suspended, on ? 1 : 0); }
 BOOL controls_suspended(void)        { return s_suspended != 0; }
 
+/* ── PlayStation controllers (pad_sdl.h, XBOX_PS_PADS=1) ─────────────
+ *
+ * Experimental, off by default. Off: controls_read_pad asks XInput for the
+ * port's own index, as before, and nothing below runs.
+ *
+ * On: each controller -- an Xbox one (an XInput index) or a PlayStation
+ * one (a pad_sdl slot) -- gets a port, its player, when it is first seen,
+ * and keeps it until it is unplugged or turned off; no other controller
+ * moves then, as on the console's four ports. An Xbox controller takes the
+ * port of its XInput index when that port is free (always, without
+ * PlayStation pads: the ports are then XInput's own); any other controller
+ * takes the lowest free port. So a DualSense alone is player 1; beside an
+ * Xbox controller already there it is player 2; an Xbox controller turned
+ * on beside a DualSense playing on port 0 becomes player 2 instead of
+ * taking player 1 from it. A fifth controller waits for a free port.
+ * The map is kept under s_port_lock: the title may ask from more than one
+ * thread. */
+enum { SRC_NONE, SRC_XI, SRC_PS };
+static SRWLOCK s_port_lock = SRWLOCK_INIT;
+static struct { int kind, index; DWORD id; } s_port[4];  /* who plays on each port */
+static int   s_xi_port[4] = { -1, -1, -1, -1 };      /* port of each XInput index, -1: none */
+static DWORD s_xi_checked[4];                         /* last look at an index with no port */
+static BOOL  s_xi_looked;
+static DWORD s_ps_id[PADSDL_SLOTS];                   /* each slot's pad as last seen, 0: none */
+static int   s_ps_port[PADSDL_SLOTS] = { -1, -1, -1, -1 };
+
+BOOL controls_ps_on(void) { return padsdl_on() != 0; }
+
+/* One line per change, for bug reports. */
+static void port_log(int port, const char *what, int index)
+{
+    static LONG lines = 0;
+    if (InterlockedIncrement(&lines) <= 200) {
+        if (index >= 0) fprintf(stderr, "[PAD] player %d: %s %d\n", port + 1, what, index);
+        else fprintf(stderr, "[PAD] player %d: %s\n", port + 1, what);
+        fflush(stderr);
+    }
+}
+
+static int free_port(int prefer)
+{
+    int p;
+    if (prefer >= 0 && prefer < 4 && s_port[prefer].kind == SRC_NONE) return prefer;
+    for (p = 0; p < 4; p++)
+        if (s_port[p].kind == SRC_NONE) return p;
+    return -1;
+}
+
+static void port_clear(int port)
+{
+    if (s_port[port].kind == SRC_XI) {
+        s_xi_port[s_port[port].index] = -1;
+        s_xi_checked[s_port[port].index] = GetTickCount();
+    }
+    if (s_port[port].kind == SRC_PS) s_ps_port[s_port[port].index] = -1;
+    if (s_port[port].kind != SRC_NONE) port_log(port, "no controller", -1);
+    s_port[port].kind = SRC_NONE;
+    s_port[port].index = -1;
+    s_port[port].id = 0;
+}
+
+static void map_update(void)
+{
+    DWORD ids[PADSDL_SLOTS], now = GetTickCount();
+    XINPUT_STATE st;
+    int k, j, p;
+    padsdl_list(ids);
+    /* PlayStation pads unplugged (or another one in their slot): their port is free */
+    for (j = 0; j < PADSDL_SLOTS; j++)
+        if (s_ps_id[j] && s_ps_id[j] != ids[j]) {
+            if (s_ps_port[j] >= 0) port_clear(s_ps_port[j]);
+            s_ps_id[j] = 0;
+        }
+    /* Xbox controllers with no port: looked for at most once a second (XInput is
+     * slow to ask an empty index), all at the first call; before the PlayStation
+     * pads, so that an Xbox controller already on keeps its index's port */
+    for (k = 0; k < 4; k++)
+        if (s_xi_port[k] < 0 && (!s_xi_looked || now - s_xi_checked[k] >= 1000)) {
+            s_xi_checked[k] = now;
+            if (XInputGetState((DWORD)k, &st) == ERROR_SUCCESS && (p = free_port(k)) >= 0) {
+                s_port[p].kind = SRC_XI;
+                s_port[p].index = k;
+                s_port[p].id = 0;
+                s_xi_port[k] = p;
+                port_log(p, "XInput controller", k);
+            }
+        }
+    s_xi_looked = TRUE;
+    /* PlayStation pads with no port: the lowest free one */
+    for (j = 0; j < PADSDL_SLOTS; j++)
+        if (ids[j] && (s_ps_id[j] != ids[j] || s_ps_port[j] < 0)) {
+            s_ps_id[j] = ids[j];
+            if ((p = free_port(-1)) < 0) continue;
+            s_port[p].kind = SRC_PS;
+            s_port[p].index = j;
+            s_port[p].id = ids[j];
+            s_ps_port[j] = p;
+            padsdl_set_player(j, ids[j], p);
+            {
+                char name[64];
+                padsdl_name(j, ids[j], name, sizeof name);
+                port_log(p, name[0] ? name : "PlayStation controller", -1);
+            }
+        }
+}
+
+/* Option on: the state of the controller playing on `port`. */
+static BOOL port_state(DWORD port, XINPUT_STATE *st)
+{
+    BOOL ok = FALSE;
+    AcquireSRWLockExclusive(&s_port_lock);
+    map_update();
+    switch (s_port[port].kind) {
+    case SRC_XI:
+        ok = XInputGetState((DWORD)s_port[port].index, st) == ERROR_SUCCESS;
+        if (!ok) port_clear((int)port);         /* unplugged or turned off */
+        break;
+    case SRC_PS:
+        ok = padsdl_state(s_port[port].index, s_port[port].id, &st->Gamepad);
+        if (!ok) port_clear((int)port);
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_port_lock);
+    return ok;
+}
+
+BOOL controls_port_present(DWORD port)
+{
+    XINPUT_STATE st;
+    if (!padsdl_on() || port >= 4) return FALSE;
+    memset(&st, 0, sizeof st);
+    return port_state(port, &st);
+}
+
+void controls_port_rumble(DWORD port, WORD left, WORD right)
+{
+    int kind, index;
+    DWORD id;
+    if (!padsdl_on() || port >= 4) return;
+    AcquireSRWLockShared(&s_port_lock);
+    kind = s_port[port].kind;
+    index = s_port[port].index;
+    id = s_port[port].id;
+    ReleaseSRWLockShared(&s_port_lock);
+    if (kind == SRC_XI) {
+        XINPUT_VIBRATION v;
+        v.wLeftMotorSpeed = left;
+        v.wRightMotorSpeed = right;
+        XInputSetState((DWORD)index, &v);
+    } else if (kind == SRC_PS) {
+        padsdl_rumble(index, id, left, right);
+    }
+}
+
 /* Console button bit or analog index of each control. */
 static void apply(ControlsPad *p, int ctl, BYTE value)
 {
@@ -271,8 +426,10 @@ static const struct { const char *name; WORD bit; int trig; } k_fake[] = {
     { "RSLeft", 0, 14 }, { "RSRight", 0, 15 }, { "RSUp", 0, 16 }, { "RSDown", 0, 17 },
 };
 #define NFAKE (sizeof k_fake / sizeof k_fake[0])
-static volatile DWORD s_fake_until[NFAKE];
-static volatile DWORD s_fake_key_until[256];
+/* GetTickCount64 deadlines: one never set (0) is always in the past (as 32-bit
+ * ticks, past 24.9 days of Windows uptime, every button read as held). */
+static volatile ULONGLONG s_fake_until[NFAKE];
+static volatile ULONGLONG s_fake_key_until[256];
 
 int controls_fake_enabled(void)
 {
@@ -283,7 +440,7 @@ int controls_fake_enabled(void)
 
 int controls_fake_press(const char *name, int ms)
 {
-    DWORD until = GetTickCount() + (DWORD)(ms > 0 ? ms : 150);
+    ULONGLONG until = GetTickCount64() + (ULONGLONG)(ms > 0 ? ms : 150);
     size_t i;
     if (!controls_fake_enabled()) return 0;
     if (!_strnicmp(name, "PAD:", 4)) {
@@ -302,10 +459,10 @@ int controls_fake_press(const char *name, int ms)
 
 static void fake_state(XINPUT_STATE *st)
 {
-    DWORD now = GetTickCount();
+    ULONGLONG now = GetTickCount64();
     size_t i;
     for (i = 0; i < NFAKE; i++) {
-        if ((LONG)(s_fake_until[i] - now) <= 0) continue;
+        if (s_fake_until[i] <= now) continue;
         st->Gamepad.wButtons |= k_fake[i].bit;
         switch (k_fake[i].trig) {
         case 1: st->Gamepad.bLeftTrigger = 255; break;
@@ -330,10 +487,14 @@ BOOL controls_read_pad(DWORD port, ControlsPad *out)
 
     memset(out, 0, sizeof *out);
     memset(&st, 0, sizeof st);
+    /* The XInput controller of the port's own index, as before; with the
+     * PlayStation controllers on, the controller that plays on the port
+     * (an Xbox or a PlayStation one, port_state). */
     if (controls_fake_enabled()) {
         if (port != 0) return FALSE;
         fake_state(&st);
-    } else if (port >= 4 || XInputGetState(port, &st) != ERROR_SUCCESS) return FALSE;
+    } else if (port >= 4 || (!padsdl_on() ? XInputGetState(port, &st) != ERROR_SUCCESS
+                                          : !port_state(port, &st))) return FALSE;
     if (s_suspended) return TRUE;               /* connected, but idle for now */
     controls_get_current(&m);
     for (i = 0; i < CTL_PAD_COUNT; i++) {
@@ -399,7 +560,7 @@ void controls_read_keyboard(ControlsPad *io)
     controls_get_current(&m);
     for (i = 0; i < CTL_COUNT; i++)
         if (m.key[i] && ((front && (GetAsyncKeyState(m.key[i]) & 0x8000)) || autokey_held(m.key[i])
-                         || (controls_fake_enabled() && (LONG)(s_fake_key_until[m.key[i]] - GetTickCount()) > 0)))
+                         || (controls_fake_enabled() && s_fake_key_until[m.key[i]] > GetTickCount64())))
             apply(io, i, 255);
 }
 

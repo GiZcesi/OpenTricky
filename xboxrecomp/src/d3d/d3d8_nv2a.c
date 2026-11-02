@@ -13,6 +13,7 @@
  * buffers, so nothing set here leaks into them.
  */
 #include "../kernel/xbox_perf.h"
+#include "../kernel/xbox_logstats.h"
 #include "d3d8_internal.h"
 #include "d3d8_gpuprof.h"
 #include "d3d8_temporal.h"
@@ -64,6 +65,7 @@ static UINT                g_ps_cb_size;
 static int                 g_init_failed;
 
 #define NV_PS_CACHE 2048
+/* ps NULL: the key's shader was tried once and failed. */
 static struct { uint64_t key; ID3D11PixelShader *ps; } g_ps_cache[NV_PS_CACHE];
 static int g_ps_count;
 
@@ -190,7 +192,10 @@ static int pump_alt_off(void)
     if (alt < 0) { const char *e = getenv("XBOX_FIX_PUMP_ALT"); alt = e && e[0] == '1'; }
     return alt && (g_pump_frame & 1u);
 }
-void d3d8_pump_frame_tick(void) { g_pump_frame++; }
+static void vi_present(void);
+/* At the head of host_present, before the post and the Present: the frame
+ * ends here (also the vertex/index ring's query of the frame, vi_present). */
+void d3d8_pump_frame_tick(void) { vi_present(); g_pump_frame++; }
 int  d3d8_pump_alt_off(void) { return pump_alt_off(); }   /* also used by the post */
 
 int d3d8_pump_state_on(void)
@@ -228,6 +233,20 @@ int d3d8_pump_onemap_on(void)
     return on && !(alt && (g_pump_frame & 1u)) && !pump_alt_off();
 }
 
+/* XBOX_FIX_PUMP_CGEN, default 1; 0 = previous path: the VS constants
+ * of a GPU draw are compared only where the translator wrote a new value since
+ * the last draw (its bitmap, Nv2aVshDraw.vdirty) instead of all 3 KB, and the
+ * parameters and PS constants already in the constant ring are bound again by
+ * offset when their bytes have not changed, without writing them; a draw with
+ * nothing new maps nothing. The shaders read the same bytes. Off on the frames
+ * XBOX_FIX_PUMP_ALT turns the pump optimizations off. */
+int d3d8_pump_cgen_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_CGEN"); on = !(e && e[0] == '0'); }
+    return on && !pump_alt_off();
+}
+
 int d3d8_pump_cache_on(void)
 {
     static int on = -1;
@@ -235,26 +254,65 @@ int d3d8_pump_cache_on(void)
     return on && !pump_alt_off();
 }
 
+/* XBOX_FIX_PUMP_MEMO2 (default 1; =0 one entry, the previous path): the
+ * memos in front of the vertex shader, input layout and pixel shader key
+ * lookups keep the last two lookups instead of the last one, so that two
+ * kinds of draws that take turns -- a terrain patch and its seam blend, the
+ * same program with one instruction, one input and alpha_t0z more -- each
+ * find theirs. The memos only spare a lookup: the caches behind them only
+ * grow, so a remembered entry is the one the lookup returns. Off with the
+ * other optimizations on the XBOX_FIX_PUMP_ALT frames. */
+int d3d8_pump_memo2_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XBOX_FIX_PUMP_MEMO2");
+        on = !(e && e[0] == '0');
+        fprintf(stderr, "[PUMP] XBOX_FIX_PUMP_MEMO2=%d\n", on);
+    }
+    return on && !pump_alt_off();
+}
+
 static KIdx g_ps_idx[NV_PS_CACHE * 2];
+
+/* The key's position in the cache, or -1. */
+static int ps_slot(unsigned long long key)
+{
+    int i;
+    if (d3d8_pump_cache_on())
+        return kidx_find(g_ps_idx, NV_PS_CACHE * 2, key);
+    for (i = 0; i < g_ps_count; i++)
+        if (g_ps_cache[i].key == key)
+            return i;
+    return -1;
+}
 
 static ID3D11PixelShader *ps_find(unsigned long long key)
 {
-    int i;
-    if (d3d8_pump_cache_on()) {
-        i = kidx_find(g_ps_idx, NV_PS_CACHE * 2, key);
-        return i >= 0 ? g_ps_cache[i].ps : NULL;
-    }
-    for (i = 0; i < g_ps_count; i++)
-        if (g_ps_cache[i].key == key)
-            return g_ps_cache[i].ps;
-    return NULL;
+    int i = ps_slot(key);
+    return i >= 0 ? g_ps_cache[i].ps : NULL;
 }
 
+/* 1: compiled; 0: never tried; -1: tried and failed. */
 int d3d8_nv2a_has_ps(unsigned long long key)
 {
-    return ps_find(key) != NULL;
+    int i = ps_slot(key);
+    return i < 0 ? 0 : g_ps_cache[i].ps ? 1 : -1;
 }
 
+static void ps_put(unsigned long long key, ID3D11PixelShader *ps)
+{
+    g_ps_cache[g_ps_count].key = key;
+    g_ps_cache[g_ps_count].ps = ps;
+    kidx_put(g_ps_idx, NV_PS_CACHE * 2, key, g_ps_count);
+    g_ps_count++;
+}
+
+/* A key whose shader could not be generated, compiled or
+ * created is kept as failed (NULL), so that it is tried once: without it,
+ * each of its draws generated and compiled it again (3 to 18 ms each), as
+ * a shader refused by another HLSL compiler (Wine's) would be. Its draws
+ * are skipped as before. No device yet is not a failure. */
 int d3d8_nv2a_add_ps(unsigned long long key, const char *hlsl, int len)
 {
     ID3D11Device *dev = d3d8_GetD3D11Device();
@@ -264,6 +322,7 @@ int d3d8_nv2a_add_ps(unsigned long long key, const char *hlsl, int len)
     static int failures;
 
     if (!dev || g_ps_count >= NV_PS_CACHE) return 0;
+    if (len <= 0) { ps_put(key, NULL); return 0; }
     {
         double t0 = nv_now_ms();
         int hit;
@@ -281,33 +340,35 @@ int d3d8_nv2a_add_ps(unsigned long long key, const char *hlsl, int len)
                     (unsigned long long)key,
                     err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?", hlsl);
         if (err) ID3D10Blob_Release(err);
+        ps_put(key, NULL);
         return 0;
     }
     if (err) ID3D10Blob_Release(err);
     hr = ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(blob),
                                         ID3D10Blob_GetBufferSize(blob), NULL, &ps);
     ID3D10Blob_Release(blob);
-    if (FAILED(hr) || !ps) return 0;
-    g_ps_cache[g_ps_count].key = key;
-    g_ps_cache[g_ps_count].ps = ps;
-    kidx_put(g_ps_idx, NV_PS_CACHE * 2, key, g_ps_count);
-    g_ps_count++;
+    if (FAILED(hr) || !ps) { ps_put(key, NULL); return 0; }
+    ps_put(key, ps);
     return 1;
 }
 
-/* Buffer Maps of this file, counted for XBOX_PERF (Maps per GPU draw) and
- * timed under XBOX_PERF_MAPTIME. Same calls as before otherwise. */
+/* Buffer Maps of this file, counted for XBOX_PERF (Maps per GPU draw),
+ * timed under XBOX_PERF_MAPTIME, and under XBOX_LOG_STATS for the slow Maps
+ * of map_stats. Same calls as before otherwise. */
 static unsigned g_nv_maps;
+static void map_note(ID3D11Resource *r, D3D11_MAP how, unsigned long long cyc);
 
 static HRESULT nv_map(ID3D11DeviceContext *ctx, ID3D11Resource *r, D3D11_MAP how, D3D11_MAPPED_SUBRESOURCE *m)
 {
     unsigned long long t;
     HRESULT hr;
     g_nv_maps++;
-    if (!g_perf_maptime) return ID3D11DeviceContext_Map(ctx, r, 0, how, 0, m);
+    if (!g_perf_maptime && !xbox_log_stats()) return ID3D11DeviceContext_Map(ctx, r, 0, how, 0, m);
     t = __rdtsc();
     hr = ID3D11DeviceContext_Map(ctx, r, 0, how, 0, m);
-    g_perf_map_cyc += __rdtsc() - t;
+    t = __rdtsc() - t;
+    if (g_perf_maptime) g_perf_map_cyc += t;
+    if (xbox_log_stats()) map_note(r, how, t);
     return hr;
 }
 
@@ -372,33 +433,67 @@ static int cbr_ready(ID3D11Device *dev, ID3D11DeviceContext *ctx)
  * only if they changed (or if the ring wrapped since). */
 static UINT g_cbr_par_first, g_cbr_par_num;
 
+/* The parameters and PS constants last written to the ring (bytes,
+ * offset, ring generation), for XBOX_FIX_PUMP_CGEN. */
+static struct { uint8_t b[512]; UINT size, off; unsigned gen; int ok; } g_cbr_last[2];
+
+static int cbr_same(int k, const void *p, UINT size)
+{
+    return g_cbr_last[k].ok && g_cbr_last[k].gen == g_cbr_gen && g_cbr_last[k].size == size &&
+           !memcmp(g_cbr_last[k].b, p, size);
+}
+
+static void cbr_keep(int k, const void *p, UINT size, UINT off)
+{
+    g_cbr_last[k].ok = size <= sizeof g_cbr_last[k].b;
+    if (!g_cbr_last[k].ok) return;
+    memcpy(g_cbr_last[k].b, p, size);
+    g_cbr_last[k].size = size;
+    g_cbr_last[k].off = off;
+    g_cbr_last[k].gen = g_cbr_gen;
+}
+
 static int cbr_draw(ID3D11DeviceContext *ctx, const void *vsc, int vsc_changed, UINT vsc_size,
                     const void *par, UINT par_size, const void *psc, UINT psc_size)
 {
     D3D11_MAPPED_SUBRESOURCE m;
     UINT need, a_vsc = CBR_ALIGN(vsc_size), a_par = CBR_ALIGN(par_size), a_psc = CBR_ALIGN(psc_size);
-    UINT o_par, o_psc, first[2], num[2];
+    UINT o_par = 0, o_psc = 0, first[2], num[2];   /* always set below (0 only quiets the compiler) */
     D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
     ID3D11Buffer *bufs[2];
     int write_vsc = vsc_changed || g_cbr_vsc_gen != g_cbr_gen;
-    need = (write_vsc ? a_vsc : 0) + a_par + a_psc;
+    int reuse = d3d8_pump_cgen_on();
+    int write_par = !(reuse && cbr_same(0, par, par_size));
+    int write_psc = !(reuse && cbr_same(1, psc, psc_size));
+    need = (write_vsc ? a_vsc : 0) + (write_par ? a_par : 0) + (write_psc ? a_psc : 0);
     if (g_cbr_off + need > CBR_SIZE) {
         how = D3D11_MAP_WRITE_DISCARD;
         g_cbr_off = 0;
         g_cbr_gen++;
-        write_vsc = 1;
+        write_vsc = write_par = write_psc = 1;
         need = a_vsc + a_par + a_psc;
     }
-    if (FAILED(nv_map(ctx, (ID3D11Resource *)g_cbr, how, &m))) return 0;
-    if (write_vsc) {
-        memcpy((uint8_t *)m.pData + g_cbr_off, vsc, vsc_size);
-        g_cbr_vsc_off = g_cbr_off;
-        g_cbr_vsc_gen = g_cbr_gen;
-        g_cbr_off += a_vsc;
+    if (need) {
+        if (FAILED(nv_map(ctx, (ID3D11Resource *)g_cbr, how, &m))) return 0;
+        if (write_vsc) {
+            memcpy((uint8_t *)m.pData + g_cbr_off, vsc, vsc_size);
+            g_cbr_vsc_off = g_cbr_off;
+            g_cbr_vsc_gen = g_cbr_gen;
+            g_cbr_off += a_vsc;
+        }
+        if (write_par) {
+            o_par = g_cbr_off; memcpy((uint8_t *)m.pData + o_par, par, par_size); g_cbr_off += a_par;
+            cbr_keep(0, par, par_size, o_par);
+        }
+        if (write_psc) {
+            o_psc = g_cbr_off; memcpy((uint8_t *)m.pData + o_psc, psc, psc_size); g_cbr_off += a_psc;
+            cbr_keep(1, psc, psc_size, o_psc);
+        }
+        nv_unmap(ctx, (ID3D11Resource *)g_cbr);
     }
-    o_par = g_cbr_off; memcpy((uint8_t *)m.pData + o_par, par, par_size); g_cbr_off += a_par;
-    o_psc = g_cbr_off; memcpy((uint8_t *)m.pData + o_psc, psc, psc_size); g_cbr_off += a_psc;
-    nv_unmap(ctx, (ID3D11Resource *)g_cbr);
+    if (!write_par) o_par = g_cbr_last[0].off;   /* the same bytes, already in the ring */
+    if (!write_psc) o_psc = g_cbr_last[1].off;
+    if (g_perf_detail && !need) perf_count(PC_CBSKIP, 1);   /* only where it reuses: XBOX_PERF_DETAIL */
     bufs[0] = bufs[1] = g_cbr;
     first[0] = g_cbr_vsc_off / 16u; num[0] = a_vsc / 16u;
     first[1] = o_par / 16u;         num[1] = a_par / 16u;
@@ -577,25 +672,45 @@ static void nv_hlsl_dump(const char *name, uint64_t key, const char *src, int le
 /* The shader for this program and these input kinds, compiled on first use.
  * A program that fails to compile is remembered, so it is not retried. */
 static int vsh_lookup(const Nv2aVshDraw *d, const uint8_t kind[16]);
-static struct { uint64_t hash; uint8_t kind[16]; int pts, vi; } g_vsh_last = { 0, {0}, 0, -1 };
+static struct { uint64_t hash; uint8_t kind[16]; int pts, vi; } g_vsh_last[2] = { { 0, {0}, 0, -1 }, { 0, {0}, 0, -1 } };
+static int g_vsh_mru;                   /* the entry of the last lookup; the other is replaced next (MEMO2) */
+static unsigned long long g_vsh_memo2_hits, g_il_memo2_hits;     /* found in the older entry (XBOX_SUBST_TIME) */
+
+static int vsh_memo_is(int w, const Nv2aVshDraw *d, const uint8_t kind[16], int pts)
+{
+    return g_vsh_last[w].vi >= 0 && g_vsh_last[w].hash == d->prog_hash && g_vsh_last[w].pts == pts &&
+           !memcmp(g_vsh_last[w].kind, kind, sizeof g_vsh_last[w].kind);
+}
 
 static int vsh_get(const Nv2aVshDraw *d)
 {
     uint8_t kind[16];
-    int a, i;
+    int a, i, w, pts = d->topology == D3DPT_POINTLIST, two = d3d8_pump_memo2_on();
 
     for (a = 0; a < 16; a++) kind[a] = (d->inputs & (1u << a)) ? d->attr[a].kind : 0xFF;
-    /* Same program and input kinds as the previous lookup: same entry (each
-     * draw asks twice, and consecutive draws often share the program). */
-    if (d3d8_pump_onemap_on() && g_vsh_last.vi >= 0 && g_vsh_last.hash == d->prog_hash &&
-        g_vsh_last.pts == (d->topology == D3DPT_POINTLIST) && !memcmp(g_vsh_last.kind, kind, sizeof kind))
-        return g_vsh_last.vi;
+    /* Same program and input kinds as the previous lookup -- with
+     * XBOX_FIX_PUMP_MEMO2, as one of the last two: same entry (each draw asks
+     * twice, and consecutive draws often share the program or take turns). */
+    if (d3d8_pump_onemap_on()) {
+        w = two ? g_vsh_mru : 0;
+        if (vsh_memo_is(w, d, kind, pts)) return g_vsh_last[w].vi;
+        if (two && vsh_memo_is(w ^ 1, d, kind, pts)) { g_vsh_mru = w ^ 1; g_vsh_memo2_hits++; return g_vsh_last[w ^ 1].vi; }
+    }
     i = vsh_lookup(d, kind);
-    g_vsh_last.vi = i;
-    g_vsh_last.hash = d->prog_hash;
-    g_vsh_last.pts = d->topology == D3DPT_POINTLIST;
-    memcpy(g_vsh_last.kind, kind, sizeof kind);
+    w = two ? g_vsh_mru ^ 1 : 0;        /* the older entry (one entry: the only one) */
+    g_vsh_mru = w;
+    g_vsh_last[w].vi = i;
+    g_vsh_last[w].hash = d->prog_hash;
+    g_vsh_last[w].pts = pts;
+    memcpy(g_vsh_last[w].kind, kind, sizeof kind);
     return i;
+}
+
+/* XBOX_SUBST_TIME (nv2a_pgraph_d3d11.c): lookups found in the older memo entry so far */
+void d3d8_nv2a_memo2_hits(unsigned long long *vsh, unsigned long long *il)
+{
+    *vsh = g_vsh_memo2_hits;
+    *il = g_il_memo2_hits;
 }
 
 static int vsh_lookup(const Nv2aVshDraw *d, const uint8_t kind[16])
@@ -660,21 +775,34 @@ static int vsh_lookup(const Nv2aVshDraw *d, const uint8_t kind[16])
 }
 
 static ID3D11InputLayout *il_lookup(int vi, const D3D11_INPUT_ELEMENT_DESC *el, int n);
-static struct { int vi, n; D3D11_INPUT_ELEMENT_DESC el[16]; ID3D11InputLayout *il; } g_il_last;
+static struct { int vi, n; D3D11_INPUT_ELEMENT_DESC el[16]; ID3D11InputLayout *il; } g_il_last[2];
+static int g_il_mru;                    /* as g_vsh_mru */
+
+static int il_memo_is(int w, int vi, const D3D11_INPUT_ELEMENT_DESC *el, int n)
+{
+    return g_il_last[w].il && g_il_last[w].vi == vi && g_il_last[w].n == n &&
+           !memcmp(g_il_last[w].el, el, (size_t)n * sizeof *el);
+}
 
 /* The input layout for this shader and these elements; the same elements
- * as the previous draw give the same layout without hashing them again. */
+ * as the previous draw (XBOX_FIX_PUMP_MEMO2: as one of the last two) give
+ * the same layout without hashing them again. */
 static ID3D11InputLayout *il_get(int vi, const D3D11_INPUT_ELEMENT_DESC *el, int n)
 {
     ID3D11InputLayout *il;
-    if (d3d8_pump_onemap_on() && g_il_last.il && g_il_last.vi == vi && g_il_last.n == n &&
-        !memcmp(g_il_last.el, el, (size_t)n * sizeof *el))
-        return g_il_last.il;
+    int w, two = d3d8_pump_memo2_on();
+    if (d3d8_pump_onemap_on()) {
+        w = two ? g_il_mru : 0;
+        if (il_memo_is(w, vi, el, n)) return g_il_last[w].il;
+        if (two && il_memo_is(w ^ 1, vi, el, n)) { g_il_mru = w ^ 1; g_il_memo2_hits++; return g_il_last[w ^ 1].il; }
+    }
     il = il_lookup(vi, el, n);
-    g_il_last.il = il;
-    g_il_last.vi = vi;
-    g_il_last.n = n;
-    memcpy(g_il_last.el, el, (size_t)n * sizeof *el);
+    w = two ? g_il_mru ^ 1 : 0;
+    g_il_mru = w;
+    g_il_last[w].il = il;
+    g_il_last[w].vi = vi;
+    g_il_last[w].n = n;
+    memcpy(g_il_last[w].el, el, (size_t)n * sizeof *el);
     return il;
 }
 
@@ -735,11 +863,137 @@ static UINT ib_upload(ID3D11DeviceContext *ctx, const uint32_t *idx, UINT n)
 
 /* XBOX_FIX_PUMP_ONEMAP: one ring for the vertex groups and the indices of a
  * draw (bound as both vertex and index buffer), written by one Map once the
- * whole size is known -- a wrap (DISCARD) can never fall between two uploads
- * of one draw. NO_OVERWRITE otherwise, as the other rings. */
+ * whole size is known -- a wrap can never fall between two uploads of one
+ * draw. NO_OVERWRITE otherwise, as the other rings.
+ *
+ * XBOX_FIX_PUMP_RING (default 1): the ring wraps without DISCARD. A DISCARD
+ * of the whole 48 MB cost about 1.5 to 2.5 ms on the frame that wrapped, one
+ * frame in 9 to 16 (indicative: a development build), most likely the driver
+ * handing out new memory for all of it (renaming); DXVK also counts the 48 MB
+ * against its MaxMemoryPerSubmission and submits at once.
+ * Only the draws of d3d8_nv2a_draw_program_gpu read the ring, each right
+ * after its own write: every other draw binds its own vertex buffer in the
+ * one slot its input layout reads (slot 0), or draws without one, and the
+ * only other indexed draws (the tuning panel's) bind their own index buffer. So once an
+ * event query ended at a write position has completed, the GPU has finished
+ * with every byte below that position. A query is ended at each presented
+ * frame, in d3d8_pump_frame_tick (head of host_present, before the post and
+ * the Present; under DXVK an End may submit the commands waiting, and it ends
+ * the open render pass, as the post's first target change would). A write
+ * over bytes of the previous lap is a NO_OVERWRITE once a query past them
+ * has completed and reads TRUE; otherwise (GPU far behind, frame bigger than
+ * the ring), a DISCARD and a new lap, as before. In play, only queries a lap
+ * old are read: long completed. Positions run across laps (lap * size +
+ * offset), so a completed query covers the older laps too. The shaders read
+ * the same bytes as before (the offsets of a lap begun by a DISCARD after a
+ * failed check start again at 0); the CPU never waits for the GPU. A failed
+ * Map is followed by a new lap.
+ * XBOX_FIX_PUMP_RING=0: the previous path, a DISCARD at each wrap (a failed
+ * Map is followed by a new lap there too).
+ * XBOX_FIX_PUMP_RING_ALT=1 (identity test): the switch is read when a lap
+ * begins, so the laps begun on an even presented frame wrap without DISCARD
+ * and the others with one. XBOX_FIX_PUMP_ALT turns it off with the other
+ * pump optimizations.
+ * XBOX_FIX_PUMP_RING_MB=n (development builds, 1 to 48): a ring of n MB, to
+ * wrap often. A draw larger than the ring is not drawn: counted, logged once.
+ * XBOX_LOG_STATS=1: wraps, DISCARDs, slow Maps in the log (map_stats; every
+ * Map timed). XBOX_PERF_CSV: a V line per presented frame (perf_ring_frame),
+ * counts only. A lap begins at each wrap and at each DISCARD for lack of a
+ * completed query. If the device were ever created again, the queries, their
+ * queue and the lap state would have to go with g_vi_ring. */
 #define VI_RING_SIZE (48u * 1024u * 1024u)
+#define VI_MARKS 16
 static ID3D11Buffer *g_vi_ring;
-static UINT g_vi_off;
+static UINT g_vi_off, g_vi_size = VI_RING_SIZE;
+static int g_vi_on = -1, g_vi_alt;
+static int g_vi_shared;                 /* this lap writes over the previous one, in the same memory */
+static unsigned long long g_vi_lap;     /* laps since the first Map (lap 0) */
+static unsigned long long g_vi_safe;    /* the GPU has finished with every position below */
+static unsigned long long g_vi_marked;  /* position at the last query */
+static ID3D11Query *g_vi_q[VI_MARKS];   /* queries in flight, the oldest at g_vi_qhead */
+static unsigned long long g_vi_qpos[VI_MARKS];
+static unsigned g_vi_qhead, g_vi_qn;
+static unsigned g_vi_wraps, g_vi_discards, g_vi_fallbacks, g_vi_refused;   /* map_stats, V line */
+
+static void vi_cfg(void)
+{
+    const char *e = getenv("XBOX_FIX_PUMP_RING");
+    g_vi_on = !(e && e[0] == '0');
+    e = getenv("XBOX_FIX_PUMP_RING_ALT");
+    g_vi_alt = e && e[0] == '1';
+    fprintf(stderr, "[PUMP] XBOX_FIX_PUMP_RING=%d%s: vertex/index ring of %u MB, %s\n", g_vi_on,
+            g_vi_alt ? " (ALT: the laps begun on even frames)" : "", g_vi_size >> 20,
+            g_vi_on ? "wrapping without DISCARD once the GPU has finished" : "DISCARD at each wrap");
+}
+
+/* The switch, read when a lap begins. The XBOX_FIX_PUMP_ALT term never turns
+ * it off with the present code (ONEMAP, the ring's only user, is off on the
+ * frames it turns off); it is kept so that the ring follows the family. */
+static int vi_fix_now(void)
+{
+    return g_vi_on > 0 && !(g_vi_alt && (g_pump_frame & 1u)) && !pump_alt_off();
+}
+
+/* The oldest query in flight, read without flushing and without waiting:
+ * 1 if it has completed (S_OK and TRUE) and is taken off. */
+static int vi_pop(ID3D11DeviceContext *ctx)
+{
+    unsigned k = g_vi_qhead;
+    BOOL done = FALSE;
+    if (!g_vi_qn || ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)g_vi_q[k], &done, sizeof done,
+                                                D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || !done)
+        return 0;
+    if (g_vi_qpos[k] > g_vi_safe) g_vi_safe = g_vi_qpos[k];
+    g_vi_qhead = (k + 1) % VI_MARKS;
+    g_vi_qn--;
+    return 1;
+}
+
+/* 1 if a completed query shows that the GPU has finished with every position
+ * below `need`. */
+static int vi_gpu_done(ID3D11DeviceContext *ctx, unsigned long long need)
+{
+    while (g_vi_safe < need && vi_pop(ctx)) {}
+    return g_vi_safe >= need;
+}
+
+/* At each presented frame: a query ended at the write position, if it moved.
+ * All slots in flight: the oldest (16 frames back) is read first; if it has
+ * not completed, this frame is covered by a later query. */
+static void vi_mark(ID3D11DeviceContext *ctx)
+{
+    unsigned long long pos = g_vi_lap * g_vi_size + g_vi_off;
+    unsigned k;
+    if (pos == g_vi_marked) return;
+    if (g_vi_qn == VI_MARKS && !vi_pop(ctx)) return;
+    k = (g_vi_qhead + g_vi_qn) % VI_MARKS;
+    if (!g_vi_q[k]) {
+        D3D11_QUERY_DESC qd;
+        qd.Query = D3D11_QUERY_EVENT;
+        qd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateQuery(d3d8_GetD3D11Device(), &qd, &g_vi_q[k]))) { g_vi_q[k] = NULL; return; }
+    }
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)g_vi_q[k]);
+    g_vi_qpos[k] = pos;
+    g_vi_qn++;
+    g_vi_marked = pos;
+}
+
+static void map_stats(void);
+
+/* d3d8_pump_frame_tick, at each presented frame: the statistics of the frame
+ * (map_stats, V line of XBOX_PERF_CSV), then the ring's query. */
+static void vi_present(void)
+{
+    ID3D11DeviceContext *ctx;
+    map_stats();
+    if (g_perf_on) {
+        static unsigned w0, d0, f0, r0;
+        perf_ring_frame(g_vi_wraps - w0, g_vi_discards - d0, g_vi_fallbacks - f0, g_vi_refused - r0, g_vi_shared);
+        w0 = g_vi_wraps; d0 = g_vi_discards; f0 = g_vi_fallbacks; r0 = g_vi_refused;
+    }
+    if (g_vi_ring && g_vi_on > 0 && (ctx = d3d8_GetD3D11Context()) != NULL) vi_mark(ctx);
+}
 
 static uint8_t *vi_ring_map(ID3D11DeviceContext *ctx, UINT size, UINT *off)
 {
@@ -747,22 +1001,113 @@ static uint8_t *vi_ring_map(ID3D11DeviceContext *ctx, UINT size, UINT *off)
     D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
     if (!g_vi_ring) {
         D3D11_BUFFER_DESC bd;
+        if (g_vi_on < 0) vi_cfg();
         memset(&bd, 0, sizeof bd);
-        bd.ByteWidth = VI_RING_SIZE;
+        bd.ByteWidth = g_vi_size;
         bd.Usage = D3D11_USAGE_DYNAMIC;
         bd.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         if (FAILED(ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL, &g_vi_ring)))
             return NULL;
-        g_vi_off = VI_RING_SIZE;        /* first Map = DISCARD */
+        g_vi_off = g_vi_size;           /* first Map = DISCARD, lap 0 */
+        g_vi_lap = ~0ull;
     }
-    if (size > VI_RING_SIZE) return NULL;
-    if (g_vi_off + size > VI_RING_SIZE) { g_vi_off = 0; how = D3D11_MAP_WRITE_DISCARD; }
-    if (FAILED(nv_map(ctx, (ID3D11Resource *)g_vi_ring, how, &m)))
+    if (size > g_vi_size) {             /* only with XBOX_FIX_PUMP_RING_MB: the draw is lost */
+        if (!g_vi_refused++)
+            fprintf(stderr, "[PUMP] a draw of %u bytes is larger than the vertex/index ring (%u MB): not drawn\n",
+                    size, g_vi_size >> 20);
         return NULL;
+    }
+    if (g_vi_off + size > g_vi_size) {  /* a new lap */
+        g_vi_off = 0;
+        g_vi_lap++;
+        g_vi_wraps++;
+        g_vi_shared = g_vi_lap > 0 && vi_fix_now();
+        if (!g_vi_shared) how = D3D11_MAP_WRITE_DISCARD;
+    }
+    /* A lap in the memory of the previous one checks each write, whatever the
+     * switch says now: the bytes it replaces were written one lap earlier.
+     * No completed query past them: a DISCARD and a new lap, as before. */
+    if (g_vi_shared && !vi_gpu_done(ctx, (g_vi_lap - 1) * g_vi_size + g_vi_off + size)) {
+        g_vi_off = 0;
+        g_vi_lap++;
+        g_vi_shared = 0;
+        g_vi_fallbacks++;
+        how = D3D11_MAP_WRITE_DISCARD;
+    }
+    if (how == D3D11_MAP_WRITE_DISCARD) {
+        /* What the DISCARD hands out holds nothing of the earlier laps; if the
+         * Map fails, the next Map begins a new lap all the same. */
+        g_vi_safe = g_vi_lap * g_vi_size;
+        g_vi_discards++;
+    }
+    if (FAILED(nv_map(ctx, (ID3D11Resource *)g_vi_ring, how, &m))) {
+        g_vi_off = g_vi_size;           /* the next Map begins a new lap: never over bytes in an unknown state */
+        return NULL;
+    }
     *off = g_vi_off;
     g_vi_off = (g_vi_off + size + 15u) & ~15u;
     return (uint8_t *)m.pData + *off;
+}
+
+/* XBOX_LOG_STATS=1: every buffer Map of this file is timed (nv_map); a Map of
+ * more than 100 us is slow (a DISCARD of the whole vertex/index ring took
+ * about 1.5 to 2.5 ms on a development build). Every 10 s of presented
+ * frames, one line: the wraps and DISCARDs of the vertex/index ring, its slow
+ * and longest Maps, at a new lap and elsewhere, the draws larger than the
+ * ring; the same for the other Maps (the constant ring, whose wraps are each
+ * a DISCARD). With XBOX_FIX_PUMP_RING=0, the previous path's. Test tools read
+ * this line: its fields keep their wording, new ones go after them. */
+typedef struct { unsigned n, slow; unsigned long long top; } MapTimes;
+static MapTimes g_mt[4];                /* vertex/index ring: [0] in a lap, [1] a new lap; others: [2], [3] DISCARD */
+static unsigned long long g_mt_slow = ~0ull;    /* 100 us in rdtsc cycles, once measured */
+
+static void map_note(ID3D11Resource *r, D3D11_MAP how, unsigned long long cyc)
+{
+    MapTimes *t = r == (ID3D11Resource *)g_vi_ring ? &g_mt[g_vi_off == 0 ? 1 : 0]
+                                                   : &g_mt[how == D3D11_MAP_WRITE_DISCARD ? 3 : 2];
+    t->n++;
+    if (cyc > g_mt_slow) t->slow++;
+    if (cyc > t->top) t->top = cyc;
+}
+
+static void map_stats(void)
+{
+    static LARGE_INTEGER f, t0, tw;
+    static unsigned long long c0;
+    static unsigned frames, w0, d0, fb0, r0, cg0;
+    LARGE_INTEGER now;
+    double us, k;
+    if (!xbox_log_stats()) return;
+    QueryPerformanceCounter(&now);
+    if (!f.QuadPart) {
+        QueryPerformanceFrequency(&f);
+        t0 = tw = now;
+        c0 = __rdtsc();
+        w0 = g_vi_wraps; d0 = g_vi_discards; fb0 = g_vi_fallbacks; r0 = g_vi_refused; cg0 = g_cbr_gen;
+        return;
+    }
+    frames++;
+    us = (double)(now.QuadPart - t0.QuadPart) * 1e6 / (double)f.QuadPart;
+    if (us < 1e5) return;               /* the rdtsc rate, measured over 0.1 s at least */
+    k = (double)(__rdtsc() - c0) / us;
+    g_mt_slow = (unsigned long long)(100.0 * k);
+    if (now.QuadPart - tw.QuadPart < 10 * f.QuadPart) return;
+    fprintf(stderr, "[PUMP] Maps, last %.1f s, %u frames: vertex/index ring (%u MB) %u wraps, %u DISCARD "
+            "(%u for lack of a completed query); slow (> 100 us) %u in a lap, %u at a new lap; longest %.0f us, "
+            "%.0f at a new lap; %u draws larger than the ring | other Maps: %u constant ring wraps; slow %u, "
+            "%u DISCARD; longest %.0f us, %.0f DISCARD | since start: %u wraps, %u DISCARD (%u for lack of a query), "
+            "%u draws larger than the ring\n",
+            (double)(now.QuadPart - tw.QuadPart) / (double)f.QuadPart, frames, g_vi_size >> 20,
+            g_vi_wraps - w0, g_vi_discards - d0, g_vi_fallbacks - fb0, g_mt[0].slow, g_mt[1].slow,
+            (double)g_mt[0].top / k, (double)g_mt[1].top / k, g_vi_refused - r0, g_cbr_gen - cg0, g_mt[2].slow,
+            g_mt[3].slow, (double)g_mt[2].top / k, (double)g_mt[3].top / k, g_vi_wraps, g_vi_discards,
+            g_vi_fallbacks, g_vi_refused);
+    xbox_log_flush();
+    memset(g_mt, 0, sizeof g_mt);
+    tw = now;
+    frames = 0;
+    w0 = g_vi_wraps; d0 = g_vi_discards; fb0 = g_vi_fallbacks; r0 = g_vi_refused; cg0 = g_cbr_gen;
 }
 
 /* Point sprites on the GPU. The CPU path turned each point into
@@ -1272,6 +1617,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     int points = d->topology == D3DPT_POINTLIST;
     unsigned maps0 = g_nv_maps;         /* XBOX_PERF: Maps of this draw */
     int onemap = d3d8_pump_onemap_on();
+    double pd = g_perf_detail ? perf_now() : 0.0;   /* XBOX_PERF_DETAIL, before the uploads */
 
     if (!ctx || !dev || !ps || !d->nindices || !nv_init()) return 0;
     switch (d->topology) {
@@ -1337,6 +1683,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
         }
     }
     if (g_perf_on) pt = perf_now();
+    if (g_perf_detail) perf_add(PZ_DPRE, pt - pd);
     if (onemap) {                       /* every group, then the indices, in one Map */
         UINT rel[16], total = 0, ib_rel, base;
         uint8_t *w;
@@ -1381,11 +1728,48 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     if (g_perf_on) { double t = perf_now(); perf_add(PZ_DUP, t - pt); pt = t; }
 
     use_cbr = d3d8_pump_cb_on() && cbr_ready(dev, ctx);
-    if (!g_vsc_valid || memcmp(g_vsc_last, d->vconst, sizeof g_vsc_last)) {
-        memcpy(g_vsc_last, d->vconst, sizeof g_vsc_last);
-        if (!use_cbr) cb_write(ctx, g_vsc_cb, g_vsc_last, sizeof g_vsc_last);
-        vsc_changed = 1;
-        g_vsc_valid = 1;
+    if (g_perf_on) {                    /* how often the 3 KB compare could be skipped */
+        static uint32_t last_gen;
+        static int have;
+        if (have && g_vsc_valid && d->vgen == last_gen) perf_count(PC_VSC_GEN, 1);
+        last_gen = d->vgen;
+        have = 1;
+    }
+    if (g_vsc_valid && d->vdirty && d3d8_pump_cgen_on()) {
+        /* Only the constants written with a new value since the last
+         * GPU draw can differ from the copy; all the others are unchanged. */
+        int w, changed = 0;
+        unsigned ncmp = 0;              /* counted once per draw, as the whole-block compare below is */
+        for (w = 0; w < (VSHCPU_CONSTANTS + 31) / 32; w++) {
+            uint32_t mk = d->vdirty[w];
+            while (mk) {
+                int c = w * 32 + __builtin_ctz(mk);
+                mk &= mk - 1u;
+                ncmp++;
+                if (memcmp(g_vsc_last[c], d->vconst[c], sizeof g_vsc_last[c])) {
+                    memcpy(g_vsc_last[c], d->vconst[c], sizeof g_vsc_last[c]);
+                    changed = 1;
+                }
+            }
+            d->vdirty[w] = 0;
+        }
+        if (g_perf_on) perf_count(PC_VSC_CMP, ncmp);
+        if (changed) {
+            if (!use_cbr) cb_write(ctx, g_vsc_cb, g_vsc_last, sizeof g_vsc_last);
+            vsc_changed = 1;
+            if (g_perf_on) perf_count(PC_VSC_CHG, 1);
+        } else if (g_perf_on) perf_count(PC_VSC_EQ, 1);
+    } else {
+        if (g_perf_on && g_vsc_valid) perf_count(PC_VSC_CMP, VSHCPU_CONSTANTS);   /* the whole block (at most) */
+        if (!g_vsc_valid || memcmp(g_vsc_last, d->vconst, sizeof g_vsc_last)) {
+            memcpy(g_vsc_last, d->vconst, sizeof g_vsc_last);
+            if (!use_cbr) cb_write(ctx, g_vsc_cb, g_vsc_last, sizeof g_vsc_last);
+            vsc_changed = 1;
+            g_vsc_valid = 1;
+            if (g_perf_on) perf_count(PC_VSC_CHG, 1);
+        } else if (g_perf_on) perf_count(PC_VSC_EQ, 1);
+        /* The copy now equals the constants: nothing is new */
+        if (d->vdirty) memset(d->vdirty, 0, ((VSHCPU_CONSTANTS + 31) / 32) * sizeof *d->vdirty);
     }
     if (use_cbr != g_cbr_was) {         /* path change: rewrite everything */
         if (!use_cbr) cb_write(ctx, g_vsc_cb, g_vsc_last, sizeof g_vsc_last);
@@ -1428,7 +1812,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
         cb_write(ctx, g_ps_cb, d->ps_consts, d->ps_consts_size);
     if (g_perf_on) { double t = perf_now(); perf_add(PZ_DCB, t - pt); pt = t; }
 
-    d3d8_states_apply();
+    d3d8_states_apply_nv2a();            /* its raster state is the next call's */
     nv_set_raster(ctx, dev, d->raster);
     if (ngrp) ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, (UINT)ngrp, vbs, strides, offs);
     ID3D11DeviceContext_IASetInputLayout(ctx, il);
@@ -1483,6 +1867,43 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
         return 1;
     }
     if (g_perf_on) { double t = perf_now(); perf_add(PZ_DSTATE, t - pt); pt = t; }
+    if (g_perf_detail) {    /* same bound state as the previous such draw (a merge could join them);
+                             * ~8 KB copied and compared per draw: XBOX_PERF_DETAIL only */
+        static struct {
+            DWORD rs[256], tss[4][32];
+            void *tex[4];
+            int vi, nel, raster, topo;
+            ID3D11PixelShader *ps;
+            ID3D11InputLayout *il;
+            D3D11_INPUT_ELEMENT_DESC el[16];
+            UINT strides[16];
+            uint32_t vgen;
+            float par[88];
+            uint8_t psc[512];
+        } sg[2];
+        static int cur, have;
+        int k, n = cur ^ 1;
+        const DWORD *rs = d3d8_GetRenderStates();
+        memset(&sg[n], 0, sizeof sg[n]);
+        if (rs) memcpy(sg[n].rs, rs, sizeof sg[n].rs);
+        for (k = 0; k < 4; k++) {
+            const DWORD *t = d3d8_GetTSS((DWORD)k);
+            if (t) memcpy(sg[n].tss[k], t, sizeof sg[n].tss[k]);
+            sg[n].tex[k] = d3d8_CurTexture(k);
+        }
+        sg[n].vi = vi; sg[n].nel = nel; sg[n].raster = d->raster; sg[n].topo = (int)topo;
+        sg[n].ps = ps; sg[n].il = il;
+        memcpy(sg[n].el, el, (size_t)nel * sizeof el[0]);
+        for (k = 0; k < ngrp; k++) sg[n].strides[k] = strides[k];
+        sg[n].vgen = d->vgen;
+        memcpy(sg[n].par, &params, sizeof params < sizeof sg[n].par ? sizeof params : sizeof sg[n].par);
+        if (d->ps_consts_size <= sizeof sg[n].psc) memcpy(sg[n].psc, d->ps_consts, d->ps_consts_size);
+        if (have && !memcmp(&sg[0], &sg[1], sizeof sg[0]) && !(d->raster & 0xC0) &&
+            !g_d3d8_light_mark && !g_d3d8_temporal_mark)
+            perf_count(PC_MERGES, 1);
+        cur = n;
+        have = 1;
+    }
     {
         int gm = d3d8_ghost_mode();
         if (gm == 1) return 1;

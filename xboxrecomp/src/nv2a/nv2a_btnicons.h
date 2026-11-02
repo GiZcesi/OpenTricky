@@ -2,11 +2,13 @@
  * Xbox pad or a PlayStation pad.
  *
  * The game draws its button prompts from four texture atlases (menus, race
- * HUD, trick HUD, loading screens). When one of them is uploaded, its texels
- * (the player's own files) are scaled up 4x, the rectangle of each button
- * glyph is cleared and an icon drawing is fitted inside it; the rest of the
- * atlas is kept. Drawings: port/assets/btnicons/juliocacko/ (CC0), built into
- * the executable as resources; the "ps2" style has its own pictures
+ * HUD, trick HUD, loading screens). Each one's texels (the player's own
+ * files) are scaled up 4x, the rectangle of each button glyph is cleared and
+ * an icon drawing is fitted inside it; the rest of the atlas is kept. That is
+ * done ahead of use, off the pump (btnicons_prepare), and the composed copy
+ * replaces the atlas when it is uploaded. Drawings:
+ * port/assets/btnicons/juliocacko/ (CC0), built into the executable as
+ * resources; the "ps2" style has its own pictures
  * (port/assets/btnicons/ps2/).
  *
  * The launcher always sets XBOX_BUTTON_ICONS ([Fork] ButtonIcons). Unset or
@@ -26,7 +28,9 @@
  *                     debug        each glyph rectangle filled with a bright
  *                                  colour and its number (table in the .c),
  *                                  to tell on screen which glyph is which
- *   XBOX_BUTTON_ICONS_LOG=1        one line per atlas composed, with its cost
+ *   XBOX_BUTTON_ICONS_LOG=1        the cost of each composition, step by step, and
+ *                                  the fingerprints of its source texels and of
+ *                                  the composed atlas (every level)
  *   XBOX_FIX_BUMPERS_WIDE=0        bumpers at the Duke glyphs' size (comparisons;
  *                                  default: wide, btnicons_wide_bumpers)
  */
@@ -57,12 +61,20 @@ int btnicons_bumper_text_dy(void);
 #define BTNICONS_BUMPER_W  24.0f
 #define BTNICONS_BUMPER_H  15.0f
 
+/* Starts composing the button atlases ahead of use, on a thread of its own,
+ * from the disc's texture banks ("Ahead of use" in the .c). Called once the
+ * D3D11 device exists (nv2a_live_pb.c); later calls do nothing. Nothing
+ * either when the icons are off. */
+void btnicons_prepare(void);
+
 /* After a texture-cache miss on a w x h texture: when its level-0 guest bytes
  * are one of the button atlases, the composed atlas (a new reference for the
- * caller), else NULL. `guest` is the texture just decoded from those bytes
- * (lockable, linear A8R8G8B8 or DXT); `color` is the NV2A colour format. */
+ * caller), else NULL: the copy composed ahead of use, taken once ready, or,
+ * for an atlas that could not be made ahead, composed here. `bgra0` is
+ * level 0 as the pump decoded it from those bytes (w x h BGRA rows, tightly
+ * packed; NULL for a DXT texture); `color` is the NV2A colour format. */
 IDirect3DTexture8 *btnicons_compose(const uint8_t *level0, uint32_t n0, uint32_t w, uint32_t h,
-                                    uint32_t color, IDirect3DTexture8 *guest);
+                                    uint32_t color, const uint8_t *bgra0);
 
 /* 1 in the "ps2" style (the PS2 button style): ctlscheme.c then draws
  * the button shapes at the pictures' sizes. */

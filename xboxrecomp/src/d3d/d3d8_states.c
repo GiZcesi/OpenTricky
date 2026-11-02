@@ -12,7 +12,9 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_temporal.h"
+#include "../kernel/xbox_perf.h"
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 /* ================================================================
@@ -190,6 +192,7 @@ static void update_blend_state(const DWORD *rs)
     bd.RenderTarget[0].BlendOpAlpha = bd.RenderTarget[0].BlendOp;
     bd.RenderTarget[0].RenderTargetWriteMask = (UINT8)(rs[D3DRS_COLORWRITEENABLE] & 0x0F);
 
+    if (g_perf_on) perf_count(PC_SOBJ, 1);
     hr = ID3D11Device_CreateBlendState(d3d8_GetD3D11Device(), &bd, &g_blend_state);
     if (FAILED(hr))
         fprintf(stderr, "D3D8: CreateBlendState failed: 0x%08lX\n", hr);
@@ -224,6 +227,7 @@ static void update_depth_stencil_state(const DWORD *rs)
     dsd.FrontFace.StencilPassOp = d3d8_to_d3d11_stencilop(rs[D3DRS_STENCILPASS]);
     dsd.BackFace = dsd.FrontFace;
 
+    if (g_perf_on) perf_count(PC_SOBJ, 1);
     hr = ID3D11Device_CreateDepthStencilState(d3d8_GetD3D11Device(), &dsd, &g_ds_state);
     if (FAILED(hr))
         fprintf(stderr, "D3D8: CreateDepthStencilState failed: 0x%08lX\n", hr);
@@ -264,6 +268,7 @@ static void update_rasterizer_state(const DWORD *rs)
     rd.MultisampleEnable = FALSE;
     rd.AntialiasedLineEnable = FALSE;
 
+    if (g_perf_on) perf_count(PC_SOBJ, 1);
     hr = ID3D11Device_CreateRasterizerState(d3d8_GetD3D11Device(), &rd, &g_raster_state);
     if (FAILED(hr))
         fprintf(stderr, "D3D8: CreateRasterizerState failed: 0x%08lX\n", hr);
@@ -373,8 +378,10 @@ void d3d8_states_apply_sampler(DWORD stage)
         int k;
         for (k = 0; k < ncache; k++)
             if (!memcmp(&cache[k].d, &sd, sizeof sd)) break;
+        if (g_perf_on) perf_count(PC_SMPL, (unsigned)k + 1u);   /* compares */
         if (k == ncache) {
             ID3D11SamplerState *ss = NULL;
+            if (g_perf_on) perf_count(PC_SOBJ, 1);
             hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &ss);
             if (FAILED(hr) || !ss) return;
             if (ncache < SAMPLER_CACHE) { cache[k].d = sd; cache[k].s = ss; ncache++; }
@@ -384,6 +391,224 @@ void d3d8_states_apply_sampler(DWORD stage)
         ID3D11SamplerState_AddRef(cache[k].s);   /* released on the next apply, as before */
         ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &g_sampler_states[stage]);
     }
+}
+
+/* ================================================================
+ * XBOX_FIX_PUMP_SOBJ, default 1; 0 = the path above: state objects
+ * from tables keyed by every render / stage state they are built from, and
+ * compared on all of it -- the one-entry caches above release and recreate
+ * an object whenever two draws in a row differ (a trip into the runtime,
+ * which then hands back the object it already had), and their 32-bit hash
+ * can collide. Same descriptions, same objects as D3D11 would return; the
+ * tables own their objects for the life of the device. Off on the frames
+ * XBOX_FIX_PUMP_ALT turns the pump optimizations off.
+ * ================================================================ */
+
+extern int d3d8_pump_alt_off(void);
+
+static int pump_sobj_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_SOBJ"); on = !(e && e[0] == '0'); }
+    return on && !d3d8_pump_alt_off();
+}
+
+#define SO_TAB 256                      /* per kind; far more than the title uses */
+#define SO_KEY 14                       /* DWORDs of a key (the sampler description is 13) */
+typedef struct { DWORD key[SO_KEY]; unsigned n; IUnknown *obj; } SoEnt;
+static SoEnt g_so[4][SO_TAB];           /* blend, depth-stencil, (rasteriser: unused), sampler */
+
+static unsigned so_hash(const DWORD *k, unsigned n)
+{
+    unsigned h = 2166136261u, i;
+    for (i = 0; i < n; i++) h = (h ^ k[i]) * 16777619u;
+    return h ^ (h >> 15);
+}
+
+/* The entry of key k (n DWORDs) in table t: found, or the free slot it goes
+ * to (obj NULL), or NULL when the table is full. */
+static SoEnt *so_find(int t, const DWORD *k, unsigned n)
+{
+    unsigned i = so_hash(k, n) & (SO_TAB - 1u), step;
+    for (step = 0; step < SO_TAB; step++, i = (i + 1u) & (SO_TAB - 1u)) {
+        SoEnt *e = &g_so[t][i];
+        if (!e->obj) return e;
+        if (e->n == n && !memcmp(e->key, k, n * sizeof *k)) return e;
+    }
+    return NULL;
+}
+
+/* A new object: into its free slot, or, the table full, kept alive until
+ * the next one of its kind (as bound until then). */
+static void so_put(int t, SoEnt *e, const DWORD *k, unsigned n, IUnknown *obj)
+{
+    static IUnknown *spare[4];
+    if (!e) {
+        if (spare[t]) IUnknown_Release(spare[t]);
+        spare[t] = obj;
+        return;
+    }
+    memcpy(e->key, k, n * sizeof *k);
+    e->n = n;
+    e->obj = obj;
+}
+
+static ID3D11BlendState *so_blend(const DWORD *rs)
+{
+    DWORD k[5];
+    SoEnt *e;
+    D3D11_BLEND_DESC bd;
+    ID3D11BlendState *b = NULL;
+    k[0] = rs[D3DRS_ALPHABLENDENABLE]; k[1] = rs[D3DRS_SRCBLEND]; k[2] = rs[D3DRS_DESTBLEND];
+    k[3] = rs[D3DRS_BLENDOP]; k[4] = rs[D3DRS_COLORWRITEENABLE];
+    e = so_find(0, k, 5);
+    if (e && e->obj) return (ID3D11BlendState *)e->obj;
+    memset(&bd, 0, sizeof(bd));         /* as update_blend_state */
+    bd.RenderTarget[0].BlendEnable = rs[D3DRS_ALPHABLENDENABLE] ? TRUE : FALSE;
+    bd.RenderTarget[0].SrcBlend = d3d8_to_d3d11_blend(rs[D3DRS_SRCBLEND]);
+    bd.RenderTarget[0].DestBlend = d3d8_to_d3d11_blend(rs[D3DRS_DESTBLEND]);
+    bd.RenderTarget[0].BlendOp = d3d8_to_d3d11_blendop(rs[D3DRS_BLENDOP] ? rs[D3DRS_BLENDOP] : 1);
+    bd.RenderTarget[0].SrcBlendAlpha = blend_alpha_factor(bd.RenderTarget[0].SrcBlend);
+    bd.RenderTarget[0].DestBlendAlpha = blend_alpha_factor(bd.RenderTarget[0].DestBlend);
+    bd.RenderTarget[0].BlendOpAlpha = bd.RenderTarget[0].BlendOp;
+    bd.RenderTarget[0].RenderTargetWriteMask = (UINT8)(rs[D3DRS_COLORWRITEENABLE] & 0x0F);
+    if (g_perf_on) perf_count(PC_SOBJ, 1);
+    if (FAILED(ID3D11Device_CreateBlendState(d3d8_GetD3D11Device(), &bd, &b)) || !b) {
+        fprintf(stderr, "D3D8: CreateBlendState failed\n");
+        return NULL;
+    }
+    so_put(0, e, k, 5, (IUnknown *)b);
+    return b;
+}
+
+static ID3D11DepthStencilState *so_ds(const DWORD *rs)
+{
+    DWORD k[10];
+    SoEnt *e;
+    D3D11_DEPTH_STENCIL_DESC dsd;
+    ID3D11DepthStencilState *d = NULL;
+    k[0] = rs[D3DRS_ZENABLE]; k[1] = rs[D3DRS_ZWRITEENABLE]; k[2] = rs[D3DRS_ZFUNC];
+    k[3] = rs[D3DRS_STENCILENABLE]; k[4] = rs[D3DRS_STENCILFUNC]; k[5] = rs[D3DRS_STENCILMASK];
+    k[6] = rs[D3DRS_STENCILWRITEMASK]; k[7] = rs[D3DRS_STENCILFAIL]; k[8] = rs[D3DRS_STENCILZFAIL];
+    k[9] = rs[D3DRS_STENCILPASS];
+    e = so_find(1, k, 10);
+    if (e && e->obj) return (ID3D11DepthStencilState *)e->obj;
+    memset(&dsd, 0, sizeof(dsd));       /* as update_depth_stencil_state */
+    dsd.DepthEnable = rs[D3DRS_ZENABLE] ? TRUE : FALSE;
+    dsd.DepthWriteMask = rs[D3DRS_ZWRITEENABLE] ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+    dsd.DepthFunc = d3d8_to_d3d11_cmp(rs[D3DRS_ZFUNC]);
+    dsd.StencilEnable = rs[D3DRS_STENCILENABLE] ? TRUE : FALSE;
+    dsd.StencilReadMask = (UINT8)(rs[D3DRS_STENCILMASK] & 0xFF);
+    dsd.StencilWriteMask = (UINT8)(rs[D3DRS_STENCILWRITEMASK] & 0xFF);
+    dsd.FrontFace.StencilFunc = d3d8_to_d3d11_cmp(rs[D3DRS_STENCILFUNC]);
+    dsd.FrontFace.StencilFailOp = d3d8_to_d3d11_stencilop(rs[D3DRS_STENCILFAIL]);
+    dsd.FrontFace.StencilDepthFailOp = d3d8_to_d3d11_stencilop(rs[D3DRS_STENCILZFAIL]);
+    dsd.FrontFace.StencilPassOp = d3d8_to_d3d11_stencilop(rs[D3DRS_STENCILPASS]);
+    dsd.BackFace = dsd.FrontFace;
+    if (g_perf_on) perf_count(PC_SOBJ, 1);
+    if (FAILED(ID3D11Device_CreateDepthStencilState(d3d8_GetD3D11Device(), &dsd, &d)) || !d) {
+        fprintf(stderr, "D3D8: CreateDepthStencilState failed\n");
+        return NULL;
+    }
+    so_put(1, e, k, 10, (IUnknown *)d);
+    return d;
+}
+
+/* The sampler of a stage: the description d3d8_states_apply_sampler builds,
+ * the object from the table (that description is its key). */
+/* (XBOX_FIX_PUMP_SMEMO, default 1; 0 = every description built and
+ * looked up as before): per stage, the stage states the sampler description
+ * is made of (filters, address modes, anisotropy, LOD bias, most-detailed
+ * level), the host anisotropy and the temporal LOD bias, with the object they
+ * gave last time. Same inputs, same description (so_sampler below is a
+ * function of these alone), same object: bound again without the
+ * description, its hash and its lookup. Only an object held by g_so (not the
+ * spare of a full table) is remembered; so_release_all forgets them. Off on
+ * the frames XBOX_FIX_PUMP_ALT turns the pump optimizations off. */
+static const D3DTEXTURESTAGESTATETYPE k_smemo_tss[8] = {
+    D3DTSS_MAGFILTER, D3DTSS_MINFILTER, D3DTSS_MIPFILTER, D3DTSS_ADDRESSU,
+    D3DTSS_ADDRESSV, D3DTSS_MAXANISOTROPY, D3DTSS_MIPMAPLODBIAS, D3DTSS_MAXMIPLEVEL,
+};
+static struct { DWORD in[10]; ID3D11SamplerState *ss; } s_smemo[4];
+
+static int pump_smemo_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_SMEMO"); on = !(e && e[0] == '0'); }
+    return on && !d3d8_pump_alt_off();
+}
+
+/* ctx: the caller's context; memo: pump_smemo_on(), decided by the caller
+ * once per draw (XBOX_FIX_PUMP_ALT changes only from one frame to the next). */
+static void so_sampler(DWORD stage, ID3D11DeviceContext *ctx, int memo)
+{
+    const DWORD *tss = d3d8_GetTSS(stage);
+    D3D11_SAMPLER_DESC sd;
+    union { DWORD u; float f; } bias, tb;
+    UINT aniso;
+    DWORD k[(sizeof(D3D11_SAMPLER_DESC) + 3) / 4];
+    SoEnt *e;
+    ID3D11SamplerState *ss = NULL;
+    DWORD in[10];
+    int i;
+    if (stage >= 4 || !tss) return;
+    if (s_tmp_wanted < 0) s_tmp_wanted = d3d8_temporal_wanted();
+    tb.f = s_tmp_wanted ? d3d8_temporal_mip_bias() : 0.0f;   /* read once: the memo's key and the description */
+    if (memo) {
+        for (i = 0; i < 8; i++) in[i] = tss[k_smemo_tss[i]];
+        in[8] = (DWORD)g_host_aniso;
+        in[9] = tb.u;
+        if (s_smemo[stage].ss && !memcmp(s_smemo[stage].in, in, sizeof in)) {
+            if (g_perf_on) { perf_count(PC_SMPL, 1); if (g_perf_detail) perf_count(PC_SMEMO, 1); }   /* PC_SMPL as the lookup counts it; the hit itself: XBOX_PERF_DETAIL only */
+            ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &s_smemo[stage].ss);
+            return;
+        }
+    }
+    memset(&sd, 0, sizeof(sd));         /* as d3d8_states_apply_sampler */
+    sd.Filter = d3d8_to_d3d11_filter(tss[D3DTSS_MAGFILTER], tss[D3DTSS_MINFILTER], tss[D3DTSS_MIPFILTER]);
+    sd.AddressU = d3d8_to_d3d11_address(tss[D3DTSS_ADDRESSU] ? tss[D3DTSS_ADDRESSU] : D3DTADDRESS_WRAP);
+    sd.AddressV = d3d8_to_d3d11_address(tss[D3DTSS_ADDRESSV] ? tss[D3DTSS_ADDRESSV] : D3DTADDRESS_WRAP);
+    sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    aniso = tss[D3DTSS_MAXANISOTROPY] ? tss[D3DTSS_MAXANISOTROPY] : 1;
+    if (aniso > 16) aniso = 16;
+    if ((g_host_aniso > 1 || aniso > 1) && tss[D3DTSS_MINFILTER] != D3DTEXF_POINT &&
+        tss[D3DTSS_MINFILTER] != D3DTEXF_NONE) {
+        sd.Filter = D3D11_FILTER_ANISOTROPIC;
+        if ((UINT)g_host_aniso > aniso) aniso = (UINT)g_host_aniso;
+    }
+    sd.MaxAnisotropy = aniso;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    bias.u = tss[D3DTSS_MIPMAPLODBIAS];
+    sd.MipLODBias = (bias.f == bias.f && bias.f > -16.0f && bias.f < 16.0f) ? bias.f : 0.0f;
+    if (s_tmp_wanted) sd.MipLODBias += tb.f;
+    sd.MinLOD = (FLOAT)tss[D3DTSS_MAXMIPLEVEL];
+    sd.MaxLOD = (tss[D3DTSS_MIPFILTER] == D3DTEXF_NONE) ? sd.MinLOD : D3D11_FLOAT32_MAX;
+    memset(k, 0, sizeof k);
+    memcpy(k, &sd, sizeof sd);
+    e = so_find(3, k, (unsigned)(sizeof k / sizeof k[0]));
+    if (g_perf_on) perf_count(PC_SMPL, 1);
+    if (e && e->obj) ss = (ID3D11SamplerState *)e->obj;
+    else {
+        if (g_perf_on) perf_count(PC_SOBJ, 1);
+        if (FAILED(ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &ss)) || !ss) return;
+        so_put(3, e, k, (unsigned)(sizeof k / sizeof k[0]), (IUnknown *)ss);
+    }
+    if (memo) {                         /* held by g_so for the device's life, or not kept */
+        memcpy(s_smemo[stage].in, in, sizeof in);
+        s_smemo[stage].ss = e ? ss : NULL;
+    }
+    ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &ss);
+}
+
+static void so_release_all(void)
+{
+    int t, i;
+    for (t = 0; t < 4; t++) {
+        for (i = 0; i < SO_TAB; i++)
+            if (g_so[t][i].obj) IUnknown_Release(g_so[t][i].obj);
+        memset(g_so[t], 0, sizeof g_so[t]);
+    }
+    memset(s_smemo, 0, sizeof s_smemo);
 }
 
 /* ================================================================
@@ -399,6 +624,7 @@ HRESULT d3d8_states_init(void)
 void d3d8_states_shutdown(void)
 {
     int i;
+    so_release_all();
     if (g_blend_state)  { ID3D11BlendState_Release(g_blend_state); g_blend_state = NULL; }
     if (g_ds_state)     { ID3D11DepthStencilState_Release(g_ds_state); g_ds_state = NULL; }
     if (g_raster_state) { ID3D11RasterizerState_Release(g_raster_state); g_raster_state = NULL; }
@@ -450,4 +676,36 @@ void d3d8_states_apply(void)
         for (s = 0; s < 4; s++)
             d3d8_states_apply_sampler(s);
     }
+}
+
+void d3d8_states_apply_nv2a(void)
+{
+    const DWORD *rs = d3d8_GetRenderStates();
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    float blend_factor[4] = { 1, 1, 1, 1 };
+    ID3D11BlendState *b;
+    ID3D11DepthStencilState *d;
+    DWORD s;
+    int memo;
+
+    if (!pump_sobj_on()) { d3d8_states_apply(); return; }
+    if (!rs || !ctx) return;
+    b = so_blend(rs);
+    d = so_ds(rs);
+    if (b) ID3D11DeviceContext_OMSetBlendState(ctx, b, blend_factor, 0xFFFFFFFF);
+    if (d) ID3D11DeviceContext_OMSetDepthStencilState(ctx, d, rs[D3DRS_STENCILREF]);
+    /* no rasteriser state: the caller binds its own right after */
+    if (g_wclip_on) {                   /* as d3d8_states_apply */
+        D3D11_RECT r;
+        float sx, sy;
+        d3d8_GetGuestScale(&sx, &sy);
+        r.left   = (LONG)(g_wclip.left   * sx + 0.5f);
+        r.top    = (LONG)(g_wclip.top    * sy + 0.5f);
+        r.right  = (LONG)(g_wclip.right  * sx + 0.5f);
+        r.bottom = (LONG)(g_wclip.bottom * sy + 0.5f);
+        ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &r);
+    }
+    memo = pump_smemo_on();             /* once per draw, not per stage */
+    for (s = 0; s < 4; s++)
+        so_sampler(s, ctx, memo);
 }

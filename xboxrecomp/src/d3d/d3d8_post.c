@@ -3,8 +3,9 @@
  * See d3d8_post.h for what it does and where it sits in the present.
  *
  * SMAA 1x is Jorge Jimenez et al.'s reference implementation, used
- * unmodified from smaa/SMAA.hlsl (MIT licence, smaa/LICENSE.txt and the
- * notice at the top of the file; provenance in smaa/README.md).
+ * from smaa/SMAA.hlsl with two overloads renamed (MIT licence,
+ * smaa/LICENSE.txt and the notice at the top of the file; provenance and the
+ * change in smaa/README.md).
  */
 #include "d3d8_internal.h"
 #include <d3dcompiler.h>
@@ -154,7 +155,14 @@ static const char s_smaa_prefix[] =
     "#define SMAASampleOffset(tex, coord, offset) tex.Sample(LinearSampler, coord, offset)\n"
     "#define SMAA_FLATTEN [flatten]\n"
     "#define SMAA_BRANCH [branch]\n"
-    "#define SMAAGather(tex, coord) tex.Gather(LinearSampler, coord, 0)\n";
+    "#define SMAAGather(tex, coord) tex.Gather(LinearSampler, coord, 0)\n"
+    /* A multiply-add macro for mad(), as the reference has one
+     * for GLSL 3. Wine 9.0's HLSL compiler (vkd3d-shader 1.10, Proton 9) has
+     * no mad() intrinsic and refused all of SMAA ("Function "mad" is not
+     * defined"; then its overloads, see smaa/README.md): the game ran without
+     * it. D3DCompile gives the same bytecode with the macro as with the
+     * intrinsic; later vkd3d versions give mul + add instead of mad. */
+    "#define mad(a, b, c) ((a) * (b) + (c))\n";
 
 static const char s_smaa_body[] = {
 #embed "smaa/SMAA.hlsl"

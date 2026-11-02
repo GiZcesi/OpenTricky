@@ -486,7 +486,7 @@ bool ot_shpx_decode(const uint8_t *d, uint32_t n, const char *name, OtImage *out
     return d && out && shpx_image(d, n, name, out);
 }
 
-/* ── Files and archive entries for other modules (the rider preview) ── */
+/* ── Files and archive entries, for other readers ────────────────── */
 
 struct OtDiscFile { Iso iso; };
 

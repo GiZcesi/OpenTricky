@@ -114,7 +114,7 @@ body {
     --h-pill: 32dp;  --lh-pill: 30dp;  --lh-disc: 30dp;  --lh-ver: 30dp;  --lh-sw: 30dp;  --h-dot: 8dp;  --m-dot: 11dp;  --r-dot: 4dp;  --h-prog: 2dp;  --m-prog: 4dp;  --h-step: 22dp;  --lh-step: 22dp;  --h-sic: 20dp;  --lh-sic: 18dp;  --m-sic: 1dp;  --h-pb: 22dp;  --lh-pb: 20dp;  --m-pb: 4dp;
     --h-mode: 34dp;  --lh-mode: 32dp;  --h-soon: 15dp;  --lh-soon: 13dp;  --m-soon: 8.5dp;
     --h-seg: 30dp;  --lh-seg: 28dp;  --lh-seg-out: 30dp;  --h-tab: 32dp;  --lh-tab: 30dp;
-    --h-row: 40dp;  --lh-row: 40dp;  --h-ab: 22dp;  --lh-ab: 20dp;  --m-ab: 9dp;
+    --h-row: 40dp;  --lh-row: 40dp;  --h-ab: 22dp;  --lh-ab: 20dp;  --m-ab: 9dp;  --w-sb: 4dp;  --w-sb-back: -4dp;
     --h-soonb: 15dp;  --lh-soonb: 13dp;  --m-soonb: 12.5dp;  --h-tog: 18dp;  --m-tog: 11dp;
     --h-mod: 4dp;  --m-mod: 18dp;  --h-cell: 28dp;  --lh-cell: 26dp;  --m-cell: 6dp;
     --h-tag: 20dp;  --lh-tag: 18dp;
@@ -125,14 +125,14 @@ body {
     --h-fbtn: 36dp;  --m-fbtn: 9dp;  --lh-fbtn: 34dp;  --lh-save: 34dp;  --lh-note: 54dp;
     --h-play: 82dp;  --lh-play: 82dp;  --lh-play-off: 80dp;
     --pr-pill: 12dp;  --mr-pb: -8dp;  --p5: 5dp;  --p5-r: 3.6dp;  --p6: 6dp;  --p6-r: 4.6dp;  --p7: 7dp;  --p7-r: 5.6dp;  --p9: 9dp;  --p9-r: 7.6dp;
-    --p12: 12dp;  --p15: 15dp;  --p16: 16dp;  --p18: 18dp;
+    --p12: 12dp;  --p15: 15dp;  --p16: 16dp;  --p16-back: -16dp;  --p18: 18dp;
     --dx-pri: 0px;   /* the main buttons' labels (display face) moved back by half its overhang */
     /* The chamfered panels' inner margin (What's new, the disc panel, the help, the dialogs). */
     --pad-panel: 26dp;
 
     /* The focus of the keyboard and the controller, on every control. */
     --focus-ring: #ffffff 0 0 0 2dp;
-    --focus-ring-in: #ffffff 0 0 0 2dp inset;   /* the settings lines of the scrolled list, which clips outside */
+    --focus-ring-in: #ffffff 0 0 0 2dp inset;   /* the lines of a scrolled list (a setting, a disc image found), which clips outside */
     /* The line icons, drawn at their size in pixels (set in whole pixels by apply_layout). */
     --icon: 22dp;
     /* Set again in whole pixels by the launcher at each layout (apply_layout). */

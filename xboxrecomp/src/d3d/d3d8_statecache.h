@@ -8,10 +8,16 @@
  * goes through the mirror this way: it stays exact without hand-written
  * invalidation.
  *
- * Never filtered (passed as is): textures (SRV) and render targets, which
- * the runtime unbinds by itself on a read / write conflict.
- * ClearState empties the mirror. A bound object is held by the context: its
- * address cannot be reused while it is bound, so comparing pointers is safe.
+ * Never filtered (passed as is): render targets. Pixel-shader textures
+ * (SRV), which the runtime unbinds by itself on a read / write conflict, are
+ * filtered only with XBOX_FIX_PUMP_SRV: every render-target change,
+ * ClearState, Present and buffer resize forgets them, and the mirror holds a
+ * reference on each view it records.
+ * ClearState empties the mirror, and so does sc_ForgetAll after code that
+ * binds through the context directly: the tuning panel, and every Present
+ * (an overlay hooked on it does too). A bound object is held by the
+ * context: its address cannot be reused while it is bound, so comparing
+ * pointers is safe.
  * A context other than the immediate one: passes without the mirror.
  */
 #ifndef D3D8_STATECACHE_H
@@ -37,6 +43,14 @@ void sc_PSSetConstantBuffers1(ID3D11DeviceContext1 *c, UINT start, UINT n, ID3D1
                               const UINT *first, const UINT *num);
 void sc_ClearState(ID3D11DeviceContext *c);
 void sc_ClearState1(ID3D11DeviceContext1 *c);
+/* Pixel-shader textures (XBOX_FIX_PUMP_SRV) and what invalidates them. */
+void sc_PSSetShaderResources(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11ShaderResourceView *const *v);
+void sc_OMSetRenderTargets(ID3D11DeviceContext *c, UINT n, ID3D11RenderTargetView *const *rtv, ID3D11DepthStencilView *dsv);
+void sc_OMSetRenderTargetsAndUnorderedAccessViews(ID3D11DeviceContext *c, UINT n, ID3D11RenderTargetView *const *rtv,
+                                                  ID3D11DepthStencilView *dsv, UINT uav_start, UINT nuav,
+                                                  ID3D11UnorderedAccessView *const *uav, const UINT *counts);
+void sc_ForgetTextures(void);
+void sc_ForgetAll(void);                /* after direct context calls (the tuning panel, Present) */
 
 #undef ID3D11DeviceContext_OMSetBlendState
 #define ID3D11DeviceContext_OMSetBlendState(T, a, b, c) sc_OMSetBlendState(T, a, b, c)
@@ -68,6 +82,13 @@ void sc_ClearState1(ID3D11DeviceContext1 *c);
 #define ID3D11DeviceContext1_VSSetConstantBuffers1(T, a, b, c, d, e) sc_VSSetConstantBuffers1(T, a, b, c, d, e)
 #undef ID3D11DeviceContext1_PSSetConstantBuffers1
 #define ID3D11DeviceContext1_PSSetConstantBuffers1(T, a, b, c, d, e) sc_PSSetConstantBuffers1(T, a, b, c, d, e)
+#undef ID3D11DeviceContext_PSSetShaderResources
+#define ID3D11DeviceContext_PSSetShaderResources(T, a, b, c) sc_PSSetShaderResources(T, a, b, c)
+#undef ID3D11DeviceContext_OMSetRenderTargets
+#define ID3D11DeviceContext_OMSetRenderTargets(T, a, b, c) sc_OMSetRenderTargets(T, a, b, c)
+#undef ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews
+#define ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(T, a, b, c, d, e, f, g) \
+    sc_OMSetRenderTargetsAndUnorderedAccessViews(T, a, b, c, d, e, f, g)
 #undef ID3D11DeviceContext_ClearState
 #define ID3D11DeviceContext_ClearState(T) sc_ClearState(T)
 #undef ID3D11DeviceContext1_ClearState

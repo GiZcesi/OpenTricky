@@ -10,6 +10,7 @@
 #include "recomp/recomp_types.h"
 #include "fps_cap.h"
 #include "hud_anchor.h"
+#include "aspect.h"
 #include "frame_clock.h"
 #include "../../xboxrecomp/src/kernel/xbox_perf.h"
 
@@ -103,12 +104,19 @@ static double now_ms(void)
 #define POSE_N      21u
 #define TELEPORT    400.0f          /* units per tick (race: ~30) */
 #define CAM_CUT_COS 0.866f          /* camera rotation > 60 deg in one tick = cut */
+/* A camera whose step changes by more than this in one tick was cut by the
+ * game: its motion never accelerates that fast (Showoff on Garibaldi at 240:
+ * at most 22 units per tick per tick in the race, 0.2 at the start gate),
+ * while the cut from an intro shot to the start camera (A pressed during the
+ * intro) moves it 279 units in one tick, under TELEPORT. */
+#define CAM_CUT_ACCEL 100.0f
 #define BONE_CUT_COS 0.0f           /* bone turned by > 180 deg: quaternions, cos(half angle) < 0 -> 90 deg */
 
 enum { SP_VIEW, SP_POS, SP_POSE };
 typedef struct { uint32_t va, len, kind, off; } Span;
 typedef struct {
     uint32_t st, race, n, nw;
+    uint32_t eye;                   /* aspect_eye_epoch() when read: where the views' eyes came from */
     Span sp[NV_MAX + 2u * NR_MAX];
     float w[(NV_MAX * VIEW_LEN + NR_MAX * (0x10u + POSE_N * 0x40u)) / 4u];
 } VS;
@@ -127,6 +135,10 @@ static struct {
     int written;                    /* interpolated state in memory (render in progress) */
     unsigned long long n_interp, n_mismatch, n_alpha1, n_cut_cam, n_cut_rider, n_badrot, n_logged;
     uint32_t log_from;
+    /* per view (the first spans of the layout): camera step of the last tick
+     * (tick N - tick N-1), whether it is known, and whether tick N was a cut */
+    float cam_step[NV_MAX][3];
+    int cam_step_ok[NV_MAX], cam_cut[NV_MAX];
 } I;
 
 static unsigned long long s_outliers;
@@ -698,6 +710,7 @@ static void vs_read(VS *v)
 {
     uint32_t k;
     for (k = 0; k < v->n; k++) memcpy(&v->w[v->sp[k].off], (const void *)XBOX_PTR(v->sp[k].va), v->sp[k].len);
+    v->eye = aspect_eye_epoch();
 }
 
 static void vs_write(const VS *v)
@@ -807,6 +820,10 @@ static int view_lerp(const float *a, const float *b, float t, float *o)
         ca[i] = -(ma[12] * ma[4 * i] + ma[13] * ma[4 * i + 1] + ma[14] * ma[4 * i + 2]);
         cb[i] = -(mb[12] * mb[4 * i] + mb[13] * mb[4 * i + 1] + mb[14] * mb[4 * i + 2]);
     }
+    /* The views of the two ticks were built from eyes of another source
+     * (aspect.c: the title's eye, the follow camera's moved one): a jump of
+     * the whole back-off, no motion of the camera; shown as a cut. */
+    if (I.prev.eye != I.cur.eye) return 0;
     if (!(dist3(ca, cb) < TELEPORT) || !(dist3(a, b) < TELEPORT)) return -1;
     r = rot_lerp(ma, mb, t, m, CAM_CUT_COS);
     if (r <= 0) return r;
@@ -816,6 +833,40 @@ static int view_lerp(const float *a, const float *b, float t, float *o)
     o[20] = a[20] + (b[20] - a[20]) * t;
     o[21] = a[21] + (b[21] - a[21]) * t;
     return 1;
+}
+
+/* After each tick (prev = N-1, cur = N valid): a view whose camera step
+ * (block position) differs from the step of the tick before by more than
+ * CAM_CUT_ACCEL was cut by the game at tick N and is shown at N, as with a
+ * teleport. The tick after a cut is not compared (its step follows the new
+ * shot, not the old one). */
+static void cam_cut_update(void)
+{
+    uint32_t k;
+    for (k = 0; k < NV_MAX; k++) I.cam_cut[k] = 0;
+    for (k = 0; k < I.cur.n && k < NV_MAX; k++) {
+        const Span *p = &I.cur.sp[k];
+        const float *x = &I.prev.w[p->off], *y = &I.cur.w[p->off];
+        float d[3];
+        int i;
+        if (p->kind != SP_VIEW) break;
+        if (I.prev.eye != I.cur.eye) { I.cam_step_ok[k] = 0; continue; }   /* view_lerp's cut: the eye changed source */
+        for (i = 0; i < 3; i++) d[i] = y[i] - x[i];
+        if (!(dist3(x, y) < TELEPORT)) { I.cam_step_ok[k] = 0; continue; }   /* view_lerp's cut */
+        if (I.cam_step_ok[k] && !(dist3(d, I.cam_step[k]) <= CAM_CUT_ACCEL)) {
+            I.cam_cut[k] = 1;
+            I.cam_step_ok[k] = 0;
+            continue;
+        }
+        memcpy(I.cam_step[k], d, sizeof d);
+        I.cam_step_ok[k] = 1;
+    }
+}
+
+static void cam_cut_reset(void)
+{
+    uint32_t k;
+    for (k = 0; k < NV_MAX; k++) I.cam_step_ok[k] = I.cam_cut[k] = 0;
 }
 
 /* Rider: position + 21 bones. Teleport (root bone) -> state N. */
@@ -869,7 +920,9 @@ static int interp_begin(uint32_t st, double ts)
         const Span *p = &I.cur.sp[k];
         const float *x = &I.prev.w[p->off], *y = &I.cur.w[p->off];
         if (p->kind == SP_VIEW) {
-            if (view_lerp(x, y, t, &o->w[p->off]) <= 0) { I.n_cut_cam++; cut_note("camera", p->va, x, y); memcpy(&o->w[p->off], y, p->len); }
+            if ((k < NV_MAX && I.cam_cut[k]) || view_lerp(x, y, t, &o->w[p->off]) <= 0) {
+                I.n_cut_cam++; cut_note("camera", p->va, x, y); memcpy(&o->w[p->off], y, p->len);
+            }
         } else if (p->kind == SP_POS) {
             const Span *q = &I.cur.sp[k + 1];
             if (rider_lerp(x, y, &I.prev.w[q->off], &I.cur.w[q->off], t, &o->w[p->off], &o->w[q->off]) < 0) {
@@ -1018,7 +1071,7 @@ void hook_fps_00043690(void)
     }
 }
 
-/* ── Leg smoothing (XBOX_FPS_SMOOTH_LEGS=1; off by default) ────────
+/* ── Leg smoothing (XBOX_FPS_SMOOTH_LEGS=1; on in Recommended, off in Original Xbox / Deck) ─
  * In a carve, the board suspension (rider +0x1F8, ground physics 0x27B63 /
  * 0x27D28) can oscillate at 12-20 Hz; the board node follows it (0x3BD83)
  * and the legs bend with it on every tick: the board and the legs shake
@@ -1029,6 +1082,15 @@ void hook_fps_00043690(void)
  * Only while riding on the ground (+0x454 == 2 and +0x458 == 3): the history
  * restarts on any other state (jump, landing, fall, trick), on a teleport and
  * on a local step larger than 20 deg or 20 units in one tick.
+ * When the history restarts, the legs and the board go back from the
+ * average to the game's pose within the tick it restarts at: above 60 fps,
+ * across that tick's images, from the pose shown at tick N-1 to the game's
+ * at tick N, as the interpolation moves everything else; at 60 fps, on that
+ * tick's image (none after a teleport). Not in one image above 60 (up to
+ * 8.7 units on a Garibaldi race, 5-6 times a minute), and not slower than
+ * the game's own motion either: a return spread over 4 ticks made the board
+ * slide back under the rider for 67 ms after every jump, landing and trick,
+ * like a rubber band.
  * The bones are written before the render and written back bit exact after
  * it; the logic never sees them. At 60 fps the render and tick hooks are
  * installed only for this (no interpolation, no extra frame). */
@@ -1036,6 +1098,9 @@ void hook_fps_00043690(void)
 #define LEG_N        7u             /* bones 14..20 */
 #define LEG_AVG      4u
 #define LEG_HIST     (LEG_AVG + 1u)
+#define LEG_FADE     1u             /* ticks the return to the game's pose lasts */
+#define LEG_AVG_N    LEG_AVG
+#define LEG_FADE_N   LEG_FADE
 #define LEG_STEP_COS 0.98481f       /* cos(10 deg) = local bone turned by more than 20 deg */
 #define LEG_STEP_LEN 20.0f
 #define LEG_STATE    0x454u
@@ -1049,6 +1114,11 @@ typedef struct {
     float    raw[(1u + LEG_N) * 16u];       /* tick N as written by the tick: root, bones 14..20 */
     float    save[LEG_N * 16u];             /* bones before the render */
     int      written;
+    LegBone  rawl[LEG_N];                   /* the game's local pose at tick N */
+    LegBone  shown[LEG_N];                  /* local pose shown at tick N (alpha 1), fade included */
+    int      shown_ok;
+    float    fade_q[LEG_N][4], fade_t[LEG_N][3];   /* shown - game when the history restarted */
+    uint32_t fade;                          /* ticks of that return left (LEG_FADE .. 0) */
 } LegRider;
 
 static struct {
@@ -1103,41 +1173,111 @@ static void leg_mean(const LegRider *r, uint32_t b, uint32_t from, uint32_t cnt,
     for (i = 0; i < 3; i++) o->t[i] /= (float)cnt;
 }
 
+/* Rotation that takes the local pose `raw` to `shown` (row vectors: shown =
+ * D * raw, D = shown * raw^T) as a quaternion with w >= 0, and the step of
+ * the position. */
+static void leg_delta(const LegBone *shown, const LegBone *raw, float *dq, float *dt)
+{
+    float ms[16] = { 0 }, mr[16] = { 0 }, d[16] = { 0 };
+    int i, j, k;
+    q2m(shown->q, ms);
+    q2m(raw->q, mr);
+    for (i = 0; i < 3; i++)
+        for (j = 0; j < 3; j++) {
+            float a = 0.0f;
+            for (k = 0; k < 3; k++) a += ms[4 * i + k] * mr[4 * j + k];
+            d[4 * i + j] = a;
+        }
+    m2q(d, dq);
+    if (dq[3] < 0.0f) for (i = 0; i < 4; i++) dq[i] = -dq[i];
+    for (i = 0; i < 3; i++) dt[i] = shown->t[i] - raw->t[i];
+}
+
+/* The share w (0..1) of the restart offset of bone b put back on the local
+ * pose x (rotation from the identity, normalized lerp: the offsets are a few
+ * degrees). */
+static void leg_fade(const LegRider *r, uint32_t b, float w, LegBone *x)
+{
+    float q[4], d[16] = { 0 }, m[16] = { 0 }, o[16] = { 0 }, l;
+    int i, j, k;
+    if (!(w > 0.0f)) return;
+    if (w > 1.0f) w = 1.0f;
+    for (i = 0; i < 4; i++) q[i] = r->fade_q[b][i] * w;
+    q[3] += 1.0f - w;
+    l = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    for (i = 0; i < 4; i++) q[i] /= l;
+    q2m(q, d);
+    q2m(x->q, m);
+    for (i = 0; i < 3; i++)
+        for (j = 0; j < 3; j++) {
+            float a = 0.0f;
+            for (k = 0; k < 3; k++) a += d[4 * i + k] * m[4 * k + j];
+            o[4 * i + j] = a;
+        }
+    m2q(o, x->q);
+    for (i = 0; i < 3; i++) x->t[i] += w * r->fade_t[b][i];
+}
+
 /* After each race tick: history of the local leg pose of every rider. */
 static void legs_tick(void)
 {
     uint32_t race = race_ptr(), nr, i, b;
     if (!L.on) return;
     if (!L.tid) L.tid = GetCurrentThreadId();
-    if (!race || MEM32(race + 0x1Cu) != 4u) { for (i = 0; i < NR_MAX; i++) L.r[i].n = 0; return; }
+    if (!race || MEM32(race + 0x1Cu) != 4u) {
+        for (i = 0; i < NR_MAX; i++) { L.r[i].n = 0; L.r[i].fade = 0; L.r[i].shown_ok = 0; }
+        return;
+    }
     nr = MEM32(race + 0x88u); if (nr > NR_MAX) nr = NR_MAX;
     for (i = 0; i < NR_MAX; i++) {
         LegRider *r = &L.r[i];
-        uint32_t va = i < nr ? MEM32(race + 0xC4u + 4u * i) : 0;
+        uint32_t va = i < nr ? MEM32(race + 0xC4u + 4u * i) : 0, had;
         const float *pose;
         LegBone cur[LEG_N];
-        int ok;
-        if (va < 0x1000u) { r->va = 0; r->n = 0; continue; }
-        if (va != r->va) { r->va = va; r->n = 0; }
+        int ok, raw_ok, jump = 0;
+        if (va < 0x1000u) { r->va = 0; r->n = 0; r->fade = 0; r->shown_ok = 0; continue; }
+        if (va != r->va) { r->va = va; r->n = 0; r->fade = 0; r->shown_ok = 0; }
+        if (r->fade) r->fade--;
+        had = r->n;
         pose = (const float *)XBOX_PTR(va + POSE_OFF);
-        ok = MEM32(va + LEG_STATE) == 2u && MEM32(va + LEG_MODE) == 3u && leg_rows(pose);
-        for (b = 0; ok && b < LEG_N; b++) {
+        raw_ok = leg_rows(pose);
+        ok = raw_ok && MEM32(va + LEG_STATE) == 2u && MEM32(va + LEG_MODE) == 3u;
+        for (b = 0; raw_ok && b < LEG_N; b++) {
             const float *w = pose + 16u * (LEG_FIRST + b);
-            if (!leg_rows(w)) { ok = 0; break; }
+            if (!leg_rows(w)) { raw_ok = ok = 0; break; }
             leg_local(pose, w, &cur[b]);
-            if (r->n) {
+            if (ok && r->n) {
                 const LegBone *p = &r->h[0][b];
                 float d = fabsf(cur[b].q[0] * p->q[0] + cur[b].q[1] * p->q[1] + cur[b].q[2] * p->q[2] + cur[b].q[3] * p->q[3]);
                 if (d < LEG_STEP_COS || dist3(cur[b].t, p->t) > LEG_STEP_LEN) { r->n = 0; L.n_reset++; }
             }
         }
-        if (ok && r->n && dist3(pose + 12, r->raw + 12) > TELEPORT) { r->n = 0; L.n_reset++; }
-        if (!ok) { if (r->n) L.n_reset++; r->n = 0; continue; }
-        memmove(&r->h[1], &r->h[0], (LEG_HIST - 1u) * sizeof r->h[0]);
-        memcpy(r->h[0], cur, sizeof cur);
-        if (r->n < LEG_HIST) r->n++;
+        if (raw_ok && r->shown_ok && dist3(pose + 12, r->raw + 12) > TELEPORT) jump = 1;
+        if (ok && r->n && jump) { r->n = 0; L.n_reset++; }
+        if (!ok) { if (r->n) L.n_reset++; r->n = 0; }
+        /* the average stops showing at this tick: fade out the offset it had
+         * from the game's pose at the tick before (shown and rawl: tick N-1) */
+        if (had >= 2u && r->n == 0 && raw_ok && r->shown_ok && !jump) {
+            for (b = 0; b < LEG_N; b++) leg_delta(&r->shown[b], &r->rawl[b], r->fade_q[b], r->fade_t[b]);
+            r->fade = LEG_FADE_N;
+        }
+        if (!raw_ok || jump) r->fade = 0;
+        if (ok) {
+            memmove(&r->h[1], &r->h[0], (LEG_HIST - 1u) * sizeof r->h[0]);
+            memcpy(r->h[0], cur, sizeof cur);
+            if (r->n < LEG_HIST) r->n++;
+        }
+        if (!raw_ok) { r->shown_ok = 0; continue; }
         memcpy(r->raw, pose, 16u * sizeof(float));
         memcpy(r->raw + 16, pose + 16u * LEG_FIRST, LEG_N * 16u * sizeof(float));
+        /* what a render at alpha 1 shows for this tick (legs_begin, t = 1) */
+        memcpy(r->rawl, cur, sizeof cur);
+        for (b = 0; b < LEG_N; b++) {
+            if (r->n >= 2u) leg_mean(r, b, 0, r->n < LEG_AVG_N ? r->n : LEG_AVG_N, &r->shown[b]);
+            else r->shown[b] = cur[b];
+            if (r->fade) leg_fade(r, b, (float)(r->fade - 1u) / (float)LEG_FADE_N, &r->shown[b]);
+        }
+        r->shown_ok = 1;
     }
 }
 
@@ -1152,7 +1292,7 @@ static void legs_begin(void)
         float *pose;
         uint32_t cnt;
         float t = I.written ? I.alpha : 1.0f;
-        if (r->n < 2u || r->va != MEM32(race + 0xC4u + 4u * i)) continue;
+        if ((r->n < 2u && !r->fade) || r->va != MEM32(race + 0xC4u + 4u * i)) continue;
         pose = (float *)XBOX_PTR(r->va + POSE_OFF);
         /* without interpolation, memory must still be tick N */
         if (!I.written && (memcmp(pose, r->raw, 16u * sizeof(float))
@@ -1161,22 +1301,31 @@ static void legs_begin(void)
         if (t < 0.0f) t = 0.0f;
         if (t > 1.0f) t = 1.0f;
         memcpy(r->save, pose + 16u * LEG_FIRST, sizeof r->save);
-        cnt = r->n < LEG_AVG ? r->n : LEG_AVG;
+        cnt = r->n < LEG_AVG_N ? r->n : LEG_AVG_N;
         for (b = 0; b < LEG_N; b++) {
             LegBone a, o;
             float m[16] = { 0 }, *w = pose + 16u * (LEG_FIRST + b);
             int j, k, c;
-            leg_mean(r, b, 0, cnt, &o);
-            if (t < 1.0f) {     /* interpolated root: the average one tick earlier, blended */
-                uint32_t c1 = r->n - 1u < LEG_AVG ? r->n - 1u : LEG_AVG;
-                float d, l;
-                leg_mean(r, b, 1, c1, &a);
-                d = a.q[0] * o.q[0] + a.q[1] * o.q[1] + a.q[2] * o.q[2] + a.q[3] * o.q[3];
-                for (k = 0; k < 4; k++) o.q[k] = (d < 0.0f ? -a.q[k] : a.q[k]) * (1.0f - t) + o.q[k] * t;
-                l = sqrtf(o.q[0] * o.q[0] + o.q[1] * o.q[1] + o.q[2] * o.q[2] + o.q[3] * o.q[3]);
-                for (k = 0; k < 4; k++) o.q[k] /= l;
-                for (k = 0; k < 3; k++) o.t[k] = a.t[k] * (1.0f - t) + o.t[k] * t;
+            if (r->n < 2u) {    /* fade only: the pose in memory (tick N, or interpolated) */
+                if (!leg_rows(w)) continue;
+                leg_local(pose, w, &o);
+            } else {
+                leg_mean(r, b, 0, cnt, &o);
+                if (t < 1.0f) {     /* interpolated root: the average one tick earlier, blended */
+                    uint32_t c1 = r->n - 1u < LEG_AVG_N ? r->n - 1u : LEG_AVG_N;
+                    float d, l;
+                    leg_mean(r, b, 1, c1, &a);
+                    d = a.q[0] * o.q[0] + a.q[1] * o.q[1] + a.q[2] * o.q[2] + a.q[3] * o.q[3];
+                    for (k = 0; k < 4; k++) o.q[k] = (d < 0.0f ? -a.q[k] : a.q[k]) * (1.0f - t) + o.q[k] * t;
+                    l = sqrtf(o.q[0] * o.q[0] + o.q[1] * o.q[1] + o.q[2] * o.q[2] + o.q[3] * o.q[3]);
+                    for (k = 0; k < 4; k++) o.q[k] /= l;
+                    for (k = 0; k < 3; k++) o.t[k] = a.t[k] * (1.0f - t) + o.t[k] * t;
+                }
             }
+            /* after a restart: the offset of the average, given back over LEG_FADE
+             * ticks (alpha 0 of the first tick = the image shown just before; with
+             * one tick, alpha 1 = the game's pose at tick N) */
+            if (r->fade) leg_fade(r, b, ((float)r->fade - t) / (float)LEG_FADE_N, &o);
             /* W = L * R (rotation rows, then translation) */
             q2m(o.q, m);
             for (j = 0; j < 3; j++)
@@ -1414,6 +1563,7 @@ static void trace_render(uint32_t race, double t0, double t1, const float *cam, 
             I.ts - s_t0_run);
     trace_flush();
 }
+
 
 /* ── render gate (XBOX_RENDER_GATE, d3d8_sync.h; off by default) ─────
  * Before a render starts (its content is frozen there: interp_begin reads
@@ -1919,6 +2069,9 @@ static void hook_AD4A0(void)
             vs_read(&I.cur);
             memcpy(&I.prev, &I.pre, sizeof I.prev);
             I.ok = 1;
+            cam_cut_update();
+        } else {
+            cam_cut_reset();
         }
         /* Old clock: tick start = return of the frame wait if this tick
          * follows it by less than a tick, else now. A tick consumed late

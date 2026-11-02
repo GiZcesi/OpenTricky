@@ -44,6 +44,10 @@ typedef struct {
     const uint8_t     *mem_lo, *mem_hi;
     const float      (*attr_const)[4];  /* values of attributes with no array */
     const float      (*vconst)[4];      /* the 192 program constants */
+    uint32_t           vgen;            /* their generation (+1 at each change of value) */
+    /* One bit per constant whose value changed since the GPU path last
+     * took them (d3d8_nv2a_draw_program_gpu reads and clears it); NULL = unknown. */
+    uint32_t          *vdirty;
     float              screen_w, screen_h, clip_max;
     int                fog_mode;        /* 0 off, 1 linear, 2 linear abs, 3 exp, 4 exp abs, 5 exp2 */
     float              fog_p0, fog_p1;

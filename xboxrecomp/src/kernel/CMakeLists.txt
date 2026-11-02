@@ -40,7 +40,7 @@ if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     # synchronization: WaitOnAddress / WakeByAddressAll (xbox_memory_layout.c).
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt ws2_32 psapi synchronization xbox_nv2a)
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt psapi synchronization xbox_nv2a)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)

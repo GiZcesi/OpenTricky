@@ -46,6 +46,7 @@ UINT                 d3d8_GetBackbufferHeight(void);
 /* Current render state array accessor */
 const DWORD         *d3d8_GetRenderStates(void);
 const DWORD         *d3d8_GetTSS(DWORD stage);
+void                *d3d8_CurTexture(int stage);   /* the texture SetTexture last bound (XBOX_PERF) */
 
 /* Transform accessors */
 const D3DMATRIX     *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type);
@@ -176,6 +177,12 @@ void    d3d8_states_apply(void);
 
 /* Create sampler state from TSS and apply to slot */
 void    d3d8_states_apply_sampler(DWORD stage);
+
+/* D3d8_states_apply for a draw that binds its own rasteriser state
+ * right after (nv_set_raster, d3d8_nv2a.c): with XBOX_FIX_PUMP_SOBJ (default
+ * 1) the D3D8 one is not bound first, and the state objects come from tables
+ * keyed by their whole description; otherwise exactly d3d8_states_apply. */
+void    d3d8_states_apply_nv2a(void);
 
 #endif /* _WIN32 -- end of D3D11 backend section */
 

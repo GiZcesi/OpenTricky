@@ -4,6 +4,7 @@
 #define COBJMACROS
 #include "d3d8_sync.h"
 #include "../kernel/xbox_logstats.h"
+void sc_ForgetAll(void);                /* d3d8_statecache.c */
 #include <dxgi1_3.h>
 #include <dxgi1_5.h>
 #include <math.h>
@@ -18,6 +19,7 @@ static int    s_latency = 2;
 static int    s_legacy_vsync;           /* XBOX_VSYNC=1 (legacy) */
 static UINT   s_flags;                  /* chain creation flags */
 static HANDLE s_wait;                   /* latency object (flip model) */
+static void (*s_before_present)(void);  /* O-B: see d3d8_sync_set_before_present */
 static HWND   s_hwnd;
 static volatile LONG s_hz;              /* refresh rate of the window's display */
 static volatile LONG s_pace_fps;        /* frame rate limit (0: none), see d3d8_sync_set_pace */
@@ -486,9 +488,12 @@ static void report_window(void)
 
 static void pacing_atexit(void) { d3d8_sync_report(); }
 
+static void gpu_fence_summary(void);
+
 void d3d8_sync_report(void)
 {
     static LONG done;
+    gpu_fence_summary();
     if (!M.on || InterlockedExchange(&done, 1)) return;
     report_global("summary");
     if (G.on)
@@ -711,6 +716,8 @@ static struct {
     double gpu_ms;
     double gd[128], mcur;           /* mode 3: GPU end - slot over the last 128 frames (~2 s), margin in use */
     int gn, gi;
+    double mwarm;                   /* a video frame's margin before the first full computation */
+    int warm_done;                  /* the first full computation made (the 128th frame; V is never reset) */
 } V;
 
 /* Mode 3 ("2b", XBOX_PRESENT_GRID=3[:min margin ms[:guard ms]], the
@@ -721,7 +728,7 @@ static struct {
  * the grid. Here the margin = p95 of (GPU end - slot) over the last
  * ~2 s + 0.5 ms, within [margin, 10] ms (margin: 3 by default): the frame
  * is finished before it is sent, and sent on the grid. */
-static double pgrid_margin3(double d)
+static double pgrid_margin3(double d, int video)
 {
     double tmp[128], p;
     int i, j, n;
@@ -734,7 +741,27 @@ static double pgrid_margin3(double d)
      * guard band's edge and back (3 / 5 refresh pairs). Recomputed
      * every 128 frames (~2 s): taken when higher, lowered only by more than
      * 1 ms. */
-    if (V.mcur > 0.0 && V.gi != 0) return V.mcur;
+    if (V.mcur > 0.0 && V.gi != 0) {
+        /* Until the first full computation (the 128th frame), the margin
+         * stays at its floor; a video frame then follows the GPU at once
+         * (the boot video's GPU slows down within its first seconds: at the
+         * floor, frames rode the deadline, 1/3 refresh pairs). The p95 of the
+         * samples so far + 0.5, raised only; game frames keep V.mcur. */
+        if (video && !V.warm_done) {
+            for (i = 0; i < n; i++) {
+                double x = V.gd[i];
+                for (j = i; j > 0 && tmp[j - 1] > x; j--) tmp[j] = tmp[j - 1];
+                tmp[j] = x;
+            }
+            p = tmp[(int)(0.95 * (n - 1))] + 0.5;
+            if (p < G.margin) p = G.margin;
+            if (p > 10.0) p = 10.0;
+            if (p > V.mwarm) V.mwarm = p;
+            return V.mwarm > V.mcur ? V.mwarm : V.mcur;
+        }
+        return V.mcur;
+    }
+    V.warm_done = 1;
     for (i = 0; i < n; i++) {                 /* insertion sort, 128 values at most */
         double x = V.gd[i];
         for (j = i; j > 0 && tmp[j - 1] > x; j--) tmp[j] = tmp[j - 1];
@@ -762,15 +789,33 @@ static double pgrid_margin3(double d)
  *    mean of the waits of every 8th frame, turned on from the start: a mean
  *    of the slept waits would grow with the sleeps' lateness (measured: 2.0
  *    against 0.9 ms) and push the grid's margin up.
- * Both stop at 25 ms, as before (never block a stalled frame for long). */
+ * Both stop at 25 ms, as before (never block a stalled frame for long).
+ *
+ * The fence's event resets itself only when a wait takes its signal. When the
+ * query is seen done before the fence's signal reaches the event (the event
+ * is set by the system, or by a thread of DXVK, a little after the GPU's
+ * end), that signal stays set after the frame, and the next frame's wait
+ * returned at once: its whole GPU time was turned on. The event is now
+ * emptied before it is armed, and a wake while the fence is not at the
+ * frame's value (an earlier frame's signal, come during the wait) waits
+ * again for the rest of the time. XBOX_FIX_FENCEWAIT=0: as before
+ * (comparison). Counted: the first such wake is logged, the totals every
+ * 10 s with XBOX_LOG_STATS=1 and once when the window closes. */
 static struct {
     int tried, ok, spin, test_sleep;
+    int fix;                        /* XBOX_FIX_FENCEWAIT, default 1 */
     ID3D11DeviceContext4 *ctx4;
     ID3D11Fence *fence;
     HANDLE ev;
     UINT64 value;
     double mean;                    /* running mean of the turned-on waits (ms), for the query's polling */
     unsigned n;                     /* frames waited with the query */
+    unsigned long long armed;       /* waits on the event */
+    unsigned long long old;         /* of them, ended by an earlier frame's signal (the fence not at this one) */
+    unsigned long long again;       /* waits made again after one (the fix) */
+    double old_ms;                  /* without the fix: time turned after such a wake */
+    double t_log;                   /* the last periodic line */
+    int said;                       /* the first such wake was logged */
 } F;
 
 static const IID k_iid_device5 = { 0x8ffde202, 0xa0e7, 0x45df, { 0x9e, 0x01, 0xe8, 0x37, 0x80, 0x1b, 0x5e, 0xa0 } };
@@ -780,9 +825,17 @@ static const IID k_iid_fence = { 0xaffde9d1, 0x1df7, 0x4bb7, { 0x8a, 0x34, 0x0f,
 static void gpu_fence_init(ID3D11Device *dev)
 {
     ID3D11Device5 *d5 = NULL;
+    {
+        const char *e = getenv("XBOX_FIX_FENCEWAIT");
+        F.fix = !(e && e[0] == '0');
+        if (!F.fix) fprintf(stderr, "D3D8: XBOX_FIX_FENCEWAIT=0: the fence's event as before (not emptied before a wait)\n");
+    }
     if (FAILED(ID3D11Device_QueryInterface(dev, &k_iid_device5, (void **)&d5)) || !d5) d5 = NULL;
+    /* No flags: (D3D11_FENCE_FLAG)0, not D3D11_FENCE_FLAG_NONE, which
+     * MinGW's headers define as 1 (Microsoft's as 0); DXVK logs that 1 as an
+     * unsupported flag. */
     if (d5 && SUCCEEDED(ID3D11DeviceContext_QueryInterface(V.ctx, &k_iid_context4, (void **)&F.ctx4)) && F.ctx4 &&
-        SUCCEEDED(ID3D11Device5_CreateFence(d5, 0, D3D11_FENCE_FLAG_NONE, &k_iid_fence, (void **)&F.fence)) && F.fence &&
+        SUCCEEDED(ID3D11Device5_CreateFence(d5, 0, (D3D11_FENCE_FLAG)0, &k_iid_fence, (void **)&F.fence)) && F.fence &&
         (F.ev = CreateEventW(NULL, FALSE, FALSE, NULL)) != NULL) {
         F.ok = 1;
     } else {
@@ -794,9 +847,49 @@ static void gpu_fence_init(ID3D11Device *dev)
                                                  : "event query, Sleep(1) polling (no D3D11 fence)");
 }
 
+static void gpu_fence_report(const char *when)
+{
+    fprintf(stderr, "D3D8: GPU wait (%s): %llu waits on the fence's event, %llu ended by an earlier frame's signal, "
+            "%llu waited on again, %.1f ms turned after one\n", when, F.armed, F.old, F.again, F.old_ms);
+}
+
+/* Once, when the window closes (d3d8_sync_report). */
+static void gpu_fence_summary(void)
+{
+    static LONG done;
+    if (F.armed && !InterlockedExchange(&done, 1)) gpu_fence_report("session");
+}
+
+/* The wait on the fence's event was ended by a signal while the fence is not
+ * at this frame's value: an earlier frame's. With the fix, waited on again
+ * until the value or the wait's limit (`lim` ms from t0), and 0 is returned;
+ * without it (as before), the time it was seen: the rest is turned on. */
+static double gpu_fence_old_signal(double t0, DWORD lim)
+{
+    double t = now_ms();
+    F.old++;
+    if (!F.said) {
+        F.said = 1;
+        fprintf(stderr, "D3D8: GPU wait: the fence's event was left set by an earlier frame (wait %llu): %s\n", F.armed,
+                F.fix ? "waited on again" : "the rest of the GPU time is turned on (XBOX_FIX_FENCEWAIT=0)");
+        xbox_log_flush();
+    }
+    if (!F.fix) return t;
+    for (;;) {
+        double left = (double)lim - (t - t0);
+        if (left < 1.0) break;
+        F.again++;
+        if (WaitForSingleObject(F.ev, (DWORD)left) != WAIT_OBJECT_0) break;
+        if (ID3D11Fence_GetCompletedValue(F.fence) >= F.value) break;
+        F.old++;
+        t = now_ms();
+    }
+    return 0.0;
+}
+
 static void pgrid_gpu_wait(IDXGISwapChain *sc)
 {
-    double t0, el;
+    double t0, el, t_old = 0.0, t_end;
     int armed = 0;
     if (!V.tried) {
         ID3D11Device *dev = NULL;
@@ -822,12 +915,16 @@ static void pgrid_gpu_wait(IDXGISwapChain *sc)
         ID3D11DeviceContext4_Signal(F.ctx4, F.fence, F.value);
         ID3D11DeviceContext_Flush(V.ctx);
         if (ID3D11Fence_GetCompletedValue(F.fence) < F.value) {
+            if (F.fix) ResetEvent(F.ev);        /* a signal left by the previous frame must not end this wait */
             if (FAILED(ID3D11Fence_SetEventOnCompletion(F.fence, F.value, F.ev))) {
                 F.ok = 0;                       /* not again: Sleep(1) polling from now on */
                 fprintf(stderr, "D3D8: GPU wait: SetEventOnCompletion failed, Sleep(1) polling from now on\n");
             } else {
+                DWORD lim = F.test_sleep ? 25u : (DWORD)(F.mean - 2.0);
                 armed = 1;
-                WaitForSingleObject(F.ev, F.test_sleep ? 25u : (DWORD)(F.mean - 2.0));
+                F.armed++;
+                if (WaitForSingleObject(F.ev, lim) == WAIT_OBJECT_0 && ID3D11Fence_GetCompletedValue(F.fence) < F.value)
+                    t_old = gpu_fence_old_signal(t0, lim);
             }
         }
         ID3D11DeviceContext_End(V.ctx, (ID3D11Asynchronous *)V.q);
@@ -844,10 +941,16 @@ static void pgrid_gpu_wait(IDXGISwapChain *sc)
         Sleep(0);
     }
     if (armed) WaitForSingleObject(F.ev, 0);       /* its signal, if the turn saw the end first */
-    el = now_ms() - t0;
+    t_end = now_ms();
+    el = t_end - t0;
     if (!(F.n++ & 7u)) F.mean = F.mean > 0.0 ? F.mean + (el - F.mean) / 4.0 : el;   /* every 8th: turned on */
     V.gpu_frames++;
     V.gpu_ms += el;
+    if (t_old > 0.0) F.old_ms += t_end - t_old;
+    if (armed && xbox_log_stats() && t_end - F.t_log >= 10000.0) {
+        if (F.t_log > 0.0) gpu_fence_report("total");
+        F.t_log = t_end;
+    }
 }
 
 /* Next vertical blank strictly after t (ms, QPC base), from the frame
@@ -942,7 +1045,19 @@ static void pgrid_init(void)
  * out. Only at the 60 fps limit, VSync (or Adaptive without tearing), on a
  * display at 59-61 Hz with a fixed refresh in the frame statistics; anywhere
  * else (VRR, no statistics: Deck / DXVK without them, a window behind) the
- * previous presentation is kept (2-frame queue), and one log line says so. */
+ * previous presentation is kept (2-frame queue), and one log line says so.
+ * A frame of the title's video player (d3d8_sync_video_frame) is
+ * not one of those 60 Hz frames. The player presents once per frame of its
+ * file, at 29.97 fps: every second refresh, and in a burst of 3 to 6 frames
+ * when a video starts. The console shows each one from the first
+ * vertical blank after its flip (PresentationInterval ONE): two refreshes a
+ * frame, every frame shown. So a video frame is planned like any other and
+ * shown on the first refresh it makes, and the two rules below that assume
+ * one frame per refresh leave it alone: it is never left out (on an occupied
+ * refresh it takes the next one), and it is never moved back to the refresh
+ * right after the previous frame (that cut the previous frame to one refresh:
+ * pairs of 1 and 3 refreshes instead of 2 and 2). The game's
+ * frames take exactly the path above. */
 #define S60_LEAD    1.5     /* ms before its refresh a Present must be made (GPU done) to be shown on it */
 #define S60_HYST    1.0     /* ms: how early a frame must be for an occupied refresh to be left out (see s60_wait) */
 static struct {
@@ -951,6 +1066,7 @@ static struct {
     double t_log;
     const char *why;        /* last reason it stood aside */
     unsigned long long frames, drops, late, recover, held, kept;
+    unsigned long long vframes, vnext;  /* video frames; of them, taken a refresh after an occupied one */
 } S6;
 #define S60_RING    16
 static struct { UINT pc; double s; } S6R[S60_RING];     /* refresh planned for each Present (by its PresentCount) */
@@ -993,12 +1109,14 @@ static int s60_check(IDXGISwapChain *sc, double t, UINT sync)
 }
 
 /* 60 Hz display path (see above): 1 = present now (planned refresh in
- * S6.s_prev), 0 = leave this frame out. */
-static int s60_wait(IDXGISwapChain *sc, double t)
+ * S6.s_prev), 0 = leave this frame out. video: a frame of the title's video
+ * player, never left out. */
+static int s60_wait(IDXGISwapChain *sc, double t, int video)
 {
     double k, slot, margin, plan, s, per, hold;
     DXGI_FRAME_STATISTICS fs;
     S6.frames++;
+    if (video) S6.vframes++;
     pgrid_gpu_wait(sc);
     per = V.vper;
     /* the present grid's slot (as pgrid_wait), its margin from the GPU end */
@@ -1013,7 +1131,7 @@ static int s60_wait(IDXGISwapChain *sc, double t)
         G.last_slot = slot;
     }
     t = now_ms();
-    margin = pgrid_margin3(t - slot);
+    margin = pgrid_margin3(t - slot, video);
     plan = slot + margin;
     if (plan - t > margin + 0.5 * PGRID_PERIOD) plan = t;        /* never planned more than ~half a frame + margin ahead */
     s = pgrid_next_blank(sc, plan + S60_LEAD);                   /* the refresh it is planned on */
@@ -1045,17 +1163,24 @@ static int s60_wait(IDXGISwapChain *sc, double t)
      * 0.008 ms per frame: without this margin the plan crossed the refresh
      * back and forth near the meeting point, 8-14 frames left out a minute
      * (with as many shown twice) instead of one per beat (measured).
-     * After a frame left out the next one starts S60_HYST clear of it. */
+     * After a frame left out the next one starts S60_HYST clear of it.
+     * A video frame is never left out: the player shows every frame
+     * of its file; on an occupied refresh it takes the next one, as on the
+     * console the flip after a pending one waits for the following blank. */
     if (S6.s_prev > 0.0 && s < S6.s_prev + 0.5 * per && S6.s_prev - t < 3.0 * per) {
-        if (plan + S60_LEAD + S60_HYST <= S6.s_prev) { S6.drops++; return 0; }
+        if (!video && plan + S60_LEAD + S60_HYST <= S6.s_prev) { S6.drops++; return 0; }
         s = S6.s_prev + per;
         S6.kept++;
+        if (video) S6.vnext++;
     }
     t = now_ms();
     /* The other side: a plan moved past the refresh after the previous one
      * (a margin step) while the frame is ready for it keeps the cadence (no
-     * refresh left without a new frame). */
-    if (S6.s_prev > 0.0 && s > S6.s_prev + 1.5 * per && S6.s_prev - t < 3.0 * per && t + S60_LEAD <= S6.s_prev + per) {
+     * refresh left without a new frame). One frame a refresh is the game's
+     * cadence, not a video's: a video frame planned two refreshes
+     * after the previous one is on its own pace and keeps its refresh. */
+    if (!video && S6.s_prev > 0.0 && s > S6.s_prev + 1.5 * per && S6.s_prev - t < 3.0 * per
+        && t + S60_LEAD <= S6.s_prev + per) {
         s = S6.s_prev + per;
         S6.kept++;
     }
@@ -1079,8 +1204,9 @@ static int s60_wait(IDXGISwapChain *sc, double t)
     if (t - S6.t_log >= 10000.0) {
         if (S6.t_log > 0.0 && xbox_log_stats())
             fprintf(stderr, "D3D8: 60 Hz display: %llu frames, %llu left out (two on one refresh), %llu late (a refresh later), "
-                    "%llu shown off plan by the statistics, refresh %.4f ms, margin now %.2f ms\n",
-                    S6.frames, S6.drops, S6.late, S6.recover, per, V.mcur);
+                    "%llu shown off plan by the statistics, refresh %.4f ms, margin now %.2f ms; "
+                    "%llu video frames, none left out, %llu on the refresh after an occupied one\n",
+                    S6.frames, S6.drops, S6.late, S6.recover, per, V.mcur, S6.vframes, S6.vnext);
         S6.t_log = t;
     }
     return 1;
@@ -1124,7 +1250,7 @@ static void pgrid_wait(IDXGISwapChain *sc, double t)
     G.anchor += 0.02 * (t - slot);
     G.last_slot = slot;
     t = now_ms();                                               /* modes 2, 3: after the GPU wait */
-    margin = G.on == 3 ? pgrid_margin3(t - slot) : G.margin;
+    margin = G.on == 3 ? pgrid_margin3(t - slot, 0) : G.margin;
     target = slot + margin;
     if (t >= target) G.late++;
     else if (target - t > margin + 0.5 * PGRID_PERIOD) target = t;   /* never hold more than ~half a frame + margin */
@@ -1230,13 +1356,30 @@ static void presentation_mode_note(IDXGISwapChain *sc, double t)
     }
 }
 
+/* Presenting thread: the next present carries a video frame; the
+ * last one was left out. */
+static int s_video_next, s_left_out;
+
+void d3d8_sync_video_frame(int on)
+{
+    s_video_next = on;
+}
+
+int d3d8_sync_left_out(void)
+{
+    return s_left_out;
+}
+
 HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
 {
     static double last_arrive, arrive_avg;
     double t0, t1, t2, wait_ms = 0.0;
     UINT sync, flags = 0;
     HRESULT hr;
+    int video = s_video_next;
 
+    s_video_next = 0;
+    s_left_out = 0;
     t0 = now_ms();
     /* The sync interval first (it depends on the arrival only, t0): the 60 Hz
      * display path applies to VSync'ed frames only. */
@@ -1257,11 +1400,14 @@ HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
         /* Arrival interval of this frame, at Present, without our wait. */
         double d = last_arrive > 0 ? t0 - last_arrive : period;
         if (arrive_avg <= 0) arrive_avg = period;
-        if (d >= ADAPTIVE_GAP_MS) {
+        if (d >= ADAPTIVE_GAP_MS || video) {
             /* A load or a stall is not a pace: VSync for this frame, and the
              * average starts again from the target, so that the uneven
              * frames right after it (race start after the tips screen) are
-             * not taken for a slow game. */
+             * not taken for a slow game. Nor is a video: its frames
+             * come at the file's rate, each one on time; VSync, as the
+             * console shows them (late against the game's 60 fps, they all
+             * went out at once and could tear). */
             arrive_avg = period;
             InterlockedExchange(&s_adaptive_tears, 0);
             sync = 1;
@@ -1289,7 +1435,8 @@ HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
     if (s60_check(sc, t0, sync)) {
         /* 60 Hz display: planned on its refresh first; a frame left out
          * is never presented (and takes nothing from the latency object) */
-        if (!s60_wait(sc, now_ms())) {
+        if (!s60_wait(sc, now_ms(), video)) {
+            s_left_out = 1;
             if (dxgi_ms) *dxgi_ms = 0.0;
             return S_OK;
         }
@@ -1302,9 +1449,11 @@ HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
         }
         pgrid_wait(sc, now_ms());
     }
+    if (s_before_present) s_before_present();   /* the reports done during the waits (O-B) */
     t1 = now_ms();
     wait_ms = t1 - t0;
     hr = IDXGISwapChain_Present(sc, sync, flags);
+    sc_ForgetAll();                     /* the runtime, and any overlay hooked on Present, may change bindings there */
     if (S6.on && S6.s_prev > 0.0) {                         /* the refresh planned for this Present */
         UINT lpc = 0;
         if (SUCCEEDED(IDXGISwapChain_GetLastPresentCount(sc, &lpc)) && lpc) {
@@ -1322,6 +1471,8 @@ HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
     presentation_mode_note(sc, t2);
     return hr;
 }
+
+void d3d8_sync_set_before_present(void (*fn)(void)) { s_before_present = fn; }
 
 void d3d8_sync_release(void)
 {

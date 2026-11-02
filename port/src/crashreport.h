@@ -81,9 +81,9 @@ void crashreport_crash_dialog(DWORD code, const wchar_t *dir);
 /* Opens a report folder in Explorer. */
 void crashreport_open_folder(const wchar_t *dir);
 
-/* The game thread waits on purpose (for instance for other players at a start): nothing new on screen for
+/* The game thread waits on purpose (for instance in an optional module at a start): nothing new on screen for
  * that long is not a freeze. The watchdog counts nothing for the next ms milliseconds (bounded: it goes on by
- * itself past them); 0 = the wait is over, the count starts again from now. Any thread. Unused offline. */
+ * itself past them); 0 = the wait is over, the count starts again from now. Any thread. Unused by the game itself. */
 void crashreport_hold(unsigned ms);
 
 #endif

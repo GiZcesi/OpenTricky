@@ -108,6 +108,48 @@ bool is_dir(const std::string &p)
     DWORD a = GetFileAttributesW(W(p).c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
+/* A junction or a symbolic link (to a folder or a file), `a` its attributes.
+ * The helpers below never go through one: removed, only the link goes, never
+ * what it points to; it is never copied. Other reparse points (OneDrive's
+ * files on demand, deduplicated files) are plain files and folders here. */
+bool is_link(const std::string &p, DWORD a)
+{
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(W(p).c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return true;         /* cannot tell: never gone through */
+    FindClose(h);
+    return fd.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT || fd.dwReserved0 == IO_REPARSE_TAG_SYMLINK;
+}
+/* What `p` is: 0 nothing, 1 a file, 2 a folder, 3 a junction or a link. */
+int kind_of(const std::string &p)
+{
+    DWORD a = GetFileAttributesW(W(p).c_str());
+    if (a == INVALID_FILE_ATTRIBUTES) return 0;
+    if (is_link(p, a)) return 3;
+    return (a & FILE_ATTRIBUTE_DIRECTORY) ? 2 : 1;
+}
+/* The size of a file (kind 1), -1 for anything else. */
+long long file_size(const std::string &p)
+{
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(W(p).c_str(), GetFileExInfoStandard, &d) || (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+        is_link(p, d.dwFileAttributes))
+        return -1;
+    return (long long)d.nFileSizeHigh << 32 | d.nFileSizeLow;
+}
+/* `p` (a file, or a folder: `folder`; never gone through) could be removed
+ * now: the right to (DELETE, or the right to remove what is in its folder:
+ * the system weighs both) and no one holding it open without sharing its
+ * removal. Opened for that only: nothing of it is read. */
+bool deletable(const std::string &p, bool folder)
+{
+    HANDLE h = CreateFileW(W(p).c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT | (folder ? FILE_FLAG_BACKUP_SEMANTICS : 0), nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
 bool mkdirs(const std::string &p)
 {
     if (p.empty() || is_dir(p)) return true;
@@ -129,8 +171,11 @@ std::vector<std::string> list_dir(const std::string &dir)
 }
 bool remove_any(const std::string &p)
 {
-    if (!exists(p)) return true;
-    if (!is_dir(p)) {
+    DWORD a = GetFileAttributesW(W(p).c_str());
+    if (a == INVALID_FILE_ATTRIBUTES) return true;
+    if (is_link(p, a))                                  /* the link alone */
+        return (a & FILE_ATTRIBUTE_DIRECTORY) ? RemoveDirectoryW(W(p).c_str()) != 0 : DeleteFileW(W(p).c_str()) != 0;
+    if (!(a & FILE_ATTRIBUTE_DIRECTORY)) {
         SetFileAttributesW(W(p).c_str(), FILE_ATTRIBUTE_NORMAL);
         return DeleteFileW(W(p).c_str()) != 0;
     }
@@ -140,7 +185,9 @@ bool remove_any(const std::string &p)
 }
 bool copy_any(const std::string &src, const std::string &dst)
 {
-    if (!is_dir(src)) return CopyFileW(W(src).c_str(), W(dst).c_str(), FALSE) != 0;
+    DWORD a = GetFileAttributesW(W(src).c_str());
+    if (is_link(src, a)) return false;
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return CopyFileW(W(src).c_str(), W(dst).c_str(), FALSE) != 0;
     bool ok = mkdirs(dst);
     for (const std::string &n : list_dir(src)) ok = copy_any(src + "\\" + n, dst + "\\" + n) && ok;
     return ok;
@@ -159,7 +206,9 @@ void flush_file(const std::string &p)
 }
 void flush_tree(const std::string &p)
 {
-    if (!is_dir(p)) { flush_file(p); return; }
+    DWORD a = GetFileAttributesW(W(p).c_str());
+    if (is_link(p, a)) return;
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) { flush_file(p); return; }
     for (const std::string &n : list_dir(p)) flush_tree(p + "\\" + n);
 }
 /* A small text file written whole or not at all, on the disk when this returns. */
@@ -178,6 +227,9 @@ bool write_durable(const std::string &path, const std::string &text)
 #else
 bool exists(const std::string &p) { return SDL_GetPathInfo(p.c_str(), nullptr); }
 bool is_dir(const std::string &p) { SDL_PathInfo i; return SDL_GetPathInfo(p.c_str(), &i) && i.type == SDL_PATHTYPE_DIRECTORY; }
+int kind_of(const std::string &p) { return !exists(p) ? 0 : is_dir(p) ? 2 : 1; }
+long long file_size(const std::string &) { return -1; }
+bool deletable(const std::string &, bool) { return false; }
 bool mkdirs(const std::string &p) { return SDL_CreateDirectory(p.c_str()); }
 std::vector<std::string> list_dir(const std::string &) { return {}; }
 bool remove_any(const std::string &) { return false; }
@@ -203,16 +255,135 @@ bool ends_with(const std::string &s, const char *e)
 const char k_launcher[] = "OpenTricky.exe";
 const char k_game[] = "SSX Tricky.exe";
 const char k_bin[] = "bin";
-/* What an install of 0.1.1 or older had beside OpenTricky.exe and is now in
- * bin\: the release zip still has copies of them there for the updaters of
- * those versions (they refuse a zip without them). Once bin\ holds the game
- * they are removed (ot_install_tidy_root, or the update itself). */
+/* What an install of 0.1.1 had beside OpenTricky.exe and is now in bin\.
+ * The release zips have had no copies of them there since 0.1.2 (the updater
+ * of 0.1.1 cannot install a newer version); a zip that has them does not get
+ * them installed. A new version unzipped over 0.1.1 leaves them: once bin\
+ * holds the game, the files that are exactly 0.1.1's go (k_files_011,
+ * ot_install_tidy_root, or the update itself); anything else of those names
+ * is the player's and stays. */
 const char *const k_program_copies[] = { "SSX Tricky.exe", "ui", "THIRD-PARTY-LICENSES.txt" };
+
+/* Those copies as the published 0.1.1 zip has them: each file's path, size
+ * and SHA-256, then their folders, deepest first. */
+struct ShippedFile {
+    const char *path;
+    long long size;
+    const char *sha256;
+};
+#include "ot_install_011.inc"
 
 /* The game in `dir`: SSX Tricky.exe and ui\. */
 bool has_game(const std::string &dir)
 {
     return exists(dir + "\\" + k_game) && !is_dir(dir + "\\" + k_game) && is_dir(dir + "\\ui");
+}
+
+/* `rel`, below the program's folder `base`, against the file 0.1.1 had
+ * there: 1 the same bytes, 0 another file, -1 cannot tell now -- of 0.1.1's
+ * name and size, but it could not be removed anyway (in use, or protected),
+ * so it is not read: a copy that cannot go costs nothing at each start (the
+ * game is 165 MB). */
+int shipped_011(const std::string &base, const std::string &rel)
+{
+    const long long size = file_size(base + rel);
+    for (const ShippedFile &f : k_files_011)
+        if (f.size == size && lower(rel) == lower(f.path))
+            return !deletable(base + rel, false) ? -1 : ot_sha256_file(base + rel) == f.sha256 ? 1 : 0;
+    return 0;
+}
+
+bool shipped_dir_011(const std::string &rel)
+{
+    for (const char *d : k_dirs_011)
+        if (lower(rel) == lower(d)) return true;
+    return false;
+}
+
+/* The two pages that make a copy of ui\ 0.1.1's (copy_011): looked at
+ * first, removed last (remove_011). */
+const char *const k_pages_011[] = { "home.rml", "launcher.rcss" };
+
+/* `rel` is one of those pages, directly in a copy ("ui\home.rml"). */
+bool page_011(const std::string &rel)
+{
+    const size_t s = rel.find('\\');
+    if (s == std::string::npos || rel.find('\\', s + 1) != std::string::npos) return false;
+    for (const char *p : k_pages_011)
+        if (lower(rel.substr(s + 1)) == p) return true;
+    return false;
+}
+
+/* `rel` and every folder above it, below `base`, are folders: none is a
+ * junction or a link. */
+bool real_dir(const std::string &base, const std::string &rel)
+{
+    bool real = kind_of(base + rel) == 2;
+    for (size_t s = rel.find('\\'); real && s != std::string::npos; s = rel.find('\\', s + 1))
+        real = kind_of(base + rel.substr(0, s)) == 2;
+    return real;
+}
+
+/* A copy of the program beside OpenTricky.exe (`rel`, one of
+ * k_program_copies, then what is inside it): its files that are 0.1.1's
+ * (`ours`), how many other entries it holds (`others`: the player's files
+ * and folders, junctions and links, never gone through), and how many of
+ * its entries cannot be removed now (`stuck`: files left unread, folders in
+ * use). A copy of ui\ is looked into only when its two pages are 0.1.1's:
+ * otherwise nothing in it is the program's. */
+void copy_011(const std::string &base, const std::string &rel, std::vector<std::string> &ours, int &others, int &stuck)
+{
+    const int k = kind_of(base + rel);
+    if (k == 0) return;
+    if (k == 1) {
+        const int s = shipped_011(base, rel);
+        if (s > 0) ours.push_back(rel);
+        else if (s < 0) stuck++;
+        else others++;
+        return;
+    }
+    if (k != 2 || !shipped_dir_011(rel)) {
+        others++;
+        return;
+    }
+    if (rel.find('\\') == std::string::npos) {
+        const int p0 = shipped_011(base, rel + "\\" + k_pages_011[0]), p1 = shipped_011(base, rel + "\\" + k_pages_011[1]);
+        if (p0 < 0 || p1 < 0) { stuck++; return; }
+        if (!p0 || !p1) { others++; return; }
+    }
+    if (!deletable(base + rel, true)) stuck++;          /* in use: what is in it may go, not the folder */
+    for (const std::string &n : list_dir(base + rel)) copy_011(base, rel + "\\" + n, ours, others, stuck);
+}
+
+/* Removes what copy_011 found to be the program's in the copy `name`: its
+ * files, then its folders left empty, deepest first (each a folder, as are
+ * all those above it: never one seen through a junction), and only then the
+ * two pages of ui\ and ui\ itself, once nothing else of 0.1.1's is left in
+ * it (`stuck`: copy_011's). The pages are what makes a start look into ui\:
+ * a pass that a file or a folder in use cut short is taken up again at the
+ * next start. False when something of 0.1.1's stays. */
+bool remove_011(const std::string &base, const std::string &name, const std::vector<std::string> &ours, int stuck)
+{
+    bool ok = true;
+    std::vector<std::string> pages;
+    for (const std::string &r : ours)
+        if (page_011(r)) pages.push_back(r);
+        else ok = remove_any(base + r) && ok;
+#ifdef _WIN32
+    const std::string below = lower(name) + "\\";
+    for (const char *d : k_dirs_011) {
+        const std::string rel = d;
+        if (lower(rel).compare(0, below.size(), below) != 0 || !real_dir(base, rel)) continue;
+        /* Only when empty: one with the player's files stays; one left empty is in use. */
+        if (!RemoveDirectoryW(W(base + rel).c_str()) && list_dir(base + rel).empty()) ok = false;
+    }
+#endif
+    if (!ok || stuck) return false;
+    for (const std::string &r : pages) ok = remove_any(base + r) && ok;
+#ifdef _WIN32
+    if (shipped_dir_011(name) && real_dir(base, name)) RemoveDirectoryW(W(base + name).c_str());   /* only when empty */
+#endif
+    return ok;
 }
 
 /* What an update never writes, removes or backs up: the player's things and the updater's own. */
@@ -406,7 +577,9 @@ bool apply_ops(const std::string &base, const std::vector<Op> &ops, const std::s
         else if (!had[i] && !gone) back = false;
     }
 #ifdef _WIN32
-    RemoveDirectoryW(W(base + k_bin).c_str());     /* only when empty: a bin\ this attempt made */
+    /* Only when empty: a bin\ this attempt made. Never a junction or a link,
+     * which RemoveDirectoryW removes whatever it points to holds. */
+    if (kind_of(base + k_bin) == 2) RemoveDirectoryW(W(base + k_bin).c_str());
 #endif
     if (back) journal_remove(base);
     else detail += "; not all of it could be put back (next start)";
@@ -415,9 +588,11 @@ bool apply_ops(const std::string &base, const std::vector<Op> &ops, const std::s
 
 /* What an update does with the unpacked zip. Its game is in bin\ (0.1.2 and
  * later) or beside OpenTricky.exe (older). With the game in bin\:
- *  - its copies of bin\'s entries beside it are not installed (they are for
- *    the updaters of 0.1.1), and the old copies in the program's folder are
- *    removed by the update itself (backed up: Restore puts them back);
+ *  - copies of bin\'s entries beside it are not installed, and the old copies
+ *    in the program's folder are removed by the update itself (backed up:
+ *    Restore puts them back) when they are 0.1.1's through and through
+ *    (copy_011); anything else of those names is the player's, and one that
+ *    cannot be removed now is left to the tidy of a next start;
  *  - bin\, when the program's folder has one, is updated one entry at a time. */
 std::vector<Op> stage_ops(const std::string &stage, const std::string &base)
 {
@@ -446,12 +621,15 @@ std::vector<Op> stage_ops(const std::string &stage, const std::string &base)
         ops.push_back(op);
     }
     if (game_in_bin)
-        for (const char *c : k_program_copies)
-            if (exists(base + c)) {
-                Op op;
-                op.name = c;                   /* src "": removed */
-                ops.push_back(op);
-            }
+        for (const char *c : k_program_copies) {
+            std::vector<std::string> ours;
+            int others = 0, stuck = 0;
+            copy_011(base, c, ours, others, stuck);
+            if (ours.empty() || others || stuck) continue;
+            Op op;
+            op.name = c;                       /* src "": removed */
+            ops.push_back(op);
+        }
     /* The launcher last: the rest is in place before it changes. */
     std::stable_partition(ops.begin(), ops.end(), [](const Op &o) { return lower(o.name) != lower(k_launcher); });
     return ops;
@@ -632,14 +810,32 @@ bool ot_install_has_backup(const std::string &base, std::string &version)
     return true;
 }
 
-void ot_install_tidy_root(const std::string &base, std::vector<std::string> &removed, std::vector<std::string> &failed)
+void ot_install_tidy_root(const std::string &base, std::vector<std::string> &removed, std::vector<std::string> &kept,
+                          std::vector<std::string> &failed)
 {
     if (!has_game(base + k_bin)) return;               /* the game is not in bin\: nothing to tidy */
     for (const char *c : k_program_copies) {
-        if (!exists(base + c)) continue;
-        if (remove_any(base + c)) removed.push_back(c);
-        else failed.push_back(c);
+        std::vector<std::string> ours;
+        int others = 0, stuck = 0;
+        copy_011(base, c, ours, others, stuck);
+        if (ours.empty()) {
+            if (stuck) failed.push_back(c);                 /* cannot tell now: the next start looks again */
+            else if (others) kept.push_back(std::string(c) + ": not the old OpenTricky's");
+            continue;
+        }
+        if (!remove_011(base, c, ours, stuck)) failed.push_back(c);
+        else if (others) kept.push_back(std::string(c) + ": " + std::to_string(others) + (others == 1 ? " entry in it is" : " entries in it are") +
+                                        " not the old OpenTricky's (" + std::to_string(ours.size()) + " of its files removed)");
+        else if (kind_of(base + c) != 0) failed.push_back(c);
+        else removed.push_back(c);
     }
+}
+
+std::vector<std::string> ot_install_plan(const std::string &stage, const std::string &base)
+{
+    std::vector<std::string> out;
+    for (const Op &op : stage_ops(stage, base)) out.push_back((op.src.empty() ? "- " : "+ ") + op.name);
+    return out;
 }
 
 OtRecovery ot_install_recover(const std::string &base)
@@ -723,7 +919,8 @@ OtRecovery ot_install_recover(const std::string &base)
             }
         }
 #ifdef _WIN32
-        RemoveDirectoryW(W(base + k_bin).c_str());     /* only when empty: a bin\ the cut install made */
+        /* Only when empty: a bin\ the cut install made; never a junction or a link (apply_ops). */
+        if (kind_of(base + k_bin) == 2) RemoveDirectoryW(W(base + k_bin).c_str());
 #endif
     }
     r.finished = finish;

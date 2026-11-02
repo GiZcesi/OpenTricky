@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_timeout.h"
 
 /* ============================================================================
  * Thread Start Wrapper
@@ -151,7 +152,9 @@ NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
  *   - Positive values = absolute time (rare)
  *   - Zero = yield
  *
- * Maps to: SleepEx (for alertable waits) or Sleep
+ * Maps to: SleepEx (for alertable waits) or Sleep, one call per slice of the
+ * delay (kernel_timeout.h): XAPI's Sleep(INFINITE) arrives here as the longest
+ * relative interval, 0x8000000000000000.
  * ============================================================================ */
 
 NTSTATUS __stdcall xbox_KeDelayExecutionThread(
@@ -159,7 +162,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     BOOLEAN Alertable,
     PLARGE_INTEGER Interval)
 {
-    DWORD ms;
+    uint64_t ms;
 
     (void)WaitMode;
 
@@ -174,15 +177,14 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
 
     if (Interval->QuadPart < 0) {
         /* Negative = relative time in 100ns units. Convert to milliseconds. */
-        LONGLONG relative_100ns = -Interval->QuadPart;
-        ms = (DWORD)(relative_100ns / 10000);
+        ms = nt_relative_100ns(Interval->QuadPart) / 10000;
         /* A sub-millisecond wait yields rather than sleeping a whole
          * millisecond. Rounding up overshoots by up to 10x, and the title uses
          * these as short spin-waits: the intro video's playback loop issues
          * roughly 120 of them per frame, so the rounding alone cost ~120 ms a
          * frame and was most of why playback ran at 1.5 fps. Yielding is the
          * same thing the zero-interval case above already does. */
-        if (ms == 0 && relative_100ns > 0) {
+        if (ms == 0) {
             SwitchToThread();
             return STATUS_SUCCESS;
         }
@@ -193,16 +195,19 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         LONGLONG diff = Interval->QuadPart - now.QuadPart;
         if (diff <= 0)
             return STATUS_SUCCESS; /* Already past */
-        ms = (DWORD)(diff / 10000);
+        ms = (uint64_t)diff / 10000;
     }
 
-    if (Alertable) {
-        DWORD result = SleepEx(ms, TRUE);
-        if (result == WAIT_IO_COMPLETION)
-            return STATUS_ALERTED;
-    } else {
-        Sleep(ms);
-    }
+    do {
+        DWORD slice = nt_wait_slice_ms(&ms);
+        if (Alertable) {
+            DWORD result = SleepEx(slice, TRUE);
+            if (result == WAIT_IO_COMPLETION)
+                return STATUS_ALERTED;
+        } else {
+            Sleep(slice);
+        }
+    } while (ms);
 
     return STATUS_SUCCESS;
 }

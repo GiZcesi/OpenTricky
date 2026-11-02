@@ -57,6 +57,8 @@
  *   an axis samples it clamped on that axis, so that the filter no longer reads
  *   the far side of the texture at the patch's edge: 1 everywhere, 2 only
  *   where the neighbour does not continue the placement; 0 off.
+ *   XBOX_TERRAIN_SEAMS_MEMO=0 (comparison): the clamped axes are worked out at
+ *   every draw instead of being remembered per patch with its corners' bits.
  * XBOX_TERRAIN_SEAMS_LOG=1  counters on stderr.
  */
 #ifndef TERRAIN_SEAMS_H

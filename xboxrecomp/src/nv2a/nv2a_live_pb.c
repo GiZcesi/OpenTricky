@@ -52,12 +52,14 @@
 #include <stdlib.h>
 
 #include "nv2a_pgraph_d3d11.h"
+#include "nv2a_btnicons.h"
 #include "../d3d/d3d8_xbox.h"
 /* XBOX_TOTAL_RAM: the size of the guest window, which the translator needs
  * in order to bounds-check vertex stream offsets. Header-only use -- it
  * adds no link dependency from nv2a back onto the kernel library. */
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/xbox_logstats.h"
+#include "../kernel/xbox_perf.h"
 #define XBOX_GUEST_RAM_BYTES ((uint32_t)XBOX_TOTAL_RAM)
 
 /* Push-buffer command header encoding (same as nv2a_pb_replay.c). */
@@ -83,6 +85,9 @@
 /* Safety net only: fires when the title has genuinely stopped presenting, so
  * a stall cannot freeze the window. The frame boundary drives the real one. */
 #define PRESENT_FALLBACK_MS 500
+/* The same net during a video, whose frames come at ~33 ms: three
+ * frames' time without a present. */
+#define VIDEO_FALLBACK_MS   100.0
 
 static int      g_enabled       = -1;   /* -1 = not yet resolved */
 static int      g_ready         = 0;    /* device + translator live */
@@ -92,6 +97,7 @@ static uint32_t g_last_wp       = 0;
  * (count is 11 bits, so 2047 dwords). Anything further back is a reset. */
 #define WRAP_SLACK  0x2000u
 static uint32_t g_resets;
+static uint32_t g_late_wraps;   /* wraps seen before the limit moved */
 static int g_wp_wild;
 static uint32_t g_pb_end;
 static uint32_t g_pb_base       = 0;
@@ -205,6 +211,9 @@ static int live_pb_bring_up(void)
 
     pgraph_d3d11_init();
     fprintf(stderr, "[LIVE-PB] live push buffer connected to the D3D11 translator\n");
+    /* the button atlases composed ahead of use, off the pump, on the device
+     * just made (nv2a_btnicons.h) */
+    btnicons_prepare();
     return 1;
 }
 
@@ -270,8 +279,8 @@ void nv2a_live_pb_report(void)
 
     for (i = 0; i < 8; i++) top[i] = 0;
 
-    fprintf(stderr, "[LIVE-PB] dwords: %llu zero, %llu command, %llu unrecognised (of %llu); %u segment resets\n",
-            g_dw_zero, g_dw_cmd, g_dw_unknown, total, g_resets);
+    fprintf(stderr, "[LIVE-PB] dwords: %llu zero, %llu command, %llu unrecognised (of %llu); %u segment resets; %u wraps before their limit\n",
+            g_dw_zero, g_dw_cmd, g_dw_unknown, total, g_resets, g_late_wraps);
 
     for (i = 0; i < sizeof(watch) / sizeof(watch[0]); i++)
         fprintf(stderr, "[LIVE-PB]   %-28s 0x%04X  x%u\n",
@@ -301,6 +310,35 @@ void nv2a_live_pb_report(void)
     for (i = 0; i < 8 && g_method_hist[top[i]]; i++)
         fprintf(stderr, "[LIVE-PB]   0x%04X  x%u\n", top[i] << 2, g_method_hist[top[i]]);
     fflush(stderr);
+}
+
+/* XBOX_PERF, at exit: every method word of the run, by method, with
+ * the count per presented frame -- where the dispatcher's time goes. */
+static void hist_print(FILE *f)
+{
+    unsigned long long total = 0;
+    unsigned i, frames = pgraph_d3d11_frame_count();
+    for (i = 0; i < METHOD_HIST_SLOTS; i++) total += g_method_hist[i];
+    fprintf(f, "[PERF-METHODS] %llu method words over %u frames (%.0f per frame)\n",
+            total, frames, frames ? (double)total / frames : 0.0);
+    for (i = 0; i < METHOD_HIST_SLOTS; i++)
+        if (g_method_hist[i])
+            fprintf(f, "[PERF-METHODS]   0x%04X x%u (%.1f per frame)\n", i << 2, g_method_hist[i],
+                    frames ? (double)g_method_hist[i] / frames : 0.0);
+}
+
+void nv2a_live_pb_hist_dump(void) { hist_print(stderr); }
+
+/* XBOX_PERF_METHODS=<file>, with XBOX_PERF: the same, written over that
+ * file at every [PERF] window (2 s, pump thread, as the histogram) -- a test
+ * tool usually ends the game without an exit, so the report at exit never
+ * comes. Diagnostic only. */
+void nv2a_live_pb_hist_write(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    hist_print(f);
+    fclose(f);
 }
 
 /*
@@ -343,6 +381,14 @@ static uint32_t live_pb_tail_len(const uint32_t *data, uint32_t max, uint32_t *j
     return pos;
 }
 
+/* Whether a jump header (new style: address | 1; old style: 0x20000000 |
+ * address) goes to the ring's base -- the jump the title writes at a wrap. */
+static int live_pb_jump_to_base(uint32_t h)
+{
+    uint32_t to = ((h & 3u) == 1u) ? (h & ~3u) : (h & 0x1FFFFFFCu);
+    return (to & 0x0FFFFFFFu) == (g_pb_base & 0x0FFFFFFFu);
+}
+
 static void live_pb_parse(const uint32_t *data, uint32_t num_dwords)
 {
     uint32_t pos = 0;
@@ -377,7 +423,29 @@ static void live_pb_parse(const uint32_t *data, uint32_t num_dwords)
                     fflush(stderr);
                 }
             }
-            for (i = 0; i < count; i++) {
+            i = 0;
+            if (method == 0x1800 && g_perf_on) perf_count(PC_IDXW, 1);
+            /* A lone index word, or a run of transform constants, in
+             * one call (same values, counters and histogram). */
+            if (method == 0x1800 && count == 1 && pgraph_d3d11_index16_run((int)subchannel, &data[pos + 1], 1)) {
+                hist_note(method);
+                g_methods++;
+                i = 1;
+            } else {
+                /* Plain register arrays (transform constants and
+                 * program, stream offsets / formats, attribute constants)
+                 * in runs; a run stops at the end of its array, the next
+                 * array may take over, the rest goes word by word. */
+                for (;;) {
+                    uint32_t k, t = pgraph_d3d11_run((int)subchannel, method + i * 4, &data[pos + 1 + i], count - i);
+                    if (!t) break;
+                    for (k = 0; k < t; k++) hist_note(method + (i + k) * 4);
+                    g_methods += t;
+                    i += t;
+                    if (i >= count) break;
+                }
+            }
+            for (; i < count; i++) {
                 hist_note(method + i * 4);
                 if (!pgraph_d3d11_method((int)subchannel, method + i * 4, data[pos + 1 + i]))
                     note_unhandled(method + i * 4);
@@ -408,6 +476,13 @@ static void live_pb_parse(const uint32_t *data, uint32_t num_dwords)
                     fflush(stderr);
                 }
             }
+            if (method == 0x1800 && g_perf_on) perf_count(PC_IDXW, count);
+            /* A run of index words in one call (same indices, order,
+             * counters and histogram); word by word otherwise. */
+            if (method == 0x1800 && pgraph_d3d11_index16_run((int)subchannel, &data[pos + 1], count)) {
+                g_method_hist[0x1800 >> 2] += count;
+                g_methods += count;
+            } else
             for (i = 0; i < count; i++) {
                 hist_note(method);
                 if (!pgraph_d3d11_method((int)subchannel, method, data[pos + 1 + i]))
@@ -470,7 +545,18 @@ void nv2a_live_pb_tick(uint8_t *mem_base)
 
     wp    = *(volatile uint32_t *)(mem_base + ctx + CTX_WRITE_PTR_OFF);
     limit = *(volatile uint32_t *)(mem_base + ctx + CTX_LIMIT_OFF);
-    if (!wp || !limit || limit <= wp)
+    /* The write pointer may stand past the segment limit: the runtime checks
+     * the limit before a command (sub_0016B920 / sub_0016B940, a 0x200-byte
+     * margin), writes the whole command, and moves the limit later, in
+     * MakeSpace (0x16B680), after waiting for the GPU's read pointer that the
+     * pump thread publishes (xbox_memory_layout.c). Leaving such a batch for a
+     * later round while the pump went on to publish DMA_GET = the write
+     * pointer told the title that commands nobody had read were consumed; with
+     * its flow control working (fork pass fix_ringget.py) it then wrote over
+     * them a lap later and the pump read index data as methods. Once
+     * running, the batch is translated whatever the limit says; before that,
+     * a pointer past the limit still means "not set up yet". */
+    if (!wp || !limit || (!g_ready && limit <= wp))
         return;
 
     if (!g_ready) {
@@ -604,9 +690,45 @@ void nv2a_live_pb_tick(uint8_t *mem_base)
              * replayed the whole unwritten remainder of the segment as
              * commands. Everything below the new pointer has already been
              * parsed, so there is nothing to read here.
+             *
+             * Or a wrap whose limit has not moved yet. At a wrap
+             * MakeSpace (0x16B680) writes a jump to the base where it stopped,
+             * stores the base in the write pointer (0x16B70C), waits for the
+             * GPU's read pointer if the GPU is still in the way, and only then
+             * moves the limit (0x16B822). Once that wait works (fork pass
+             * fix_ringget.py), a round that starts during it, after a long batch
+             * that left the last pointer more than WRAP_SLACK before the jump,
+             * finds the write pointer at the base and the old limit: taken for a
+             * reset, the tail from the last pointer to the jump went untranslated
+             * (61 KB once in a two-player race at Draw distance Max) and the read
+             * pointer published next released the title. Every rewind this runtime
+             * makes writes that jump first (MakeSpace, sub_0016F220), so the
+             * commands from the last pointer lead to a jump to the base when
+             * it is a wrap; a reset finds that jump straight away (nothing
+             * left to read) or none.
              */
-            n = 0;
-            g_resets++;
+            uint32_t jump = 0, tail = 0;
+            if (g_pb_end > g_last_wp)
+                tail = live_pb_tail_len((const uint32_t *)(mem_base + g_last_wp),
+                                        (g_pb_end - g_last_wp) / 4, &jump);
+            if (jump && live_pb_jump_to_base(jump)) {
+                uint32_t head = (wp > g_pb_base) ? (wp - g_pb_base) / 4 : 0;
+                static int told_late = 0;
+                if (told_late < 8) {
+                    told_late++;
+                    fprintf(stderr, "[LIVE-PB] wrap before its limit moved, at 0x%08X: %u tail dwords "
+                                    "up to jump 0x%08X, %u head dwords (limit 0x%08X)\n",
+                            g_last_wp, tail, jump, head, g_pb_limit);
+                }
+                if (tail) live_pb_parse((const uint32_t *)(mem_base + g_last_wp), tail);
+                if (head) live_pb_parse((const uint32_t *)(mem_base + g_pb_base), head);
+                n = tail + head;
+                wrapped = 1;
+                g_late_wraps++;
+            } else {
+                n = 0;
+                g_resets++;
+            }
         }
         g_dwords_seen += n;
         g_last_wp = wp;
@@ -669,14 +791,19 @@ void nv2a_live_pb_tick(uint8_t *mem_base)
                     fflush(stderr);
                 }
             }
-        /* While the title is playing a video it stops issuing push-buffer
-         * flips and writes pixels straight into guest VRAM instead, so the
-         * only thing pacing the window is this fallback. At 500 ms that shows
-         * about 7 of the intro's 60 frames -- the video decodes at a correct
-         * ~30 fps (measured: 60 blits, mean interval 32.8 ms) and almost all of
-         * it was being thrown away before it reached the screen. Present at
-         * video rate while a guest framebuffer is registered. */
+        /* While the title plays a video it writes the pixels straight into
+         * guest VRAM, with no draws. Formerly the video's frames reached
+         * the window only through this fallback: at 500 ms it showed about 7
+         * of the intro's 60 frames, then a 16 ms timer (GetTickCount, 15.6 ms
+         * steps) gave 40 presents a second over a 29.97 fps video.
+         * each frame is presented once, at the title's own flip that follows
+         * it (nv2a_pgraph_d3d11.c, d3d8_GuestFramebufferFlip). Here, during a
+         * video: a frame whose present the GPU check put off, as soon as the
+         * GPU is past the previous one; and, only when no present came for
+         * VIDEO_FALLBACK_MS (performance counter), the frame shown last
+         * again. Outside videos the fallback is unchanged. */
         {
+            int video = d3d8_GuestFramebufferActive();
             unsigned fallback_ms = d3d8_HasGuestFramebuffer()
                                  ? 16u : (unsigned)PRESENT_FALLBACK_MS;
             /* While the title flips surfaces, presents happen at the flips
@@ -684,8 +811,10 @@ void nv2a_live_pb_tick(uint8_t *mem_base)
             /* A movie frame is presented only once the GPU is done
              * with the previous one, so this thread never blocks in the
              * driver and keeps acknowledging the title's fences. */
-            if (d3d8_MsSincePresent() >= fallback_ms && !pgraph_d3d11_flipping()
-                && (!d3d8_GuestFramebufferActive() || d3d8_VideoPresentReady())) {
+            if (video ? ((d3d8_VideoFramePending()
+                          || d3d8_MsSincePresentQpc() >= VIDEO_FALLBACK_MS)
+                         && d3d8_VideoPresentReady())
+                      : (d3d8_MsSincePresent() >= fallback_ms && !pgraph_d3d11_flipping())) {
             g_last_present = now;
             pgraph_d3d11_flush();
 

@@ -15,6 +15,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_timeout.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -25,21 +26,25 @@
  *   - Negative = relative (most common), in 100ns units
  *   - Positive = absolute FILETIME
  *   - NULL = infinite wait
+ *
+ * The whole wait, which can be longer than one Win32 wait: the waits below
+ * take it in slices (kernel_timeout.h). WAIT_MS_FOREVER stands for NULL.
  * ============================================================================ */
 
-static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
+#define WAIT_MS_FOREVER UINT64_MAX
+
+static uint64_t xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
 {
     if (!Timeout)
-        return INFINITE;
+        return WAIT_MS_FOREVER;
 
     if (Timeout->QuadPart == 0)
         return 0;
 
     if (Timeout->QuadPart < 0) {
         /* Relative: negative 100ns units */
-        LONGLONG relative_100ns = -Timeout->QuadPart;
-        DWORD ms = (DWORD)(relative_100ns / 10000);
-        if (ms == 0 && relative_100ns > 0)
+        uint64_t ms = nt_relative_100ns(Timeout->QuadPart) / 10000;
+        if (ms == 0)
             ms = 1;
         return ms;
     }
@@ -50,7 +55,35 @@ static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
     LONGLONG diff = Timeout->QuadPart - now.QuadPart;
     if (diff <= 0)
         return 0;
-    return (DWORD)(diff / 10000);
+    return (uint64_t)diff / 10000;
+}
+
+/* A wait of `ms` (xbox_nt_timeout_to_ms) as Win32 waits: a single one when
+ * it fits, otherwise the next slice each time one times out. */
+static DWORD xbox_wait_single(HANDLE Handle, uint64_t ms, BOOLEAN Alertable)
+{
+    DWORD result;
+
+    if (ms == WAIT_MS_FOREVER)
+        return WaitForSingleObjectEx(Handle, INFINITE, Alertable);
+    do
+        result = WaitForSingleObjectEx(Handle, nt_wait_slice_ms(&ms), Alertable);
+    while (result == WAIT_TIMEOUT && ms);
+    return result;
+}
+
+static DWORD xbox_wait_multiple(DWORD Count, const HANDLE *Handles, BOOL WaitAll,
+                                uint64_t ms, BOOLEAN Alertable)
+{
+    DWORD result;
+
+    if (ms == WAIT_MS_FOREVER)
+        return WaitForMultipleObjectsEx(Count, Handles, WaitAll, INFINITE, Alertable);
+    do
+        result = WaitForMultipleObjectsEx(Count, Handles, WaitAll,
+                                          nt_wait_slice_ms(&ms), Alertable);
+    while (result == WAIT_TIMEOUT && ms);
+    return result;
 }
 
 /* ============================================================================
@@ -201,8 +234,8 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
-    DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    uint64_t ms = xbox_nt_timeout_to_ms(Timeout);
+    DWORD result = xbox_wait_single(Handle, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -212,7 +245,7 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
-    DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    uint64_t ms = xbox_nt_timeout_to_ms(Timeout);
     DWORD result;
 
     /*
@@ -222,7 +255,7 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
-    result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    result = xbox_wait_single(Handle, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -233,14 +266,14 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
-    DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    uint64_t ms = xbox_nt_timeout_to_ms(Timeout);
     BOOL bWaitAll;
     DWORD result;
 
     /* WaitType: 0 = WaitAll, 1 = WaitAny (matches NT definitions) */
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
 
-    result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
+    result = xbox_wait_multiple(Count, Handles, bWaitAll, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -260,8 +293,8 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
     (void)WaitMode;
 
     HANDLE hObject = (HANDLE)Object;
-    DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    uint64_t ms = xbox_nt_timeout_to_ms(Timeout);
+    DWORD result = xbox_wait_single(hObject, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -280,11 +313,11 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
     (void)WaitBlockArray;
 
     BOOL bWaitAll = (WaitType == 0) ? TRUE : FALSE;
-    DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    uint64_t ms = xbox_nt_timeout_to_ms(Timeout);
 
     /* Objects[] is an array of PVOID which we treat as HANDLE[] */
-    DWORD result = WaitForMultipleObjectsEx(Count, (HANDLE*)Objects,
-                                            bWaitAll, ms, Alertable);
+    DWORD result = xbox_wait_multiple(Count, (HANDLE*)Objects,
+                                      bWaitAll, ms, Alertable);
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -423,8 +456,18 @@ static DWORD WINAPI kt_thread(LPVOID unused)
             h[1] = g_kt_wake;
             if (g_kt_wait && SetWaitableTimer(g_kt_wait, &due, 0, NULL, NULL, FALSE))
                 WaitForMultipleObjects(2, h, FALSE, INFINITE);
-            else
-                WaitForSingleObject(g_kt_wake, (DWORD)((next - q.QuadPart) * 1000 / g_kt_qpf) + 1);
+            else {
+                /* No waitable timer: whole ms to the earliest due time, + 1,
+                 * at most one Win32 wait (kernel_timeout.h). Cast to 32 bits,
+                 * it wrapped past 49.7 days, and 0xFFFFFFFE ms + 1 made
+                 * INFINITE. Past the cap the loop wakes, finds nothing due
+                 * and waits again. Seconds and remainder apart, so that the
+                 * count of ms does not overflow either. */
+                LONGLONG d = next - q.QuadPart;
+                uint64_t ms = (uint64_t)(d / g_kt_qpf) * 1000
+                            + (uint64_t)(d % g_kt_qpf) * 1000 / (uint64_t)g_kt_qpf + 1;
+                WaitForSingleObject(g_kt_wake, nt_wait_slice_ms(&ms));
+            }
         }
     }
     return 0;

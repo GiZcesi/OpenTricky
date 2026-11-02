@@ -16,6 +16,9 @@ void sub_0017770D(void);    /* Matrix_BuildPerspectiveProjection (cdecl, ret 20)
 void sub_00075DE0(void);    /* Camera_ComputeDesiredEye (thiscall, ret 0x10) */
 void sub_000759F0(void);    /* camera collision check (cdecl: eye*, pivot*, k) */
 void sub_00078DE0(void);    /* Camera_Update (thiscall, ret) */
+void sub_000ABD30(void);    /* InGameState: builds the views (thiscall, ret) */
+void sub_0010DFD0(void);    /* a position in view i's space (thiscall, ret 12: out, position, i) */
+int  hud_anchor_image_wide(void);  /* hud_anchor.c */
 void d3d8_SetPointZoom(float zoom);     /* d3d8_xbox.h */
 
 int g_aspect_hook_on;
@@ -24,7 +27,7 @@ int g_aspect_camera = 1;
 int g_aspect_menus43 = ASPECT_MENUS_DEFAULT == ASPECT_MENUS_43;   /* aspect_set_menus */
 static uint32_t s_xscale_bits;      /* (4/3) / A as a float */
 static uint32_t s_renderer;         /* Renderer_SetScreenMode's this, in mode 2 */
-static int      s_boxed;            /* this frame shows the title's own 16:9 (aspect_frame) */
+static int      s_boxed;            /* this frame is framed: ASPECT_FRAME_MENUS or _169 (aspect_frame) */
 static float    s_cam_zoom = 1.0f;  /* A / (16/9) in NoStretch, else 1 */
 static float    s_view_fov = 1.0f;  /* the race camera's FOV and distance (aspect_set_camera) */
 static float    s_view_dist = 1.0f;
@@ -153,10 +156,10 @@ double aspect_from_env(unsigned render_w, unsigned render_h)
 }
 
 /* The framed image's x-scale: the title's 16:9 (0.75f), or its 4:3 (1.0f)
- * with the menus at 4:3 (aspect_set_menus). */
+ * in the frame of the menus at 4:3 (aspect_set_menus). */
 static uint32_t boxed_bits(void)
 {
-    return g_aspect_menus43 ? 0x3F800000u : 0x3F400000u;
+    return g_aspect_menus43 && s_boxed != ASPECT_FRAME_169 ? 0x3F800000u : 0x3F400000u;
 }
 
 /* Renderer_SetScreenMode(mode): mode 2 (widescreen) gets the wider x-scale.
@@ -200,14 +203,67 @@ void hook_aspect_00103D40(void)
         MEM32(self + 0x53Cu) = s_boxed ? boxed_bits() : s_xscale_bits;
 }
 
-/* Frames shown in the 16:9 frame (menus, loading screens; hud_anchor.c
- * decides) get the title's own 16:9 x-scale back, the others the wide one.
- * Called before each RenderFrame, which builds its projections from it. */
-void aspect_frame(int boxed)
+/* Frames shown in a frame (menus, loading screens, the shots the title
+ * stages; hud_anchor.c decides) get the title's own x-scale back (16:9, or
+ * 4:3 in the frame of the 4:3 menus), the others the wide one. Called
+ * when the race's render starts, before its camera's projection, and at
+ * each RenderFrame (hud_anchor.c). */
+void aspect_frame(int mode)
 {
-    s_boxed = boxed;
+    s_boxed = mode;
     if (g_aspect_hook_on && s_renderer >= 0x1000u)
-        MEM32(s_renderer + 0x53Cu) = boxed ? boxed_bits() : s_xscale_bits;
+        MEM32(s_renderer + 0x53Cu) = mode ? boxed_bits() : s_xscale_bits;
+}
+
+/* Shots the title stages. A camera plays one of the title's camera scripts
+ * from VenueStaging_EnterNamedState (0x7A030: [cam+0x3C] = 1, the script's
+ * name at +0x4C) to VenueStaging_ExitState (0x7A0B0: [cam+0x3C] = 0): the
+ * fly-throughs and lineups before the start, and the scene after the finish
+ * line, from the first tick of the race's end to the replay (FL_*, PAN_*,
+ * then PreLoad). Once that scene has begun, the rest of the race's end
+ * (race state 5) counts too: between two of its scripts the camera plays
+ * none for a tick (one image wide, cropped, in the middle of the scene).
+ * Before its first script the race's end is still the race (the place
+ * banner over the race camera). Each of these eyes is placed and framed by
+ * the title for its own projection: on screen, such a shot is shown in the
+ * title's own frame (hud_anchor.c: centred, the sides as for the videos,
+ * never widened nor narrowed), and its camera keeps the title's eye (no
+ * back-off, hook_view_000ABD30). Before, wider than 16:9, the back-off also
+ * moved the eye of the follow shots of the scene after the finish (FLchar_*,
+ * 2.2 m back at 32:9): through the venue's walls, whole frames of one flat
+ * colour for seconds, and the narrowed field of view cropped the shots (by 2
+ * at 32:9, heads cut).
+ * The replays are not such shots: the results' replay (Top 5 Record Times
+ * and the screens over it) and the Replay screen, run by the title's TV
+ * camera (0x1E28F0), whose eye Camera_GetEye (0x781D0) hands to every view
+ * while [0x1E26C6] is up (set by 0x7BD60), its scripted shots and its own
+ * chase shots in turn. They are the race's wide image, as before: the TV
+ * camera's eye moved back for the views like a follow camera's. */
+#define TV_CAMERA       0x001E28F0u
+#define TV_CAMERA_SHOWN 0x001E26C6u
+static int cam_staged(uint32_t cam)
+{
+    return !MEM8(TV_CAMERA_SHOWN) && cam >= 0x10000u && MEM8(cam + 0x3Cu) == 1u;
+}
+
+static uint32_t s_end_scene;            /* the race whose end's scene has begun, 0 = none */
+
+int aspect_staged_shot(void)
+{
+    uint32_t app = MEM32(0x001E3C7Cu), st = app >= 0x1000u ? MEM32(app + 4u) : 0, n, i;
+    uint32_t lvl = app >= 0x1000u ? MEM32(app + 0x72Cu) : 0, race = lvl >= 0x1000u ? MEM32(lvl + 0x1Cu) : 0;
+    int end = race >= 0x1000u && MEM32(race + 0x1Cu) == 5u;       /* EndRace (RaceState_SetState 0x2CE10) */
+    if (!end) s_end_scene = 0;
+    if (MEM8(TV_CAMERA_SHOWN)) return 0;        /* a replay */
+    if (end && s_end_scene == race) return 1;
+    if (st < 0x1000u) return 0;
+    n = MEM32(st + 0x298u);             /* the views (cam_forward below) */
+    for (i = 0; i < n && i < 4u; i++)
+        if (cam_staged(MEM32(st + 0xA0u + 0x80u * i))) {
+            if (end) s_end_scene = race;
+            return 1;
+        }
+    return 0;
 }
 
 static float    s_last_proj[4];     /* last perspective projection: fov, aspect, near, far */
@@ -298,8 +354,7 @@ int aspect_last_perspective(float out[4])
 }
 
 /* Follow camera. The title's camera runs as is (same simulation as at
- * 16:9); only the eye it leaves for the view is moved back, between two
- * ticks:
+ * 16:9); only the views it is drawn from are built from an eye moved back:
  *   0x75DE0  Camera_ComputeDesiredEye (thiscall, ret 0x10: out = cam+0x47C,
  *            targets, ...): a follow camera (params [this+0x11C], flag +0xC8,
  *            target targets[[p+4]]) ;
@@ -308,22 +363,36 @@ int aspect_last_perspective(float out[4])
  *            tunnels) ; 0x75DE0 is its only caller. The pivot sits on the
  *            rider's body ;
  *   0x78DE0  Camera_Update (thiscall): the eye [cam+0x42C] trails the
- *            desired one ; the view (0xABD30) and the rest read it.
+ *            desired one ; the camera's own update, its director (the camera
+ *            scripts, VenueStaging 0x7ADF0, through Camera_GetEye) and the
+ *            views read it ;
  *   0xABD30  builds view i (InGameState+0xB0+0x80i: eye, then the view
  *            matrix at +0x10, rows of a row-vector matrix, so the forward
- *            axis is its third column) for the camera [st+0xA0+0x80i].
- * After 0x78DE0 the eye goes back along the forward axis by (z-1) times the
- * pivot's depth, then through 0x759F0 again (pivot and k from this tick),
- * and stays in [cam+0x42C] until the title's next update, which gets its own
- * eye back. Everything at the pivot's depth keeps its size and its place on
- * screen under the NoStretch zoom z = A / (16/9): the rider is framed as at
- * 16:9, lag included; only the background is narrower.
- * Only a follow camera (0x75DE0 with its flag) takes a slot; the race
- * intro's two fixed shots never do. Before, every camera took one and
- * none was given back: a finished event filled the four (its camera, the
+ *            axis is its third column) for the camera [st+0xA0+0x80i], from
+ *            Camera_GetEye ; the render draws from the views, and the title
+ *            places its 3D sounds against them (0x10DFD0).
+ * After 0x78DE0 the eye to show is computed: back along the forward axis by
+ * (z-1) times the pivot's depth, then through 0x759F0 again (pivot and k from
+ * this tick). It is in [cam+0x42C] only while 0xABD30 builds the views
+ * (hook_view_000ABD30), and only for an image shown wide (a race on screen,
+ * not a staged shot: hud_anchor_image_wide); the title's eye is back right
+ * after. So nothing else of the title reads the moved eye: its camera, its
+ * director (the shots it picks), its sounds (hook_snd_0010DFD0: placed
+ * against the views of the title's own eye). Everything at the pivot's depth
+ * keeps its size and its place on screen under the NoStretch zoom
+ * z = A / (16/9): the rider is framed as at 16:9, lag included; only the
+ * background is narrower. The TV camera of a replay is no view's camera (its
+ * eye is handed to all of them): it has no forward axis here and its eye is
+ * scaled about the pivot, as before.
+ * Only a follow camera (0x75DE0 with its flag) not on a staged shot takes a
+ * slot; the race intro's fixed shots never do. Before, every camera took one
+ * and none was given back: a finished event filled the four (its camera, the
  * two intro shots, the finish shot), and a camera of another mode (Race
- * after Showoff, or the reverse) had none, so no back-off until the game
- * was closed. */
+ * after Showoff, or the reverse) had none, so no back-off until the game was
+ * closed. Before, the moved eye stayed in [cam+0x42C] until the title's
+ * next update, read by the title's camera director, its terrain streaming
+ * and, through the views, its sounds (their listener 2.3 to 3.7 m back at
+ * 32:9). */
 typedef struct {
     uint32_t cam, k;
     uint32_t used;                      /* s_cs_clock at its last update; 0 = free */
@@ -333,7 +402,6 @@ typedef struct {
 static CamSlot  s_cs[4];
 static uint32_t s_cs_clock;
 static CamSlot *s_cs_cur;               /* while 0x75DE0 runs */
-static int      s_cs_any;               /* an eye was moved once: restore it even if the distance went back to 1 */
 
 /* The slot a camera holds, or 0; marked as used now. */
 static CamSlot *cam_find(uint32_t cam)
@@ -346,11 +414,10 @@ static CamSlot *cam_find(uint32_t cam)
 
 /* A slot for a follow camera: its own, else a free one, else the one used
  * longest ago. The title updates its live cameras every tick, so that one is
- * a camera it no longer runs (a race left, an intro over): given up as it
- * is, its eye not written back (the object may be gone or reused by now).
- * No timer: a pause, a replay or the results, however long, take nothing
- * from the cameras in use, and a camera back at the same address
- * finds its slot (cam_restore checks the eye before writing it). */
+ * a camera it no longer runs (a race left, an intro over): given up as it is
+ * (the title's eye is never left moved: nothing to write back). No timer: a
+ * pause, a replay or the results, however long, take nothing from the
+ * cameras in use, and a camera back at the same address finds its slot. */
 static CamSlot *cam_take(uint32_t cam)
 {
     CamSlot *c = cam_find(cam);
@@ -367,14 +434,17 @@ static CamSlot *cam_take(uint32_t cam)
     return c;
 }
 
-/* The title's eye back, unless something wrote the eye since (a cut). */
-static void cam_restore(CamSlot *c)
+static int eye_is(uint32_t cam, const float e[3])
 {
     int i;
-    if (!c->shown_valid) return;
-    c->shown_valid = 0;
-    for (i = 0; i < 3; i++) if (MEMF(c->cam + 0x42Cu + 4u * i) != c->shown[i]) return;
-    for (i = 0; i < 3; i++) MEMF(c->cam + 0x42Cu + 4u * i) = c->sim[i];
+    for (i = 0; i < 3; i++) if (MEMF(cam + 0x42Cu + 4u * i) != e[i]) return 0;
+    return 1;
+}
+
+static void eye_put(uint32_t cam, const float e[3])
+{
+    int i;
+    for (i = 0; i < 3; i++) MEMF(cam + 0x42Cu + 4u * i) = e[i];
 }
 
 void hook_cam_00075DE0(void)
@@ -384,7 +454,7 @@ void hook_cam_00075DE0(void)
     int follow = 0;
     if (cam_moved() && out >= 0x10000u) {
         follow = p >= 0x10000u && MEM32(p + 0xC8u) && MEM32(p) && list >= 0x10000u &&
-                 MEM32(list + (MEM32(p + 4u) << 5)) >= 0x10000u;
+                 MEM32(list + (MEM32(p + 4u) << 5)) >= 0x10000u && !cam_staged(out - 0x47Cu);
         c = follow ? cam_take(out - 0x47Cu) : cam_find(out - 0x47Cu);
     }
     if (!c) {
@@ -448,10 +518,10 @@ static int cam_forward(uint32_t cam, float f[3])
 void hook_cam_00078DE0(void)
 {
     uint32_t cam = g_ecx;
-    CamSlot *c = cam_moved() || s_cs_any ? cam_find(cam) : 0;
+    CamSlot *c = cam_moved() ? cam_find(cam) : 0;
     float e[3], f[3], dp = 0.0f, back = 0.0f;
     int i, axis;
-    if (c) cam_restore(c);
+    if (c) c->shown_valid = 0;          /* a fresh eye at each update */
     sub_00078DE0();
     if (!c || !c->follow || !c->have_pivot) return;
     c->follow = 0;                      /* a fresh 0x75DE0 each tick */
@@ -464,13 +534,12 @@ void hook_cam_00078DE0(void)
     if (axis) {
         back = (cam_zoom() - 1.0f) * dp;
         for (i = 0; i < 3; i++) e[i] = c->sim[i] - f[i] * back;
-    } else {                            /* no view yet: scale about the pivot */
+    } else {                            /* no view of its own (yet, or the TV camera): scale about the pivot */
         for (i = 0; i < 3; i++) e[i] = c->pivot[i] + (c->sim[i] - c->pivot[i]) * cam_zoom();
     }
     cam_collide(e, c->pivot, c->k);
-    for (i = 0; i < 3; i++) MEMF(cam + 0x42Cu + 4u * i) = c->shown[i] = e[i];
-    c->shown_valid = 1;
-    s_cs_any = 1;
+    for (i = 0; i < 3; i++) c->shown[i] = e[i];
+    c->shown_valid = 1;                 /* for the views only (hook_view_000ABD30) */
     if (s_cam_log > 0) {
         static unsigned n;
         if (n++ % 15u == 0u) {
@@ -481,6 +550,102 @@ void hook_cam_00078DE0(void)
         }
     }
 }
+
+/* The views' matrices as the title builds them from its own eyes (this
+ * state's), for its sounds (hook_snd_0010DFD0); no views when the views are
+ * the title's own anyway. */
+static float    s_vgame[4][16];
+static uint32_t s_vgame_st, s_vgame_n;
+
+/* Which views were built from a moved eye (bit i: view i) and how many
+ * times that changed: the eye of such a view jumps by the whole back-off in
+ * one tick (the start grid, framed and from the title's eye, to the race:
+ * 0.64 m at 21:9, 1.9 m at 32:9), which is no motion of the camera.
+ * aspect_eye_epoch: fps_cap.c shows the tick of such a jump as a cut. */
+static uint32_t s_eye_key, s_eye_epoch;
+
+static void eye_source(uint32_t key)
+{
+    if (key != s_eye_key) {
+        s_eye_key = key;
+        s_eye_epoch++;
+    }
+}
+
+unsigned aspect_eye_epoch(void)
+{
+    return s_eye_epoch;
+}
+
+/* 0xABD30 (thiscall, ecx = InGameState): the views. With a moved eye to
+ * show, the title's body runs twice: from the title's eyes (kept for the
+ * sounds), then from the moved ones, in [cam+0x42C] for that build only.
+ * In a replay every view is built from the TV camera's eye (Camera_GetEye):
+ * that camera's is the one moved. The body only reads the cameras and writes
+ * the views. */
+void hook_view_000ABD30(void)
+{
+    uint32_t sv[7] = { g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_seh_ebp };
+    uint32_t st = g_ecx, esp0 = g_esp, n, i, j;
+    CamSlot *w[4];
+    uint32_t nw = 0;
+    int tv = MEM8(TV_CAMERA_SHOWN) != 0;
+    s_vgame_n = 0;
+    if (!cam_moved() || st < 0x1000u || !hud_anchor_image_wide()) {
+        eye_source(0);
+        sub_000ABD30();
+        return;
+    }
+    n = MEM32(st + 0x298u);
+    if (n > 4u) n = 4u;
+    for (i = 0; i < 4; i++) {
+        CamSlot *c = &s_cs[i];
+        if (!c->used || !c->shown_valid || !eye_is(c->cam, c->sim)) continue;   /* none, or a cut since */
+        for (j = 0; j < n; j++) if (MEM32(st + 0xA0u + 0x80u * j) == c->cam) break;
+        if (tv ? c->cam == TV_CAMERA : j < n) w[nw++] = c;     /* the camera the views are built from */
+    }
+    if (!nw) {
+        eye_source(0);
+        sub_000ABD30();
+        return;
+    }
+    sub_000ABD30();
+    for (j = 0; j < n; j++) memcpy(s_vgame[j], (const void *)XBOX_PTR(st + 0xC0u + 0x80u * j), sizeof s_vgame[j]);
+    g_esp = esp0;                       /* the caller's return slot again */
+    g_eax = sv[0]; g_ecx = sv[1]; g_edx = sv[2]; g_ebx = sv[3]; g_esi = sv[4]; g_edi = sv[5]; g_seh_ebp = sv[6];
+    for (i = 0; i < nw; i++) eye_put(w[i]->cam, w[i]->shown);
+    sub_000ABD30();
+    for (i = 0; i < nw; i++) if (eye_is(w[i]->cam, w[i]->shown)) eye_put(w[i]->cam, w[i]->sim);
+    s_vgame_st = st;
+    s_vgame_n = n;
+    {
+        uint32_t key = 0;
+        for (j = 0; j < n; j++)
+            for (i = 0; i < nw; i++)
+                if (tv || MEM32(st + 0xA0u + 0x80u * j) == w[i]->cam) key |= 1u << j;
+        eye_source(key);
+    }
+}
+
+/* 0x10DFD0 (thiscall, ecx = InGameState; out, position, view i): a sound's
+ * position in view i's space (AudioSystem's 3D position, 0x111790), placed
+ * against the view of the title's own eye. Above 60 i/s it is the tick's
+ * view, not the render's interpolated one. */
+void hook_snd_0010DFD0(void)
+{
+    uint32_t st = g_ecx, i = MEM32(g_esp + 0xCu), m;
+    float keep[16];
+    if (!s_vgame_n || st != s_vgame_st || i >= s_vgame_n) {
+        sub_0010DFD0();
+        return;
+    }
+    m = st + 0xC0u + 0x80u * i;
+    memcpy(keep, (const void *)XBOX_PTR(m), sizeof keep);
+    memcpy((void *)XBOX_PTR(m), s_vgame[i], sizeof keep);
+    sub_0010DFD0();
+    memcpy((void *)XBOX_PTR(m), keep, sizeof keep);
+}
+
 
 void (*aspect_lookup(unsigned int xbox_va))(void)
 {
@@ -495,5 +660,7 @@ void (*aspect_lookup(unsigned int xbox_va))(void)
     if (xbox_va == 0x00075DE0u) return hook_cam_00075DE0;
     if (xbox_va == 0x000759F0u) return hook_cam_000759F0;
     if (xbox_va == 0x00078DE0u) return hook_cam_00078DE0;
+    if (xbox_va == 0x000ABD30u) return hook_view_000ABD30;
+    if (xbox_va == 0x0010DFD0u) return hook_snd_0010DFD0;
     return 0;
 }

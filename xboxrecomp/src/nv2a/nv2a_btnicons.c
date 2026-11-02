@@ -1,9 +1,15 @@
 /* Button icons -- see nv2a_btnicons.h.
  *
- * Runs on the pump thread only (texture uploads), so no locking. Each atlas
- * is composed once (a few ms, logged with XBOX_BUTTON_ICONS_LOG=1) and kept:
- * the texture cache may drop and re-upload an atlas, which then gets the
- * same composed texture again. */
+ * Each atlas is composed once and kept: the texture cache may drop and
+ * re-upload an atlas, which then gets the same composed texture again. The
+ * composition (about 20 to 160 ms for an atlas on a desktop processor, the
+ * 8x HUD atlases the most, several times that on a slower one) is
+ * done ahead of use, on a thread of its own started with the renderer, from
+ * the atlases' own bytes read off the disc (see "Ahead of use" below): the
+ * pump only takes the finished texture at the atlas' first upload. An atlas
+ * that thread could not make is composed at its first upload on the pump,
+ * as before, once that thread is done (so the two never share the drawings
+ * or the composition's state). */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -14,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_btnicons.h"
+#include "../kernel/xbox_xdvdfs.h"
+
+BOOL xbox_translate_path(const char *xbox_path, WCHAR *host_path_buf, DWORD buf_size);   /* kernel_path.c */
 
 #define BCDEC_IMPLEMENTATION
 #define BCDEC_STATIC
@@ -117,21 +126,26 @@ static const Slot k_hudload[] = {             /* loading screens */
 
 /* Atlases by the FNV-1a 64 key of their level-0 guest bytes (as nv2a_hdtex.c
  * and port/tools/hdtex_index.py compute it); 32-bit atlases have two keys
- * (linear and swizzled bytes). */
-typedef struct { uint64_t key; const char *name; const Slot *slots; int n, set; } Atlas;
+ * (linear and swizzled bytes). Each one is a picture of a texture bank of
+ * the disc (`file`), the order of the table is the order the game first
+ * needs them in (menus, loading screens, race, tricks): the order they are
+ * composed ahead of use. */
+typedef struct { uint64_t key; const char *name; const Slot *slots; int n, set; const char *file; } Atlas;
 #define N(a) (int)(sizeof(a) / sizeof((a)[0]))
 static const Atlas k_atlas[] = {
-    { 0x4eed54c00fcc7bb3ull, "fe_1",     k_fe1,     N(k_fe1),     SET_TRICK },
-    { 0x0d4cdae8ef7bef83ull, "fe_1",     k_fe1,     N(k_fe1),     SET_TRICK },
-    { 0x8c8800a11b0d092cull, "hudgame",  k_hud1,    N(k_hud1),    SET_GAME },
-    { 0x7d16f4697d06f9a4ull, "hudgame",  k_hud1,    N(k_hud1),    SET_GAME },
-    { 0x4d46ac29a6066fb5ull, "hudtrick", k_hud1,    N(k_hud1),    SET_TRICK },
-    { 0x192ed96c355beb6dull, "hudtrick", k_hud1,    N(k_hud1),    SET_TRICK },
-    { 0x20f3fcaa821cd2a4ull, "hud",      k_hudload, N(k_hudload), SET_TRICK },
+    { 0x4eed54c00fcc7bb3ull, "fe_1",     k_fe1,     N(k_fe1),     SET_TRICK, "data\\textures\\fe_1.xsh" },
+    { 0x0d4cdae8ef7bef83ull, "fe_1",     k_fe1,     N(k_fe1),     SET_TRICK, "data\\textures\\fe_1.xsh" },
+    { 0x20f3fcaa821cd2a4ull, "hud",      k_hudload, N(k_hudload), SET_TRICK, "data\\textures\\hud.xsh" },
+    { 0x8c8800a11b0d092cull, "hudgame",  k_hud1,    N(k_hud1),    SET_GAME,  "data\\textures\\hudgame.xsh" },
+    { 0x7d16f4697d06f9a4ull, "hudgame",  k_hud1,    N(k_hud1),    SET_GAME,  "data\\textures\\hudgame.xsh" },
+    { 0x4d46ac29a6066fb5ull, "hudtrick", k_hud1,    N(k_hud1),    SET_TRICK, "data\\textures\\hudtrick.xsh" },
+    { 0x192ed96c355beb6dull, "hudtrick", k_hud1,    N(k_hud1),    SET_TRICK, "data\\textures\\hudtrick.xsh" },
 };
 #define N_ATLAS N(k_atlas)
 
-static int g_mode = -1, g_log;
+/* The style and its settings (settings_read): -1 until they are read, then
+ * never changed. */
+static int g_mode = -1, g_log, g_wide, g_hud4;
 static IDirect3DTexture8 *g_done[N_ATLAS];      /* composed, kept for re-uploads */
 
 typedef struct { int w, h; uint8_t *rgba; } Img;   /* straight alpha */
@@ -226,37 +240,56 @@ static const LessonShape k_lesson_shape[] = {
 };
 #define N_LESSON_SHAPES (int)(sizeof k_lesson_shape / sizeof k_lesson_shape[0])
 
+/* The style and its settings are read from the environment (which the
+ * launcher's settings are put in before the game starts) once, by the first
+ * caller, whatever its thread: the style is worked out in full first, then
+ * published in one store, after the settings that go with it (release order,
+ * read with acquire order). A thread that sees a style sees its settings,
+ * and a first call made while another thread is still reading them waits
+ * for it in InitOnce: no caller ever sees a style that is not the one set
+ * (no "off" before the real style). */
+static INIT_ONCE g_settings_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK settings_read(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    const char *e = getenv("XBOX_BUTTON_ICONS");
+    int mode = MODE_OFF;                    /* unset or "0": test runs only */
+    (void)once; (void)param; (void)ctx;
+    if (e && e[0] && strcmp(e, "0")) {
+        if (!_stricmp(e, "playstation") || !_stricmp(e, "ps")) mode = MODE_PS;
+        else if (!_stricmp(e, "ps2")) mode = PS2_ORIGINAL_READY ? MODE_PS2 : MODE_MODERN;
+        else if (!_stricmp(e, "debug")) mode = MODE_DEBUG;
+        else mode = MODE_MODERN;            /* "modern", "auto", or a value no longer known */
+        if (!_stricmp(e, "ps2") && mode != MODE_PS2)
+            fprintf(stderr, "[BTNICONS] ps2: the PS2 button style is not in this build, auto\n");
+    }
+    e = getenv("XBOX_BUTTON_ICONS_LOG");
+    g_log = e && e[0] == '1';
+    e = getenv("XBOX_FIX_BUMPERS_WIDE");    /* "0": the Duke glyphs' size (comparisons) */
+    g_wide = (mode == MODE_MODERN || mode == MODE_PS) && !(e && e[0] == '0');
+    e = getenv("XBOX_BUTTON_ICONS_HUD_SCALE");
+    g_hud4 = e && e[0] == '4';              /* atlas_scale */
+    if (mode != MODE_OFF)
+        fprintf(stderr, "[BTNICONS] mode %s\n",
+                mode == MODE_MODERN ? "modern" : mode == MODE_PS ? "playstation" :
+                mode == MODE_PS2 ? "ps2" : "debug");
+    __atomic_store_n(&g_mode, mode, __ATOMIC_RELEASE);
+    return TRUE;
+}
+
 int btnicons_on(void)
 {
-    if (g_mode < 0) {
-        const char *e = getenv("XBOX_BUTTON_ICONS");
-        g_mode = MODE_OFF;                  /* unset or "0": test runs only */
-        if (e && e[0] && strcmp(e, "0")) {
-            if (!_stricmp(e, "playstation") || !_stricmp(e, "ps")) g_mode = MODE_PS;
-            else if (!_stricmp(e, "ps2")) g_mode = PS2_ORIGINAL_READY ? MODE_PS2 : MODE_MODERN;
-            else if (!_stricmp(e, "debug")) g_mode = MODE_DEBUG;
-            else g_mode = MODE_MODERN;      /* "modern", "auto", or a value no longer known */
-            if (!_stricmp(e, "ps2") && g_mode != MODE_PS2)
-                fprintf(stderr, "[BTNICONS] ps2: the PS2 button style is not in this build, auto\n");
-        }
-        e = getenv("XBOX_BUTTON_ICONS_LOG");
-        g_log = e && e[0] == '1';
-        if (g_mode != MODE_OFF)
-            fprintf(stderr, "[BTNICONS] mode %s\n",
-                    g_mode == MODE_MODERN ? "modern" : g_mode == MODE_PS ? "playstation" :
-                    g_mode == MODE_PS2 ? "ps2" : "debug");
+    int mode = __atomic_load_n(&g_mode, __ATOMIC_ACQUIRE);
+    if (mode < 0) {
+        InitOnceExecuteOnce(&g_settings_once, settings_read, NULL, NULL);
+        mode = __atomic_load_n(&g_mode, __ATOMIC_ACQUIRE);
     }
-    return g_mode != MODE_OFF;
+    return mode != MODE_OFF;
 }
 
 int btnicons_wide_bumpers(void)
 {
-    static int s_wide = -1;
-    if (s_wide < 0) {               /* XBOX_FIX_BUMPERS_WIDE=0: the Duke glyphs' size (comparisons) */
-        const char *e = getenv("XBOX_FIX_BUMPERS_WIDE");
-        s_wide = btnicons_on() && (g_mode == MODE_MODERN || g_mode == MODE_PS) && !(e && e[0] == '0');
-    }
-    return s_wide;
+    return btnicons_on() && g_wide;
 }
 
 int btnicons_bumper_text_dy(void)
@@ -837,29 +870,31 @@ static void draw_number(uint8_t *dst, int dw, int n, int rx, int ry, int rw, int
             }
 }
 
-/* The guest atlas as BGRA rows: 32-bit ones read back from the texture just
- * decoded, DXT3 ones decoded from the guest bytes. */
+/* DXT3 bytes (16 per 4 x 4 block) decoded to BGRA rows, into px. */
+static void dxt3_bgra(const uint8_t *level0, uint32_t w, uint32_t h, uint8_t *px)
+{
+    const uint8_t *b = level0;
+    uint32_t x, y;
+    for (y = 0; y < h; y += 4)
+        for (x = 0; x < w; x += 4, b += 16)
+            bcdec_bc2(b, px + ((size_t)y * w + x) * 4, (int)w * 4);
+    for (x = 0; x < w * h; x++) {                                /* RGBA -> BGRA */
+        uint8_t t = px[x * 4]; px[x * 4] = px[x * 4 + 2]; px[x * 4 + 2] = t;
+    }
+}
+
+/* The guest atlas as BGRA rows: 32-bit ones copied from the level 0 the pump
+ * just decoded, DXT3 ones decoded from the guest bytes. */
 static uint8_t *guest_bgra(const uint8_t *level0, uint32_t n0, uint32_t w, uint32_t h,
-                           IDirect3DTexture8 *guest)
+                           const uint8_t *bgra0)
 {
     uint8_t *px = (uint8_t *)malloc((size_t)w * h * 4);
-    uint32_t x, y;
     if (!px) return NULL;
     if (n0 == w * h * 4) {
-        D3DLOCKED_RECT lr;
-        memset(&lr, 0, sizeof lr);
-        if (FAILED(guest->lpVtbl->LockRect(guest, 0, &lr, NULL, 0)) || !lr.pBits) { free(px); return NULL; }
-        for (y = 0; y < h; y++)
-            memcpy(px + (size_t)y * w * 4, (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch, (size_t)w * 4);
-        guest->lpVtbl->UnlockRect(guest, 0);
+        if (!bgra0) { free(px); return NULL; }
+        memcpy(px, bgra0, (size_t)w * h * 4);
     } else if (n0 == w * h && !(w & 3) && !(h & 3)) {           /* DXT3: 16 bytes per 4 x 4 block */
-        const uint8_t *b = level0;
-        for (y = 0; y < h; y += 4)
-            for (x = 0; x < w; x += 4, b += 16)
-                bcdec_bc2(b, px + ((size_t)y * w + x) * 4, (int)w * 4);
-        for (x = 0; x < w * h; x++) {                            /* RGBA -> BGRA */
-            uint8_t t = px[x * 4]; px[x * 4] = px[x * 4 + 2]; px[x * 4 + 2] = t;
-        }
+        dxt3_bgra(level0, w, h, px);
     } else {
         free(px);
         return NULL;
@@ -887,15 +922,15 @@ static void half_level(const uint8_t *s, uint32_t w, uint32_t h, uint8_t *d)
 #define HUD_SCALE 8
 static int atlas_scale(const Atlas *a)
 {
-    static int s_hud = -1;
-    if (s_hud < 0) {
-        const char *e = getenv("XBOX_BUTTON_ICONS_HUD_SCALE");
-        s_hud = e && e[0] == '4' ? SCALE : HUD_SCALE;
-    }
-    return a->slots == k_hud1 && btnicons_wide_bumpers() ? s_hud : SCALE;
+    return a->slots == k_hud1 && btnicons_wide_bumpers() ? (g_hud4 ? SCALE : HUD_SCALE) : SCALE;
 }
 
-static IDirect3DTexture8 *compose(const Atlas *a, const uint8_t *src, uint32_t w, uint32_t h, int sc)
+/* XBOX_BUTTON_ICONS_LOG=1: where a composition's time goes, and the
+ * fingerprint (FNV-1a 64) of its source texels and of every level it made. */
+typedef struct { double level0, glyphs, mips, texture; uint64_t fp; uint32_t levels; } ComposeStat;
+
+static IDirect3DTexture8 *compose(const Atlas *a, const uint8_t *src, uint32_t w, uint32_t h, int sc,
+                                  ComposeStat *st)
 {
     uint32_t W = w * (uint32_t)sc, H = h * (uint32_t)sc, levels = 0, d, i, x, y;
     size_t total = 0, off = 0;
@@ -904,6 +939,7 @@ static IDirect3DTexture8 *compose(const Atlas *a, const uint8_t *src, uint32_t w
     IDirect3DTexture8 *tex = NULL;
     int s, in;
     float cx, cy;
+    double t = now_ms(), t1;
 
     for (d = W > H ? W : H; ; d >>= 1) {
         uint32_t lw = W >> levels ? W >> levels : 1, lh = H >> levels ? H >> levels : 1;
@@ -919,6 +955,7 @@ static IDirect3DTexture8 *compose(const Atlas *a, const uint8_t *src, uint32_t w
             sample_bgra(src, (int)w, (int)h, (x + 0.5f) / sc, (y + 0.5f) / sc, c);
             for (k = 0; k < 4; k++) pix[((size_t)y * W + x) * 4 + k] = (uint8_t)(c[k] + 0.5f);
         }
+    t1 = now_ms(); st->level0 = t1 - t; t = t1;
     if (a->slots == k_fe1 && g_cfg.rgba) {
         /* Configure Controller: the Duke and its lines out, the style's pad in */
         fill(pix, (int)W, 0, 0, CFG_W * sc, CFG_H * sc, 0x00000000u);
@@ -997,6 +1034,7 @@ static IDirect3DTexture8 *compose(const Atlas *a, const uint8_t *src, uint32_t w
                      (sl->w - 2 * in - sl->trim_r) * sc, (sl->h - 2 * in) * sc, 0);
         }
     }
+    t1 = now_ms(); st->glyphs = t1 - t; t = t1;
     bits[0] = pix;
     for (i = 1; i < levels; i++) {
         uint32_t pw = W >> (i - 1) ? W >> (i - 1) : 1, ph = H >> (i - 1) ? H >> (i - 1) : 1;
@@ -1004,42 +1042,290 @@ static IDirect3DTexture8 *compose(const Atlas *a, const uint8_t *src, uint32_t w
         half_level((const uint8_t *)bits[i - 1], pw, ph, pix + off);
         bits[i] = pix + off;
     }
+    t1 = now_ms(); st->mips = t1 - t;
+    st->levels = levels;
+    st->fp = g_log ? fnv64(pix, (uint32_t)total) : 0;
+    t = now_ms();
     if (FAILED(d3d8_CreateTextureFromLevels(W, H, levels, bits, &tex))) tex = NULL;
+    st->texture = now_ms() - t;
     free(pix);
     return tex;
 }
 
+/* Atlas i composed from its BGRA texels `src` (w x h), the drawings loaded
+ * (load_icons) before: one log line, two with XBOX_BUTTON_ICONS_LOG=1.
+ * t0: when the work on it began; t_icons, t_src: the time spent loading the
+ * drawings and getting src; `where`: ahead of use or at the first upload. */
+static IDirect3DTexture8 *make_atlas(int i, const uint8_t *src, uint32_t w, uint32_t h,
+                                     double t0, double t_icons, double t_src, const char *where)
+{
+    IDirect3DTexture8 *tex;
+    uint64_t src_fp = g_log ? fnv64(src, w * h * 4) : 0;
+    int sc = atlas_scale(&k_atlas[i]);
+    ComposeStat st;
+    tex = compose(&k_atlas[i], src, w, h, sc, &st);
+    if (!tex && sc != SCALE) {                               /* the larger texture refused: back to 4x */
+        fprintf(stderr, "[BTNICONS] %s: %dx refused, composed at %dx\n", k_atlas[i].name, sc, SCALE);
+        sc = SCALE;
+        tex = compose(&k_atlas[i], src, w, h, sc, &st);
+    }
+    if (!tex) return NULL;
+    fprintf(stderr, "[BTNICONS] %s composed (key %016llx) at %dx (%ux%u, %.1f MB with mips) in %.1f ms, %s\n",
+            k_atlas[i].name, (unsigned long long)k_atlas[i].key, sc, w * (uint32_t)sc, h * (uint32_t)sc,
+            (double)w * sc * h * sc * 4.0 * 4.0 / 3.0 / (1024.0 * 1024.0), now_ms() - t0, where);
+    if (g_log)
+        fprintf(stderr, "[BTNICONS] %s: drawings %.1f ms, source %.1f, level 0 %.1f, glyphs %.1f, mips %.1f, "
+                        "texture %.1f; source fp %016llx, atlas fp %016llx (%u levels)\n",
+                k_atlas[i].name, t_icons, t_src, st.level0, st.glyphs, st.mips, st.texture,
+                (unsigned long long)src_fp, (unsigned long long)st.fp, st.levels);
+    return tex;
+}
+
+/* ── Ahead of use ──────────────────────────────────────────────────────
+ * Each atlas is a picture of one of the disc's texture banks (Atlas.file).
+ * A thread started with the renderer (btnicons_prepare) reads each bank's
+ * 256 x 256 pictures, keys their level 0 in the form the game holds it in
+ * memory (a 32-bit picture swizzled: the game swizzles it at load; a DXT3
+ * one as stored) and composes every atlas of the table whose key that is,
+ * from the picture's own texels, in the table's order, below normal
+ * priority. Those are the texels the pump would get at the atlas' upload
+ * (guest_bgra): a 32-bit picture's are its BGRA texels as the file stores
+ * them, which the pump's decode of the swizzled A8R8G8B8 texture gives back
+ * (tex_texel_to_argb, texel for texel); a DXT3 one's are decoded from the
+ * same bytes. At the upload, the pump takes that texture for those bytes in
+ * that form, waiting for the thread if it has not got there yet; for any
+ * other form (another colour format, an atlas the thread could not make),
+ * it composes the atlas itself as before, once the thread is done. */
+#define NV2A_SZ_A8R8G8B8 0x06       /* NV2A colour format: swizzled A8R8G8B8 */
+enum { AHEAD_PENDING, AHEAD_READY, AHEAD_NONE };
+static INIT_ONCE          g_ahead_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION   g_ahead_lock;
+static CONDITION_VARIABLE g_ahead_cv;
+static int                g_ahead_state[N_ATLAS];   /* AHEAD_*; this and the next three under g_ahead_lock */
+static IDirect3DTexture8 *g_ahead_tex[N_ATLAS];
+static uint32_t           g_ahead_n0[N_ATLAS];      /* the level-0 bytes it was keyed on */
+static int                g_ahead_end;              /* the thread is done (or never started) */
+static HANDLE             g_ahead_thread;
+
+/* Texel (x, y) of a swizzled w x h texture (powers of two): the bits of x and
+ * y interleaved, x first (as nv2a_hdtex.c). */
+static uint32_t swz_index(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    uint32_t r = 0, ob = 0;
+    for (; w > 1 || h > 1; w >>= 1, h >>= 1) {
+        if (w > 1) { r |= (x & 1u) << ob++; x >>= 1; }
+        if (h > 1) { r |= (y & 1u) << ob++; y >>= 1; }
+    }
+    return r;
+}
+
+/* A file of the disc, looked up once and then read by ranges: its extent in
+ * the mounted disc image, else (no image) the game folder's (D:) file, kept
+ * open while it is read. */
+typedef struct { uint32_t sector, size; FILE *f; } DiscFile;
+
+/* 1 when the disc's file `rel` is there. */
+static int disc_open(const char *rel, DiscFile *d)
+{
+    memset(d, 0, sizeof *d);
+    if (xdvdfs_is_mounted()) {
+        uint8_t attrs = 0;
+        return xdvdfs_find(rel, &d->sector, &d->size, &attrs) && !(attrs & XDVDFS_ATTR_DIRECTORY);
+    } else {
+        char xp[MAX_PATH];
+        WCHAR wp[MAX_PATH];
+        snprintf(xp, sizeof xp, "D:\\%s", rel);
+        return xbox_translate_path(xp, wp, MAX_PATH) && (d->f = _wfopen(wp, L"rb")) != NULL;
+    }
+}
+
+/* `len` bytes at `off` of an open disc file: 1 when they were all read. */
+static int disc_read(DiscFile *d, uint32_t off, void *buf, uint32_t len)
+{
+    if (!d->f)
+        return off <= d->size && len <= d->size - off && xdvdfs_read(d->sector, d->size, off, buf, len) == len;
+    return fseek(d->f, (long)off, SEEK_SET) == 0 && fread(buf, 1, len, d->f) == len;
+}
+
+static void disc_close(DiscFile *d)
+{
+    if (d->f) fclose(d->f);
+    d->f = NULL;
+}
+
+/* The atlases of the bank `file` (SHPX: "SHPX", size, count, tag, then
+ * per picture a tag and its offset; a picture: format in the low byte,
+ * width, height, 16 bytes of header, then its level 0): the number made. */
+static int ahead_bank(const char *file)
+{
+    uint8_t dir[16 + 8 * 64];
+    uint32_t n, e;
+    int made = 0;
+    DiscFile d;
+    if (!disc_open(file, &d)) return 0;
+    if (!disc_read(&d, 0, dir, 16) || memcmp(dir, "SHPX", 4)) { disc_close(&d); return 0; }
+    memcpy(&n, dir + 8, 4);
+    if (n > 64) n = 64;
+    if (!disc_read(&d, 16, dir + 16, 8 * n)) { disc_close(&d); return 0; }
+    for (e = 0; e < n; e++) {
+        uint32_t off, hdr[2], w, h, fmt, n0, x, y;
+        uint8_t *raw, *form = NULL, *src;
+        uint64_t key;
+        double t0 = now_ms();
+        int i;
+        memcpy(&off, dir + 0x14 + e * 8, 4);
+        if (!disc_read(&d, off, hdr, 8)) continue;
+        fmt = hdr[0] & 0xFF;
+        w = hdr[1] & 0xFFFF;
+        h = hdr[1] >> 16;
+        if (w != 256 || h != 256) continue;
+        if (fmt == 0x7D) n0 = w * h * 4;                     /* 32-bit, linear BGRA */
+        else if (fmt == 0x61) n0 = w * h;                    /* DXT3 */
+        else continue;
+        if (!(raw = (uint8_t *)malloc(n0))) continue;
+        if (!disc_read(&d, off + 16, raw, n0)) { free(raw); continue; }
+        if (fmt == 0x7D) {                                   /* keyed swizzled, as the game holds it */
+            if (!(form = (uint8_t *)malloc(n0))) { free(raw); continue; }
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++)
+                    memcpy(form + (size_t)swz_index(x, y, w, h) * 4, raw + ((size_t)y * w + x) * 4, 4);
+            key = fnv64(form, n0);
+            free(form);
+        } else {
+            key = fnv64(raw, n0);
+        }
+        for (i = 0; i < (int)N_ATLAS; i++)
+            if (k_atlas[i].key == key && !strcmp(k_atlas[i].file, file)) break;
+        if (i == (int)N_ATLAS) { free(raw); continue; }
+        if (fmt == 0x7D) {
+            src = raw;
+        } else if ((src = (uint8_t *)malloc((size_t)w * h * 4)) != NULL) {
+            dxt3_bgra(raw, w, h, src);
+            free(raw);
+        } else {
+            free(raw);
+            continue;
+        }
+        {
+            IDirect3DTexture8 *tex = make_atlas(i, src, w, h, t0, 0.0, now_ms() - t0, "ahead of use");
+            free(src);
+            if (!tex) continue;
+            EnterCriticalSection(&g_ahead_lock);
+            g_ahead_tex[i] = tex;
+            g_ahead_n0[i] = n0;
+            g_ahead_state[i] = AHEAD_READY;
+            LeaveCriticalSection(&g_ahead_lock);
+            WakeAllConditionVariable(&g_ahead_cv);
+            made++;
+        }
+    }
+    disc_close(&d);
+    return made;
+}
+
+static DWORD WINAPI ahead_main(LPVOID arg)
+{
+    double t0 = now_ms(), t_icons;
+    int i, j, made = 0;
+    (void)arg;
+    load_icons();
+    t_icons = now_ms() - t0;
+    for (i = 0; i < (int)N_ATLAS; i++) {                     /* each bank once, in the table's order */
+        for (j = 0; j < i && strcmp(k_atlas[j].file, k_atlas[i].file); j++) {}
+        if (j == i) made += ahead_bank(k_atlas[i].file);
+    }
+    EnterCriticalSection(&g_ahead_lock);
+    for (i = 0; i < (int)N_ATLAS; i++)
+        if (g_ahead_state[i] == AHEAD_PENDING) g_ahead_state[i] = AHEAD_NONE;
+    g_ahead_end = 1;
+    LeaveCriticalSection(&g_ahead_lock);
+    WakeAllConditionVariable(&g_ahead_cv);
+    fprintf(stderr, "[BTNICONS] %d atlases composed ahead of use (drawings %.1f ms), %.0f ms in all, off the pump\n",
+            made, t_icons, now_ms() - t0);
+    return 0;
+}
+
+static BOOL CALLBACK ahead_start(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_ahead_lock);
+    InitializeConditionVariable(&g_ahead_cv);
+    /* the clock's frequency settled before the thread starts (the settings
+     * the composition reads are: btnicons_prepare checked btnicons_on) */
+    now_ms();
+    g_ahead_thread = CreateThread(NULL, 0, ahead_main, NULL, CREATE_SUSPENDED, NULL);
+    if (g_ahead_thread) {
+        SetThreadPriority(g_ahead_thread, THREAD_PRIORITY_BELOW_NORMAL);
+        ResumeThread(g_ahead_thread);
+    } else {
+        int i;
+        for (i = 0; i < (int)N_ATLAS; i++) g_ahead_state[i] = AHEAD_NONE;
+        g_ahead_end = 1;
+        fprintf(stderr, "[BTNICONS] no thread to compose ahead of use: each atlas at its first upload\n");
+    }
+    return TRUE;
+}
+
+void btnicons_prepare(void)
+{
+    if (btnicons_on()) InitOnceExecuteOnce(&g_ahead_once, ahead_start, NULL, NULL);
+}
+
+/* The pump, at atlas i's first upload: the texture composed ahead of use
+ * for these bytes in this form, waiting for the thread to get to it; else
+ * NULL, once the thread is done. */
+static IDirect3DTexture8 *ahead_take(int i, uint32_t n0, uint32_t w, uint32_t h, uint32_t color, double *waited)
+{
+    IDirect3DTexture8 *t = NULL, *unused = NULL;
+    double t0 = now_ms();
+    EnterCriticalSection(&g_ahead_lock);
+    if (g_ahead_state[i] == AHEAD_PENDING && g_ahead_thread)   /* the pump waits: no lower priority than its own */
+        SetThreadPriority(g_ahead_thread, GetThreadPriority(GetCurrentThread()));
+    while (g_ahead_state[i] == AHEAD_PENDING)
+        SleepConditionVariableCS(&g_ahead_cv, &g_ahead_lock, INFINITE);
+    if (g_ahead_state[i] == AHEAD_READY) {
+        if (n0 == g_ahead_n0[i] && (n0 != w * h * 4 || color == NV2A_SZ_A8R8G8B8)) t = g_ahead_tex[i];
+        else unused = g_ahead_tex[i];
+        g_ahead_tex[i] = NULL;
+        g_ahead_state[i] = AHEAD_NONE;
+    }
+    while (!t && !g_ahead_end)                               /* composed here: the thread done first */
+        SleepConditionVariableCS(&g_ahead_cv, &g_ahead_lock, INFINITE);
+    LeaveCriticalSection(&g_ahead_lock);
+    if (unused) unused->lpVtbl->Release(unused);
+    *waited = now_ms() - t0;
+    return t;
+}
+
 IDirect3DTexture8 *btnicons_compose(const uint8_t *level0, uint32_t n0, uint32_t w, uint32_t h,
-                                    uint32_t color, IDirect3DTexture8 *guest)
+                                    uint32_t color, const uint8_t *bgra0)
 {
     uint64_t key;
     int i;
     uint8_t *src;
-    double t0;
-    int sc;
-    (void)color;
-    if (!level0 || !guest || w != 256 || h != 256 || !btnicons_on()) return NULL;
+    double t0, t_icons, t_src, waited;
+    if (!level0 || w != 256 || h != 256 || !btnicons_on()) return NULL;
     key = fnv64(level0, n0);
     for (i = 0; i < (int)N_ATLAS; i++)
         if (k_atlas[i].key == key) break;
     if (i == (int)N_ATLAS) return NULL;
     if (!g_done[i]) {
-        t0 = now_ms();
-        if (!g_icons_loaded) load_icons();
-        src = guest_bgra(level0, n0, w, h, guest);
-        if (!src) return NULL;
-        sc = atlas_scale(&k_atlas[i]);
-        g_done[i] = compose(&k_atlas[i], src, w, h, sc);
-        if (!g_done[i] && sc != SCALE) {                     /* the larger texture refused: back to 4x */
-            fprintf(stderr, "[BTNICONS] %s: %dx refused, composed at %dx\n", k_atlas[i].name, sc, SCALE);
-            sc = SCALE;
-            g_done[i] = compose(&k_atlas[i], src, w, h, sc);
+        btnicons_prepare();                                  /* started with the renderer, else now */
+        g_done[i] = ahead_take(i, n0, w, h, color, &waited);
+        if (g_done[i]) {
+            fprintf(stderr, "[BTNICONS] %s: first upload, composed copy taken (waited %.1f ms)\n",
+                    k_atlas[i].name, waited);
+        } else {
+            t0 = now_ms();
+            if (!g_icons_loaded) load_icons();
+            t_icons = now_ms() - t0;
+            src = guest_bgra(level0, n0, w, h, bgra0);
+            if (!src) return NULL;
+            t_src = now_ms() - t0 - t_icons;
+            g_done[i] = make_atlas(i, src, w, h, t0, t_icons, t_src, "at its first upload, on the pump");
+            free(src);
+            if (!g_done[i]) return NULL;
         }
-        free(src);
-        if (!g_done[i]) return NULL;
-        fprintf(stderr, "[BTNICONS] %s composed (key %016llx) at %dx (%ux%u, %.1f MB with mips) in %.1f ms\n",
-                k_atlas[i].name, (unsigned long long)key, sc, w * (uint32_t)sc, h * (uint32_t)sc,
-                (double)w * sc * h * sc * 4.0 * 4.0 / 3.0 / (1024.0 * 1024.0), now_ms() - t0);
     } else if (g_log) {
         fprintf(stderr, "[BTNICONS] %s re-uploaded: composed copy reused\n", k_atlas[i].name);
     }

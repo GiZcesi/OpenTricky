@@ -474,6 +474,21 @@ int xbox_VerifyViewIntegrity(const char *tag);
  */
 void xbox_pfifo_get_wait(volatile uint32_t *get, uint32_t seen, uint32_t spins);
 
+/*
+ * Called every 1024 rounds by the title's wait for a visibility test's report
+ * (generated code, fork pass fix_occlwait.py; always, but XBOX_FIX_OCCLWAIT=0),
+ * before the loop's decrement: `status` is the report's status word, `rounds`
+ * the loop's count (edi). Returns the count to go on with (see the .c).
+ * xbox_occl_wait_init: main(), once, unless XBOX_FIX_OCCLWAIT=0 (count = 1 for
+ * XBOX_FIX_OCCLWAIT=count); with the developer tools it reads XBOX_OCCLWAIT_BOUND_MS,
+ * XBOX_OCCLWAIT_LOOP, XBOX_OCCLWAIT_LOOP_MARGIN and XBOX_OCCLWAIT_TRACE.
+ * xbox_occl_wake: the pump, just after it wrote a report's status.
+ */
+void xbox_occl_wait_init(int count);
+uint32_t xbox_occl_wait(volatile uint32_t *status, uint32_t rounds);
+void xbox_occl_wake(void);
+void xbox_occl_wait_report(void);
+
 #ifdef __cplusplus
 }
 #endif

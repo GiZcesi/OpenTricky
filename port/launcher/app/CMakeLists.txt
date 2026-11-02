@@ -111,10 +111,13 @@ option(OT_RELEASE "Release build (version without -dev)" OFF)
 if(OT_RELEASE)
     target_compile_definitions(OpenTricky PRIVATE OT_RELEASE=1)
 endif()
-# Pages of the private test builds (online_pages.cmake): not in the public
-# tree, where this line does nothing. Such a build may link another miniz.
+# Pages of the private test builds (a *_pages.cmake file next to this one): not
+# in the public tree, where the loop does nothing. Such a build may link another miniz.
 set(OT_MINIZ_LIB ot_miniz)
-include(${CMAKE_CURRENT_SOURCE_DIR}/online_pages.cmake OPTIONAL)
+file(GLOB OT_PAGE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/*_pages.cmake)
+foreach(f ${OT_PAGE_FILES})
+    include(${f})
+endforeach()
 # The extras' settings (port/extras.cmake): off by default; not in the public tree.
 include(${OT_SRC}/../extras.cmake OPTIONAL)
 target_link_libraries(OpenTricky PRIVATE ot_launcher_assets ${OT_MINIZ_LIB} ot_sign RmlUi::Core SDL3::SDL3-static shell32 ole32 uuid psapi winhttp)
@@ -122,16 +125,19 @@ if(MINGW)
     target_link_options(OpenTricky PRIVATE -static -static-libgcc -static-libstdc++ -s)
 endif()
 
-# Host test of the zip reader of the updates (port/launcher/tests), off by
-# default: -DOT_BUILD_TESTS=ON, then the ot_unzip_test target.
-option(OT_BUILD_TESTS "Build the launcher's host tests (ot_unzip_test)" OFF)
+# Host tests of the updates (port/launcher/tests), off by default:
+# -DOT_BUILD_TESTS=ON, then the ot_unzip_test target (the zip reader) and the
+# ot_tidy_test target (what is removed beside OpenTricky.exe).
+option(OT_BUILD_TESTS "Build the launcher's host tests (ot_unzip_test, ot_tidy_test)" OFF)
 if(OT_BUILD_TESTS)
-    add_executable(ot_unzip_test ../tests/unzip_test.cpp ot_install.cpp ot_update.cpp ot_util.cpp)
-    target_include_directories(ot_unzip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(ot_unzip_test PRIVATE ot_miniz ot_sign SDL3::SDL3-static shell32 ole32 uuid psapi winhttp)
-    if(MINGW)
-        target_link_options(ot_unzip_test PRIVATE -static -static-libgcc -static-libstdc++)
-    endif()
+    foreach(t unzip tidy)
+        add_executable(ot_${t}_test ../tests/${t}_test.cpp ot_install.cpp ot_update.cpp ot_util.cpp)
+        target_include_directories(ot_${t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(ot_${t}_test PRIVATE ot_miniz ot_sign SDL3::SDL3-static shell32 ole32 uuid psapi winhttp)
+        if(MINGW)
+            target_link_options(ot_${t}_test PRIVATE -static -static-libgcc -static-libstdc++)
+        endif()
+    endforeach()
 endif()
 
 # The installed version's "What's new" block (whatsnew.txt), built into the
@@ -163,7 +169,7 @@ foreach(part
         "RmlUi (MIT)|${OT_THIRD_PARTY}/rmlui/LICENSE.txt"
         "robin_hood and itlib (MIT), in RmlUi|${OT_THIRD_PARTY}/rmlui/Include/RmlUi/Core/Containers/LICENSE.txt"
         "khrplatform.h (Khronos, MIT-style), in RmlUi's OpenGL loader|${OT_THIRD_PARTY}/notices/khrplatform.txt"
-        "SDL (zlib)|${OT_THIRD_PARTY}/sdl3/LICENSE.txt"
+        "SDL (zlib), in the launcher and the game|${OT_THIRD_PARTY}/sdl3/LICENSE.txt"
         "yuv2rgb (BSD 3-clause), in SDL|${OT_THIRD_PARTY}/sdl3/src/video/yuv2rgb/LICENSE"
         "hidapi (the original HIDAPI licence, of the three it offers), in SDL|${OT_THIRD_PARTY}/sdl3/src/hidapi/LICENSE-orig.txt"
         "stb_image (MIT, or Unlicense), in SDL|${OT_THIRD_PARTY}/notices/sdl-stb-image.txt"

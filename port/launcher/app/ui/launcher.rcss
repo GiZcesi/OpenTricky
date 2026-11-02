@@ -335,7 +335,7 @@ body {
 .stab.on { background-color: var(--acc); border-color: var(--acc); color: var(--play-text); }
 .stab:hover, .stab:focus-visible { color: var(--c-white); }
 
-.rows { position: absolute; left: 136dp; right: 536dp; top: 200dp; height: 536dp; overflow-y: auto; padding-right: 16dp; }
+.rows { position: absolute; left: 136dp; right: 536dp; top: 200dp; height: 536dp; overflow-y: auto; padding-right: var(--p16); }
 .grp { display: flex; align-items: center; font-size: var(--fs-xs); letter-spacing: var(--ls-grp); color: var(--c-t3); margin: 16dp 0 4dp 0; height: 14dp; line-height: 14dp; }
 .grp .rule { flex: 1; height: 1dp; margin-left: 12dp; background-color: var(--line); }
 .row {
@@ -376,7 +376,10 @@ body {
 .tog .knob { position: absolute; left: 2dp; top: 2dp; width: 12dp; height: 12dp; border-radius: 1dp; background-color: var(--c-t3); }
 .tog.on .knob { left: 20dp; background-color: var(--c-white); }
 
-scrollbarvertical { width: 4dp; margin-left: -4dp; }   /* no width taken from the rows: drawn in their right padding */
+/* The scroll bar of a list (the settings list's, Find my disc image's): 4 dp in whole pixels (layout_tokens),
+ * the same in both; no width taken from the list's lines: drawn at the end of the list's right padding, its
+ * 16 dp gutter, in whole pixels too (--p16), so that the bar is as far from the lines in both. */
+scrollbarvertical { width: var(--w-sb); margin-left: var(--w-sb-back); }
 scrollbarvertical slidertrack { background-color: var(--line); }
 scrollbarvertical sliderbar { background-color: var(--line-ctl); min-height: 30dp; }
 scrollbarvertical sliderarrowdec, scrollbarvertical sliderarrowinc { height: 0; }
@@ -478,11 +481,22 @@ body.dialog { background-color: transparent; }
 }
 .mbtn.pri { font-size: var(--fs-btn-d); line-height: var(--lh-mbtn-pri); }
 .mbtn.ghost { background-color: transparent; border-color: transparent; color: var(--c-t2); }
-/* Find my disc image: one button per disc image, its name over its folder (a list line, upright). */
-.box .dlist { margin-top: 14dp; }
-.box .dimg { display: block; transform: none; height: auto; line-height: var(--h-dl); margin: 0 0 6dp 0; padding: 8dp 14dp; text-transform: none; letter-spacing: 0; font-size: var(--fs-body); }
+/* Find my disc image: one button per disc image, its name over its folder (a list line, upright), 6 dp
+ * between two lines and none under the last one (the list scrolls for its lines only, never for a
+ * margin; its buttons come 20 dp under it, as in every dialog). The dialog ends at the latest where the
+ * settings list and its help end (736 dp, 526 dp below the dialog's top): past that, only its list
+ * scrolls, and the title, the text, Browse... and Cancel stay in view.
+ * The list's scroll bar and its 16 dp gutter are the settings list's; the gutter is in the panel's
+ * padding (given back: --p16-back), so the lines keep the width of the text above them. */
+.box.list { display: flex; flex-direction: column; max-height: 526dp; }
+.box.list > * { flex-shrink: 0; }
+.box.list .dlist { flex-shrink: 1; overflow-y: auto; margin: 14dp var(--p16-back) 0 0; padding-right: var(--p16); }
+.box .dimg { display: block; transform: none; height: auto; line-height: var(--h-dl); margin: 0; padding: 8dp 14dp; text-transform: none; letter-spacing: 0; font-size: var(--fs-body); }
+.box .dimg + .dimg { margin-top: 6dp; }
 .box .dimg > span { transform: none; margin-right: 0; }   /* an upright line: none of the slanted buttons' counter-slant */
-.box .dimg .dn { display: inline-block; vertical-align: top; line-height: var(--lh-dn); margin-bottom: var(--mb-dn); }   /* its capitals in the middle of the line (layout_tokens) */
+/* The name: its capitals in the middle of the line (layout_tokens); a name too long for the line with no
+ * space in it (a file name) goes on to the next one, as a name with spaces does, never past the line. */
+.box .dimg .dn { display: inline-block; vertical-align: top; line-height: var(--lh-dn); margin-bottom: var(--mb-dn); word-break: break-word; }
 .box .dimg .dd { display: block; line-height: var(--lh-dname); font-size: var(--fs-s); font-weight: normal; color: var(--c-t2); white-space: nowrap; overflow: hidden; }
 .mbtn:hover { border-color: var(--c-t2); color: var(--c-white); }
 .mbtn.pri:hover { border-color: var(--c-white); }
@@ -495,10 +509,10 @@ body.dialog { background-color: transparent; }
 .foot .l:focus-visible, .btn:focus-visible, .mbtn:focus-visible, .cell:focus-visible {
     box-shadow: var(--focus-ring);
 }
-/* The lines of the scrolled list (a setting): the same ring, inside, since the list clips what is
- * outside it (its left edge, the line scrolled to the top or the bottom). A remapping cell sits
- * 6 dp inside its line: its ring stays outside. */
-.row:focus-visible { box-shadow: var(--focus-ring-in); }
+/* The lines of a scrolled list (a setting, a disc image found): the same ring, inside, since the list
+ * clips what is outside it (its left edge, the line scrolled to the top or the bottom). A remapping
+ * cell sits 6 dp inside its line: its ring stays outside. */
+.row:focus-visible, .box .dimg:focus-visible { box-shadow: var(--focus-ring-in); }
 /* Pressed. */
 /* Pressed: the fill darkens (0.82 of its colour); the focus ring, the outline and the text stay. */
 .setb:active, .seg > span:active, .stab:active, .st:active { background-color: var(--c-ctl-press); }

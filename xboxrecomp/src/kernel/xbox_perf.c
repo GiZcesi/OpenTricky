@@ -9,6 +9,7 @@
 #include "xbox_perf.h"
 
 int g_perf_on;
+int g_perf_detail;
 int g_perf_maptime;
 unsigned long long g_perf_map_cyc, g_perf_map_pairs;
 static unsigned s_ghist[17];            /* GPU draws by upload groups (16 = 16 or more), current window */
@@ -20,9 +21,12 @@ static double s_qpc0, s_rdtsc_ovh;      /* cycles of one rdtsc pair, subtracted 
 #define OUT    PZ_N                     /* "outside any zone" for the kernel time */
 
 extern void pgraph_d3d11_perf_counts(unsigned *draws, unsigned *methods, unsigned *verts);
+extern void nv2a_live_pb_hist_dump(void);
+extern void nv2a_live_pb_hist_write(const char *path);
 
 static double s_freq;
 static FILE  *s_csv;
+static char   s_methods_path[MAX_PATH];  /* XBOX_PERF_METHODS: histogram file, rewritten every window */
 static CRITICAL_SECTION s_lock;
 static DWORD  s_game_tid;
 static __thread int t_zone = OUT;
@@ -38,7 +42,7 @@ static unsigned p_c[PC_N], p_base[3];
 
 /* windows (2 s) */
 typedef struct { float frame, tick, render, render_k, fwait, fwait_k, other; unsigned char nticks; } GRec;
-typedef struct { float itv, pb, present, dxgi, gpu, dup, dcb, dstate, ddraw, tex, psh, vsdec, pcpu, pgpu; unsigned draws, methods, verts, c[PC_N]; } PRec;
+typedef struct { float itv, pb, present, dxgi, gpu, dup, dcb, dstate, ddraw, tex, psh, vsdec, pcpu, pgpu, z6[6]; unsigned draws, methods, verts, c[PC_N]; } PRec;
 static GRec   s_g[WIN]; static int s_ng;
 static PRec   s_p[WIN]; static int s_np;
 static double s_win_t0;
@@ -145,6 +149,24 @@ static void report(int final)
                     AVG(q[0], s_np), AVG(q[1], s_np), AVG(q[2], s_np), AVG(q[4], s_np), AVG(q[3], s_np), AVG(cd, s_np), AVG(cv, s_np));
             fprintf(stderr, "[PERF]   D3D11 state calls per frame: %.0f issued, %.0f skipped (mirror)\n", AVG(ds, s_np), AVG(dk, s_np));
         }
+        {   /* the rest of a GPU draw, split, and the pump's counters */
+            double z[6] = {0}, c[PC_N] = {0};
+            int k;
+            for (i = 0; i < s_np; i++) {
+                for (k = 0; k < 6; k++) z[k] += s_p[i].z6[k];
+                for (k = PC_IDXW; k < PC_N; k++) c[k] += s_p[i].c[k];
+            }
+            fprintf(stderr, "[PERF]   draw detail, ms/frame: prepare %.2f, D3D8 states+textures %.2f, PS state %.2f, ZTIE/ZDECAL %.2f, hooks %.2f, before uploads %.2f\n",
+                    AVG(z[0], s_np), AVG(z[1], s_np), AVG(z[2], s_np), AVG(z[3], s_np), AVG(z[4], s_np), AVG(z[5], s_np));
+            fprintf(stderr, "[PERF]   pump per frame: %.0f index words; VS constants: %.0f same generation, %.0f equal, %.0f changed; "
+                            "%.2f state objects created, %.0f sampler compares, %.0f texture binds; %.0f VS constants compared; "
+                            "with XBOX_PERF_DETAIL: %.0f texture binds skipped; consecutive draws without state between: %.0f (%.0f plain), %.0f with the same bound state and constants; %.0f draws without a constant Map; "
+                            "%.0f samplers from the memo, %.0f D3D8 state writes skipped\n",
+                    AVG(c[PC_IDXW], s_np), AVG(c[PC_VSC_GEN], s_np), AVG(c[PC_VSC_EQ], s_np), AVG(c[PC_VSC_CHG], s_np),
+                    AVG(c[PC_SOBJ], s_np), AVG(c[PC_SMPL], s_np), AVG(c[PC_SRV], s_np), AVG(c[PC_VSC_CMP], s_np),
+                    AVG(c[PC_SRVSKIP], s_np), AVG(c[PC_MERGE], s_np), AVG(c[PC_MERGEP], s_np), AVG(c[PC_MERGES], s_np), AVG(c[PC_CBSKIP], s_np),
+                    AVG(c[PC_SMEMO], s_np), AVG(c[PC_RSKIP], s_np));
+        }
         {
             double gd = 0, gm = 0, gg = 0, hn = 0;
             int h;
@@ -188,6 +210,8 @@ static void report(int final)
     }
     memset(g_kord, 0, sizeof g_kord);
     memset(g_kcnt, 0, sizeof g_kcnt);
+    if (final) nv2a_live_pb_hist_dump();   /* every method word of the run, by method */
+    else if (s_methods_path[0]) nv2a_live_pb_hist_write(s_methods_path);   /* (pump thread) */
     s_ng = s_np = 0;
     s_win_t0 = perf_now();
     if (s_csv) fflush(s_csv);
@@ -236,6 +260,7 @@ void perf_present_done(double gpu_prev)
     r.tex = (float)p_z[PZ_TEX]; r.psh = (float)p_z[PZ_PSH]; r.vsdec = (float)p_z[PZ_VSDEC];
     r.pcpu = (float)p_z[PZ_PROGCPU]; r.pgpu = (float)p_z[PZ_PROGGPU];
     r.dup = (float)p_z[PZ_DUP]; r.dcb = (float)p_z[PZ_DCB]; r.dstate = (float)p_z[PZ_DSTATE]; r.ddraw = (float)p_z[PZ_DDRAW];
+    for (k = 0; k < 6; k++) r.z6[k] = (float)p_z[PZ_PREP + k];
     r.pb = (float)p_z[PZ_PB]; r.present = (float)p_z[PZ_PRESENT]; r.dxgi = (float)p_z[PZ_DXGI]; r.gpu = (float)gpu_prev;
     r.draws = d - p_base[0]; r.methods = m - p_base[1]; r.verts = v - p_base[2];
     for (k = 0; k < PC_N; k++) r.c[k] = p_c[k];
@@ -254,6 +279,12 @@ void perf_present_done(double gpu_prev)
                 r.c[PC_CPUVTX], r.c[PC_CPUDRAW], r.c[PC_D3DSET], r.c[PC_D3DSKIP]);
     if (s_csv)                          /* GPU program draws, same frame */
         fprintf(s_csv, "M,%.3f,%u,%u,%u\n", now, r.c[PC_GDRAW], r.c[PC_GMAP], r.c[PC_GGRP]);
+    if (s_csv)                          /* rest of the GPU draws, pump counters, same frame */
+        fprintf(s_csv, "R,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", now,
+                r.z6[0], r.z6[1], r.z6[2], r.z6[3], r.z6[4], r.z6[5],
+                r.c[PC_IDXW], r.c[PC_VSC_GEN], r.c[PC_VSC_EQ], r.c[PC_VSC_CHG], r.c[PC_SOBJ], r.c[PC_SMPL],
+                r.c[PC_SRV], r.c[PC_MERGE], r.c[PC_MERGEP], r.c[PC_CBSKIP], r.c[PC_SRVSKIP], r.c[PC_MERGES], r.c[PC_VSC_CMP],
+                r.c[PC_SMEMO], r.c[PC_RSKIP]);
     if (now - s_win_t0 >= 2000.0) report(0);
     LeaveCriticalSection(&s_lock);
 }
@@ -281,8 +312,16 @@ void perf_init(void)
         if (s_csv)
             fprintf(s_csv, "# G,t_ms,frame_ms,nticks,tick_ms,tick_kernel_ms,render_ms,render_kernel_ms,wait_ms,wait_kernel_ms,other_ms\n"
                            "# P,t_ms,interval_ms,pushbuffer_ms,host_present_ms,dxgi_present_ms,gpu_ms_prev,draws,methods,verts,vs_decodes,compiles,tex_uploads,tex_sigs,kernel_calls_game,draw_upload_ms,draw_consts_ms,draw_state_ms,draw_call_ms\n"
-                           "# M,t_ms,gpu_draws,gpu_draw_maps,gpu_draw_groups\n");
+                           "# M,t_ms,gpu_draws,gpu_draw_maps,gpu_draw_groups\n"
+                           "# R,t_ms,prepare_ms,d3d8_states_textures_ms,ps_state_ms,ztie_zdecal_ms,hooks_ms,before_uploads_ms,"
+                           "index_words,vsc_same_gen,vsc_equal,vsc_changed,state_objects_created,sampler_compares,texture_binds,"
+                           "consecutive_draws,consecutive_plain,constant_map_skipped,texture_binds_skipped,same_bound_state,vsc_compared,"
+                           "sampler_memo_hits,d3d8_state_writes_skipped\n");
     }
+    e = getenv("XBOX_PERF_DETAIL");
+    g_perf_detail = e && e[0] == '1';
+    e = getenv("XBOX_PERF_METHODS");
+    if (e && *e) snprintf(s_methods_path, sizeof s_methods_path, "%s", e);
     e = getenv("XBOX_PERF_MAPTIME");
     if (e && e[0] == '1') {
         unsigned long long best = ~0ull, a, b;
@@ -297,4 +336,22 @@ void perf_init(void)
     g_perf_on = 1;
     atexit(perf_atexit);
     fprintf(stderr, "[PERF] per-zone profile active%s%s\n", s_csv ? "; CSV " : "", s_csv ? e : "");
+}
+
+/* The vertex/index ring of d3d8_nv2a.c, line V of the CSV: one per presented
+ * frame, at the head of host_present (its header comes before the first one).
+ * Counts only, no clock read. Under the lock, as the other lines: the CSV is
+ * closed at exit. */
+void perf_ring_frame(unsigned wraps, unsigned discards, unsigned fallbacks, unsigned refused, int shared)
+{
+    static int head;
+    EnterCriticalSection(&s_lock);
+    if (s_csv) {
+        if (!head) {
+            head = 1;
+            fprintf(s_csv, "# V,t_ms,ring_wraps,ring_discards,ring_discards_no_completed_query,ring_draws_too_large,ring_lap_shared\n");
+        }
+        fprintf(s_csv, "V,%.3f,%u,%u,%u,%u,%d\n", perf_now(), wraps, discards, fallbacks, refused, shared);
+    }
+    LeaveCriticalSection(&s_lock);
 }

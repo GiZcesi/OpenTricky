@@ -34,6 +34,7 @@
  *   that suspended the threads), and nothing fires under a debugger.
  */
 #include "crashreport.h"
+#include "pad_sdl.h"
 #include "launcher.h"
 #include "settings.h"
 #include "version.h"
@@ -1179,6 +1180,7 @@ static void write_hang_report(unsigned stalled_s, uint32_t draws, unsigned video
         r = MessageBoxW(NULL, msg, L"SSX Tricky", MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
         if (r == IDYES) {
             crashreport_open_folder(s_dir);
+            padsdl_quit(150);           /* PlayStation pads: no motor left running (nothing when off) */
             flush_output();
             TerminateProcess(GetCurrentProcess(), 3);
         }
@@ -1242,6 +1244,7 @@ static DWORD WINAPI report_thread(LPVOID arg)
         DWORD r = WaitForSingleObject(s_crash_event, 1000);
         if (r == WAIT_OBJECT_0) {
             DWORD code = s_ep->ExceptionRecord->ExceptionCode;
+            padsdl_quit(150);           /* PlayStation pads: no motor left running (nothing when off) */
             write_crash_report();
             if (s_fatal) {
                 /* Stack overflow: the faulting thread cannot run the filter

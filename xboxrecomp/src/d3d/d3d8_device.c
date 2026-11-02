@@ -33,6 +33,7 @@
 #include "../kernel/xbox_logstats.h"
 #include <intrin.h>
 #include <d3d11sdklayers.h>
+#include <d3d11_4.h>         /* the visibility reports' fence */
 #include <d3dcompiler.h>
 #include <wincodec.h>
 #include <stdio.h>
@@ -971,17 +972,108 @@ void d3d8_SetGuestFramebufferAlt(const void *alt)
  * frame over every screen that followed: after START skipped the attract movie
  * the frontend issued ~10,000 draws a second behind a frozen picture of the
  * intro's first frame. The upload now runs only while the video is
- * actually locking the buffer -- the player locks once per decoded frame, ~30 a
- * second against ~70 presents, so 30 idle presents (~0.4 s) means it stopped. */
+ * actually locking the buffer -- the player locks once per decoded frame and
+ * presents once per frame, so 30 presents without a lock (the frontend's
+ * frames, or the fallback below) mean it stopped. */
 #define GUEST_FB_IDLE_PRESENTS 30u
 static unsigned g_present_seq     = 0;
 static unsigned g_guest_fb_lock_seq = 0;
 static unsigned g_guest_fb_locks  = 0;
 
+/* One present per video frame, at the title's own flip.
+ *
+ * The player (0x00148B40) clears the back buffer, locks it, copies the decoded
+ * picture into it and calls Present, whose swap points the render surface at
+ * the other buffer (SET_SURFACE_COLOR_OFFSET, nv2a pgraph). That flip is the
+ * moment the frame is finished; the console shows it from the next vertical
+ * blank, one Present per frame (PresentationInterval ONE): 2 refreshes per
+ * frame of a 29.97 fps file at 59.94 Hz. Presenting on a 16 ms timer instead,
+ * measured with GetTickCount (15.6 ms steps), gave 40 presents a second at
+ * 31/31/16/31/16 ms, each showing whichever buffer a sample test guessed was
+ * newest: frames on screen for 1, 2, 3 or 4 refreshes.
+ *
+ * So each lock records which buffer the title is writing, and the flip that
+ * retires that buffer hands it over to the next present, once. The title's
+ * next lock of that buffer waits (BlockOnResource, 0x0016BF20) until the pump
+ * has translated the commands after this flip, so the frame cannot change
+ * under the copy. The locks are written on the title's thread and read on the
+ * pump's at the flip that follows the frame's Present; the interlocked writes
+ * keep them ahead of the push-buffer words carrying that flip. */
+static volatile LONG g_guest_fb_va[2];        /* guest address of src / alt, 0 = not locked yet */
+static volatile LONG g_guest_fb_written[2];   /* lock count at its last lock */
+static unsigned      g_guest_fb_handed[2];    /* lock count it had when a flip handed it over */
+static int           g_video_next = -1;       /* buffer handed over, not presented yet (-1: none) */
+static unsigned      g_video_flips, g_video_shown, g_video_replaced, g_video_relocked;
+static unsigned      g_video_left_out;        /* video presents the display path left out (d3d8_sync.c: never) */
+static int           s_present_rendered;      /* the next present carries the title's draws */
+
 void d3d8_NoteGuestFramebufferLock(void)
 {
     g_guest_fb_lock_seq = g_present_seq;
     g_guest_fb_locks++;
+}
+
+/* LockRect hook (title's thread): the buffer at guest address va (host p) is
+ * being written. */
+void d3d8_NoteGuestFramebufferLockAt(uint32_t va, const void *p)
+{
+    int i = !p ? -1 : p == g_guest_fb_src ? 0 : p == g_guest_fb_alt ? 1 : -1;
+    d3d8_NoteGuestFramebufferLock();
+    if (i >= 0) {
+        InterlockedExchange(&g_guest_fb_va[i], (LONG)va);
+        InterlockedExchange(&g_guest_fb_written[i], (LONG)g_guest_fb_locks);
+    }
+}
+
+/* Surface flip (pump thread, nv2a pgraph): the title's render surface moves
+ * away from `offset`. 1 when that surface is a video buffer written since a
+ * flip last handed it over: it is then the frame the next present shows.
+ * The surface offset is the buffer's physical address and LockRect hands the
+ * title that address in the write-combined alias, | 0xF0000000 (0x0016BF58). */
+int d3d8_GuestFramebufferFlip(uint32_t offset)
+{
+    unsigned w;
+    int i;
+    if (!g_guest_fb_src) return 0;
+    for (i = 0; i < 2; i++) {
+        uint32_t va = (uint32_t)g_guest_fb_va[i];
+        if (va && (va & 0x0FFFFFFFu) == (offset & 0x0FFFFFFFu)) break;
+    }
+    if (i == 2) return 0;
+    w = (unsigned)g_guest_fb_written[i];
+    if (w == g_guest_fb_handed[i]) return 0;      /* nothing new in it: an ordinary flip */
+    g_guest_fb_handed[i] = w;                     /* handed over once, shown or replaced */
+    if (g_video_next >= 0) g_video_replaced++;    /* the previous frame never got its present */
+    g_video_next = i;
+    g_video_flips++;
+    return 1;
+}
+
+/* 1 while a frame handed over by a flip still waits for its present (the
+ * GPU check below held it: the GPU was not done with the previous one). */
+int d3d8_VideoFramePending(void)
+{
+    return g_video_next >= 0;
+}
+
+/* The next present shows the title's own draws (a flip or a clear after
+ * draws, nv2a pgraph), not a video frame: nothing is pasted over them. */
+void d3d8_NoteRenderedFrame(void)
+{
+    s_present_rendered = 1;
+}
+
+/* Milliseconds since the last actual present, on the performance counter
+ * (the video fallback in nv2a_live_pb.c; GetTickCount moves in 15.6 ms steps). */
+static LARGE_INTEGER s_last_present_qpc;
+double d3d8_MsSincePresentQpc(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER now;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    if (!s_last_present_qpc.QuadPart) s_last_present_qpc = now;
+    return (double)(now.QuadPart - s_last_present_qpc.QuadPart) * 1000.0 / (double)f.QuadPart;
 }
 
 /* Video frames the title has written so far (the freeze watchdog, port
@@ -997,83 +1089,19 @@ static int guest_fb_active(void)
     int active = g_guest_fb_locks != 0
               && g_present_seq - g_guest_fb_lock_seq <= GUEST_FB_IDLE_PRESENTS;
     if (active != was_active) {
-        fprintf(stderr, "  [FB] video framebuffer %s after %u locks (present %u)\n",
+        fprintf(stderr, "  [FB] video framebuffer %s after %u locks (present %u)",
                 active ? "active: presenting the video"
                        : "idle: presenting rendered frames",
                 g_guest_fb_locks, g_present_seq);
+        if (!active)    /* so far, frames handed over by the title's flips */
+            fprintf(stderr, "; %u frames at flips, %u presented, %u replaced, %u relocked during the copy, "
+                    "%u left out by the display",
+                    g_video_flips, g_video_shown, g_video_replaced, g_video_relocked, g_video_left_out);
+        fprintf(stderr, "\n");
         xbox_log_flush();
         was_active = active;
     }
     return active;
-}
-
-/* Cheap freshness probe: a few sparse samples down the middle of the surface.
- * Whichever buffer's samples changed since the last present is the one the
- * title just blitted into. */
-static unsigned guest_fb_sig(const void *base, unsigned pitch, unsigned h)
-{
-    const unsigned char *p = (const unsigned char *)base;
-    unsigned sig = 2166136261u, y;
-    if (!p) return 0;
-    for (y = 0; y < h; y += 16) {
-        const unsigned char *r = p + (size_t)y * pitch;
-        unsigned k;
-        for (k = 0; k < 64; k += 4) {
-            sig ^= r[(pitch / 2) + k];
-            sig *= 16777619u;
-        }
-    }
-    return sig;
-}
-
-static const void *guest_fb_freshest(void)
-{
-    static unsigned sig_a = 0, sig_b = 0;
-    static int seeded = 0;
-    unsigned a, b;
-    const void *pick;
-
-    if (!g_guest_fb_alt) return g_guest_fb_src;
-
-    a = guest_fb_sig(g_guest_fb_src, g_guest_fb_pitch, g_guest_fb_h);
-    b = guest_fb_sig(g_guest_fb_alt, g_guest_fb_pitch, g_guest_fb_h);
-    if (!seeded) { seeded = 1; sig_a = a; sig_b = b; return g_guest_fb_src; }
-
-    /* Two rules, and both are needed.
-     *
-     * 1. Never copy a buffer that is changing right now -- that is the one the
-     *    title is mid-blit into, and it lands a torn frame (new rows above, old
-     *    below, a band across the picture).
-     * 2. Never show a frame older than one already shown. Picking "whichever is
-     *    stable" satisfies rule 1 but not rule 2: with the video at ~30 fps and
-     *    presents at ~37, both buffers are often idle, and the stable one is
-     *    sometimes the *older* of the two. Measured: 7 of 60 consecutive
-     *    presents displayed a frame that had already been superseded, which is
-     *    the residual glitching. So track when each buffer last changed and
-     *    take the newest idle one, refusing to go backwards. */
-    {
-        static unsigned gen_a = 0, gen_b = 0, now = 0, shown = 0;
-        int a_busy, b_busy;
-        unsigned cand_gen;
-
-        now++;
-        if (a != sig_a) gen_a = now;
-        if (b != sig_b) gen_b = now;
-        sig_a = a; sig_b = b;
-
-        a_busy = (gen_a == now);
-        b_busy = (gen_b == now);
-
-        if (a_busy && b_busy)      { pick = NULL; cand_gen = 0; }
-        else if (a_busy)           { pick = g_guest_fb_alt; cand_gen = gen_b; }
-        else if (b_busy)           { pick = g_guest_fb_src; cand_gen = gen_a; }
-        else if (gen_a >= gen_b)   { pick = g_guest_fb_src; cand_gen = gen_a; }
-        else                       { pick = g_guest_fb_alt; cand_gen = gen_b; }
-
-        if (pick && cand_gen < shown) pick = NULL;   /* would go backwards */
-        else if (pick)                shown = cand_gen;
-    }
-    return pick;
 }
 
 /* XBOX_PUMPLAG: the frame being drawn has a part drawn from a rewritten
@@ -1089,25 +1117,52 @@ unsigned d3d8_PresentSeq(void)
 
 /* Video presents never wait for the GPU.
  *
- * While a movie plays, this thread presents it on a 16 ms timer
- * (nv2a_live_pb.c) -- and this thread is also the one that acknowledges the
- * title's GPU fences. The movie player waits on such a fence every frame
+ * While a movie plays, this thread presents its frames (at the title's flips
+ * now; on a 16 ms timer before, nv2a_live_pb.c) -- and this thread is
+ * also the one that acknowledges the title's GPU fences. The movie player
+ * waits on such a fence every frame
  * (D3D BlockOnTime under its back-buffer LockRect), and between two frames
  * its loop is the only reader of the game's 8-sample input ring. On the
  * laptop's Intel UHD the driver regularly kept a present-path call (Map of
  * the upload texture, then Present once that was gone) blocked for 350-500 ms
  * while the GPU was still on earlier work: the fences stopped, the movie loop
  * stopped reading input, and a START pressed in that window was lost.
- * An event query is ended after each movie present; the next one is issued
- * only once the GPU has passed it, so the timer present is skipped instead of
- * blocking (the frame is shown a little later, as it would have been). */
+ * An event query is ended with each movie frame, just before its Present
+ *; the next one is issued only once the GPU has passed it, so the
+ * present is put off to a later pump tick instead of blocking (the frame is
+ * shown a little later, as it would have been; a newer frame handed over
+ * meanwhile replaces it). */
 static ID3D11Query *s_vid_query;
 static int          s_vid_query_live;
 static unsigned     s_vid_skips;
 
+/* XBOX_FLIP_LOG=1 (measuring): the time the guard itself takes on the
+ * presenting thread -- its End before each video present, and its GetData
+ * checks before it -- one [VMARK] line per video present. */
+static int          s_vid_tlog = -1;
+static unsigned     s_vid_checks;           /* GetData calls since the last video present */
+static double       s_vid_check_ms;         /* their time */
+
+static double vid_qpc_ms(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+static int vid_tlog_on(void)
+{
+    if (s_vid_tlog < 0) { const char *e = getenv("XBOX_FLIP_LOG"); s_vid_tlog = e && e[0] == '1'; }
+    return s_vid_tlog;
+}
+
 static void video_present_mark(void)
 {
+    double m0 = 0.0;
     if (!g_device_state.d3d11_device || !g_device_state.d3d11_context) return;
+    if (vid_tlog_on()) m0 = vid_qpc_ms();
     if (!s_vid_query) {
         D3D11_QUERY_DESC qd;
         qd.Query = D3D11_QUERY_EVENT;
@@ -1116,16 +1171,41 @@ static void video_present_mark(void)
             s_vid_query = NULL;
     }
     if (!s_vid_query) return;
+    /* Ended after the frame's last draw and before its Present,
+     * which sends it to the GPU with the frame (a Present flushes the
+     * commands ahead of it). Ended after the Present, it waited in the next
+     * command buffer until the next frame's check flushed it, and the GPU,
+     * idle between two video frames, took ~2 ms more to pass it: every video
+     * frame was put off that long after its flip (60 Hz, B2 31/10), and a
+     * flip of the title inside that time (a catch-up after a late frame, the
+     * menu's first frame) replaced the frame waiting, never shown. A Flush
+     * after that End sent it, but took up to 2.3 ms on this thread when the
+     * Present had just been queued at a refresh (B3 31/10). The query now
+     * tells when the GPU has drawn the frame; the Present's own GPU work
+     * comes after it. */
     ID3D11DeviceContext_End(g_device_state.d3d11_context, (ID3D11Asynchronous *)s_vid_query);
     s_vid_query_live = 1;
+    if (s_vid_tlog > 0) {
+        double m1 = vid_qpc_ms();
+        fprintf(stderr, "[VMARK] t=%.1f end %.3f ms (before the present); guard checks %u, %.3f ms\n",
+                m0, m1 - m0, s_vid_checks, s_vid_check_ms);
+        s_vid_checks = 0;
+        s_vid_check_ms = 0.0;
+    }
 }
 
 int d3d8_VideoPresentReady(void)
 {
     HRESULT hr;
+    double c0;
     if (!s_vid_query_live || !s_vid_query || !g_device_state.d3d11_context) return 1;
+    c0 = vid_tlog_on() ? vid_qpc_ms() : 0.0;
     hr = ID3D11DeviceContext_GetData(g_device_state.d3d11_context,
                                      (ID3D11Asynchronous *)s_vid_query, NULL, 0, 0);
+    if (s_vid_tlog > 0) {
+        s_vid_check_ms += vid_qpc_ms() - c0;
+        s_vid_checks++;
+    }
     if (hr == S_FALSE) {
         if (++s_vid_skips == 1 || s_vid_skips % 500 == 0) {
             fprintf(stderr, "[FB] video present held: GPU still on the previous frame (%u so far)\n",
@@ -1142,15 +1222,39 @@ void d3d8_PresentFrame(void)
 {
     /* Pump Windows messages */
     MSG msg;
+    int rendered = s_present_rendered;
 
+    s_present_rendered = 0;
     g_present_seq++;
     if (g_guest_fb_src && guest_fb_active()) {
-        const void *fb = guest_fb_freshest();
-        /* fb == NULL is passed straight through: it means "hold", and the
-         * upload re-presents the staging copy rather than re-reading a buffer
-         * the title may be writing. */
-        d3d8_PresentGuestFramebuffer(fb, g_guest_fb_pitch,
-                                     g_guest_fb_w, g_guest_fb_h);
+        /* The frame a flip handed over, once. A present that is
+         * neither that nor the title's own draws (the fallback) holds the
+         * frame shown last: fb == NULL re-presents the staging copy rather
+         * than re-reading a buffer the title may be writing. A present of the
+         * title's draws (the frontend, right after a video) shows them, as
+         * the console shows the buffer it flips to; a frame still waiting
+         * then is older than they are and is dropped. */
+        if (rendered) {
+            if (g_video_next >= 0) {
+                g_video_next = -1;
+                g_video_replaced++;
+            }
+        } else {
+            const void *fb = NULL;
+            int i = g_video_next;
+            if (i >= 0) {
+                fb = i ? g_guest_fb_alt : g_guest_fb_src;
+                g_video_next = -1;
+                g_video_shown++;
+            }
+            d3d8_PresentGuestFramebuffer(fb, g_guest_fb_pitch,
+                                         g_guest_fb_w, g_guest_fb_h);
+            /* The copy is done: had the title locked that buffer again
+             * meanwhile (it waits for the pump past the next flip, so it
+             * should not), the frame copied could be torn. Counted. */
+            if (i >= 0 && (unsigned)g_guest_fb_written[i] != g_guest_fb_handed[i])
+                g_video_relocked++;
+        }
     }
 
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -1380,6 +1484,7 @@ void d3d8_PresentFrame(void)
     }
     /* Present the backbuffer (VSync = 1) */
     g_last_present_tick = GetTickCount();
+    QueryPerformanceCounter(&s_last_present_qpc);     /* the video fallback */
     if (g_device_state.swap_chain)
         { static unsigned c = 0; if (++c == 1 || ((c % 300) == 0 && xbox_log_stats())) { fprintf(stderr, "  [PRESENT] PresentFrame #%u\n", c); xbox_log_flush(); } }
         host_present();
@@ -1473,6 +1578,74 @@ void d3d8_OcclusionFlush(void)
     if (ctx) ID3D11DeviceContext_Flush(ctx);
 }
 
+/* O-B: a D3D11.4 fence, signalled at each GET_REPORT after the
+ * queries the report waits for, so that the pump can tell they are done
+ * without GetData and write the report before the Present
+ * (nv2a_pgraph_d3d11.c, occ_poll). GetCompletedValue only reads the fence
+ * (DXVK: vkGetSemaphoreCounterValue), where a GetData that answers S_FALSE
+ * may submit the work queued so far (DXVK ignores DONOTFLUSH there). DXVK's
+ * Signal submits what is queued itself, as the Flush that follows it at
+ * GET_REPORT does already with DXVK's default settings. Two cases where DXVK
+ * skips that Flush and the Signal adds one submission per report:
+ * d3d11.ignoreExplicitFlush, and a tiler GPU (DXVK's tilerMode: mobile and
+ * Apple drivers) while a multisampled pass waits for its resolve; neither is
+ * the case of the Steam Deck or of a desktop GPU by default. Created without
+ * flags: (D3D11_FENCE_FLAG)0, not D3D11_FENCE_FLAG_NONE, which MinGW's
+ * headers define as 1 (Microsoft's as 0). Pump thread only; created at the
+ * first mark and kept (the device lives as long as the process). Without
+ * ID3D11Device5 there is no fence: every mark is 0, and the reports are
+ * written at the pump's next tick, as before. */
+static const IID k_iid_occ_device5  = { 0x8ffde202, 0xa0e7, 0x45df, { 0x9e, 0x01, 0xe8, 0x37, 0x80, 0x1b, 0x5e, 0xa0 } };
+static const IID k_iid_occ_context4 = { 0x917600da, 0xf58c, 0x4c33, { 0x98, 0xd8, 0x3e, 0x15, 0xb3, 0x90, 0xfa, 0x24 } };
+static const IID k_iid_occ_fence    = { 0xaffde9d1, 0x1df7, 0x4bb7, { 0x8a, 0x34, 0x0f, 0x46, 0x25, 0x1d, 0xab, 0x80 } };
+static struct { int tried; ID3D11DeviceContext4 *ctx4; ID3D11Fence *fence; UINT64 value; } s_occ_fence;
+
+/* A mark after every command recorded so far: its value, or 0 (no fence, or
+ * the Signal failed). */
+unsigned long long d3d8_OcclusionMark(void)
+{
+    if (!s_occ_fence.tried && g_device_state.d3d11_device && g_device_state.d3d11_context) {
+        ID3D11Device5 *d5 = NULL;
+        s_occ_fence.tried = 1;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(g_device_state.d3d11_device, &k_iid_occ_device5, (void **)&d5)) && d5
+            && SUCCEEDED(ID3D11DeviceContext_QueryInterface(g_device_state.d3d11_context, &k_iid_occ_context4,
+                                                            (void **)&s_occ_fence.ctx4)) && s_occ_fence.ctx4
+            && SUCCEEDED(ID3D11Device5_CreateFence(d5, 0, (D3D11_FENCE_FLAG)0, &k_iid_occ_fence,
+                                                   (void **)&s_occ_fence.fence)) && s_occ_fence.fence) {
+            fprintf(stderr, "[OCCL] visibility reports written as soon as their queries are done, before the Present "
+                    "too (XBOX_FIX_OCCL_EARLY=0: at the pump's next tick only)\n");
+        } else {
+            if (s_occ_fence.ctx4) { ID3D11DeviceContext4_Release(s_occ_fence.ctx4); s_occ_fence.ctx4 = NULL; }
+            s_occ_fence.fence = NULL;
+            fprintf(stderr, "[OCCL] no D3D11 fence: visibility reports written at the pump's next tick only\n");
+        }
+        if (d5) ID3D11Device5_Release(d5);
+    }
+    if (!s_occ_fence.fence) return 0;
+    if (FAILED(ID3D11DeviceContext4_Signal(s_occ_fence.ctx4, s_occ_fence.fence, s_occ_fence.value + 1))) return 0;
+    return ++s_occ_fence.value;
+}
+
+/* The last mark the GPU is past (0: none yet, or no fence). */
+unsigned long long d3d8_OcclusionMarkDone(void)
+{
+    return s_occ_fence.fence ? (unsigned long long)ID3D11Fence_GetCompletedValue(s_occ_fence.fence) : 0ull;
+}
+
+/* d3d8_OcclusionPoll without the flush of flag 0, for a query whose mark the
+ * GPU is past: 1 = ready (*samples set), 0 = not yet (the report then waits
+ * for the next tick's poll), -1 = invalid. Never blocks. */
+int d3d8_OcclusionPollDone(int h, unsigned long long *samples)
+{
+    ID3D11DeviceContext *ctx = g_device_state.d3d11_context;
+    UINT64 n = 0;
+    HRESULT hr;
+    if (h < 0 || h >= OCC_POOL || !s_occ[h] || !ctx) return -1;
+    hr = ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)s_occ[h], &n, sizeof n, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (hr == S_OK) { *samples = n; return 1; }
+    return hr == S_FALSE ? 0 : -1;
+}
+
 /* The pump has run out of commands. The D3D11 driver keeps what
  * was recorded since the last submission until a Present, a Flush or a full
  * buffer: at 60 fps the scene of frame N-1, translated right after its flip,
@@ -1503,6 +1676,7 @@ float d3d8_OcclusionScale(void)
 
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
+void                *d3d8_CurTexture(int stage) { return stage >= 0 && stage < 4 ? (void *)g_cur_textures[stage] : NULL; }
 const D3DMATRIX     *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type) {
     return ((DWORD)type < MAX_TRANSFORMS) ? &g_device_state.transforms[(DWORD)type] : NULL;
 }
@@ -1607,13 +1781,13 @@ double d3d8_HostAspect(void)
     return s_cfg_widescreen ? 16.0 / 9.0 : 4.0 / 3.0;
 }
 
-/* Fork: the image about to be presented is shown in a centred 16:9
- * frame (black bars), set by the translator per image. */
+/* Fork: the image about to be presented is shown in a centred frame
+ * (black bars), set by the translator per image (D3D8_PRESENT_BOX_*). */
 static volatile LONG s_present_box;
 
-void d3d8_SetPresentBox(int on)
+void d3d8_SetPresentBox(int mode)
 {
-    InterlockedExchange(&s_present_box, on ? 1 : 0);
+    InterlockedExchange(&s_present_box, mode == D3D8_PRESENT_BOX_FRAME || mode == D3D8_PRESENT_BOX_169 ? mode : 0);
 }
 
 /* The frame's shape, 16:9 (default) or 4:3 (menus whole at 4:3). */
@@ -1657,7 +1831,11 @@ static double present_aspect(void)
         double va = (double)g_guest_fb_w / (double)g_guest_fb_h;
         if (a > va + 0.005) return va;  /* narrower windows: as before */
     }
-    return s_present_box && a > s_present_box_shape + 0.005 ? s_present_box_shape : a;
+    {
+        LONG box = s_present_box;
+        double fs = box == D3D8_PRESENT_BOX_169 ? 16.0 / 9.0 : s_present_box_shape;
+        return box && a > fs + 0.005 ? fs : a;
+    }
 }
 
 /* Columns of a w-wide capture the image covers when framed (x0, width);
@@ -1753,13 +1931,21 @@ void d3d8_HostToast(const wchar_t *text)
     InterlockedExchange(&s_toast_tick, (LONG)GetTickCount());
 }
 
-/* Called once by d3d8_HostExit before the process ends (NULL: nothing).
- * The online mode sets it to tell the other players it left. */
-static void (*s_host_exit_hook)(void);
+/* Called once each by d3d8_HostExit before the process ends, in the order
+ * they were set (up to 4; NULL, or one set already: nothing). An optional
+ * module may close what it opened; the PlayStation controllers stop
+ * their motors. */
+#define HOST_EXIT_HOOKS 4
+static void (*volatile s_host_exit_hooks[HOST_EXIT_HOOKS])(void);
 
 void d3d8_SetHostExitHook(void (*fn)(void))
 {
-    s_host_exit_hook = fn;
+    int i;
+    if (!fn) return;
+    for (i = 0; i < HOST_EXIT_HOOKS; i++) {
+        void *was = InterlockedCompareExchangePointer((void *volatile *)&s_host_exit_hooks[i], (void *)fn, NULL);
+        if (!was || was == (void *)fn) return;
+    }
 }
 
 /* Called at each present on the image about to be shown (NULL: nothing):
@@ -1779,7 +1965,8 @@ void d3d8_SetPresentImageOverlay(int (*fn)(ID3D11Texture2D *img, ID3D11Texture2D
  * left the window unclosable -- WM_CLOSE used to set a flag nothing read. */
 void d3d8_HostExit(void)
 {
-    if (s_host_exit_hook) s_host_exit_hook();
+    int i;
+    for (i = 0; i < HOST_EXIT_HOOKS && s_host_exit_hooks[i]; i++) s_host_exit_hooks[i]();
     d3d8_sync_report();                 /* [PACING] summary */
     fflush(stdout);
     fflush(stderr);
@@ -2655,6 +2842,8 @@ static void host_output_resize(void)
 
     if (s->swap_rtv) { ID3D11RenderTargetView_Release(s->swap_rtv); s->swap_rtv = NULL; }
     if (s->swap_tex) { ID3D11Texture2D_Release(s->swap_tex); s->swap_tex = NULL; }
+    /* The texture mirror forgets its views (and its references) first */
+    sc_ForgetTextures();
     /* the creation flags (latency, tearing) must be passed again */
     hr = IDXGISwapChain_ResizeBuffers(s->swap_chain, 0, cw, ch, DXGI_FORMAT_UNKNOWN, d3d8_sync_swap_flags());
     if (FAILED(hr))
@@ -3725,8 +3914,11 @@ static HRESULT host_present_impl(void)
         double dxgi_ms = 0.0;
         LARGE_INTEGER p0, p1, pf;
         if (plog < 0) { const char *e = getenv("XBOX_FLIP_LOG"); plog = e && e[0] == '1'; }
+        if (s_video_frame) video_present_mark();   /* sent with the frame by its Present */
         if (plog) QueryPerformanceCounter(&p0);
+        d3d8_sync_video_frame(s_video_frame);   /* a video frame keeps the file's pace */
         hr = d3d8_sync_present(s->swap_chain, &dxgi_ms);
+        if (s_video_frame && d3d8_sync_left_out()) g_video_left_out++;
         {   /* one line: the time from the start to the first image shown */
             static int told;
             if (!told) {
@@ -3738,9 +3930,10 @@ static HRESULT host_present_impl(void)
         if (plog) {     /* XBOX_FLIP_LOG=1: how long Present itself blocks */
             QueryPerformanceCounter(&p1);
             QueryPerformanceFrequency(&pf);
-            fprintf(stderr, "[PRES] t=%.1f present %.2f ms\n",
+            fprintf(stderr, "[PRES] t=%.1f present %.2f ms%s\n",
                     (double)p0.QuadPart * 1000.0 / (double)pf.QuadPart,
-                    (double)(p1.QuadPart - p0.QuadPart) * 1000.0 / (double)pf.QuadPart);
+                    (double)(p1.QuadPart - p0.QuadPart) * 1000.0 / (double)pf.QuadPart,
+                    d3d8_sync_left_out() ? " left out (60 Hz display: two on one refresh)" : "");
         }
     }
     InterlockedIncrement(&s_frames);
@@ -3760,7 +3953,6 @@ static HRESULT host_present_impl(void)
     }
     s_split_done = 0;
     s_post_frame++;                     /* the next present is a new frame */
-    if (s_video_frame) video_present_mark();
     s_video_frame = 0;
     {   /* XBOX_FPS_LOG=1: frames per second every 2 s, for measuring */
         static int on = -1;
@@ -4357,6 +4549,7 @@ static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDi
     (void)self;
     g_d3d_settexture_count++;
     if (Stage >= 4) return E_INVALIDARG;
+    if (g_perf_on) perf_count(PC_SRV, 1);      /* a texture bind (PSSetShaderResources) */
     g_cur_textures[Stage] = pTexture;
 
     /* Bind SRV to pixel shader */
@@ -5589,8 +5782,8 @@ int d3d8_HasGuestFramebuffer(void)
 }
 
 /* True while the video player is still locking the guest framebuffer: its
- * frames reach the screen only through timed presents, so flip-paced
- * presenting (nv2a pgraph) must not suppress those. */
+ * frames reach the screen through the presents at its flips, and the
+ * presents in between hold the frame shown last. */
 int d3d8_GuestFramebufferActive(void)
 {
     return g_guest_fb_src != NULL && g_guest_fb_locks != 0

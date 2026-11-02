@@ -23,7 +23,6 @@
 #include "pass_tags.h"
 #include "hud_anchor.h"
 #include "nv2a/nv2a_hdtex.h"
-#include "netplay/np_net.h"
 #include "../../xboxrecomp/src/kernel/xbox_logstats.h"
 
 extern void sub_00105CE0(void);     /* SceneRenderer_RenderFrame */
@@ -210,8 +209,6 @@ static void hook_105CE0(void)
 
     g_ecx = gfx;
     sub_00105CE0();
-    /* online name tags: this image's tags, kept under its frame number for its FRAME_END */
-    if (g_np_tags_on) np_tags_frame(s_st.frame);
 
     {
         uint32_t sv_eax = g_eax, sv_edx = g_edx;
@@ -744,8 +741,6 @@ void pass_tags_init(void)
         extern int d3d8_temporal_wanted(void);
         if (d3d8_temporal_wanted()) split = 1;
     }
-    /* Online name tags: drawn at the FRAME_END marker of their image. */
-    if (g_np_tags_on) split = 1;
     /* And the HD HUD: its fonts and atlases follow each image's gate marker
      * (hud_anchor_hd_gate; none of it in the pause). */
     if (hdtex_configured()) split = s_hd_gate = 1;
@@ -759,7 +754,7 @@ void pass_tags_init(void)
     if (split && !want_emit) {
         want_emit = 1;
         fprintf(stderr, "[PASS-TAGS] emit turned on by %s\n", g_hud_anchor_on
-                ? "the proportional HUD" : g_np_tags_on ? "the online name tags"
+                ? "the proportional HUD"
                 : "XBOX_POST_SPLIT (3D post at the FRAME_END marker)");
     }
     if (!want_log && !want_emit) {

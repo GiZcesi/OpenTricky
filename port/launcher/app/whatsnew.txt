@@ -1,13 +1,13 @@
 <!-- launcher
-version: 0.1.4
-title: First stable release
-card: merqury
-fixes: Race HUD and Tricky meter fixed at any FPS and HUD size
-fixes: No more flicker on Garibaldi and Merqury City
-fixes: A few rare freezes and crashes fixed
-new: HD HUD, Render scale, Lightmap smoothing, Shadow softness
-new: Snow look: the smooth snow and board trails of the PS2
-better: Evenly paced frames, and riders always in full detail
+version: 0.1.5
+title: Faster, and a round of fixes
+card: tokyo
+fixes: Find my disc image no longer crashes the launcher
+fixes: The game's videos play at their own pace, as in the original game
+fixes: The sun's glare no longer drops out when the GPU falls behind
+new: Weather: no thick fog when it snows, as on the PS2
+new: PlayStation controllers (experimental): DualShock 4, DualSense
+better: 24-31% more FPS uncapped on our test PC; lighter Deck preset
 -->
 This file is the "What's new" block of the installed version, built into
 OpenTricky.exe (the launcher shows it without a network). The release zip

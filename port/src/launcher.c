@@ -243,6 +243,7 @@ static void fork_defaults(LauncherConfig *c)
     c->smooth_legs = 0;                 /* XBOX_FPS_SMOOTH_LEGS's default */
     c->smooth_seams = 0;                /* the terrain variables' default: nothing hooked */
     c->unlock_all = 0;                  /* XBOX_UNLOCK_ALL's default: My save */
+    c->ps_pads = 0;                     /* XBOX_PS_PADS's default: XInput only */
     c->fix_cullwind = c->fix_occlusion = c->fix_texpassthru = c->fix_gamma = 1;
     c->audio_queue = 8;
     c->audio_out = 0;                   /* auto */
@@ -253,6 +254,7 @@ static void fork_defaults(LauncherConfig *c)
     c->shadow_width = 100;              /* the soft edge as it was first made */
     c->draw_dist = 0;
     c->snow_look = 1;                   /* Soft (token "ps2"); 0 = the title's */
+    c->weather = 1;                     /* PS2: the snowfall without its fog; 0 = the title's fog */
     c->lightmap_smooth = 0;             /* the terrain's lightmap filtered as the title does */
     c->render_scale = 100;              /* the 3D at the render size: nothing changes */
     c->hd_hud = 0;                      /* the game's own race HUD */
@@ -330,6 +332,7 @@ static void fork_from_settings(LauncherConfig *c, const Settings *s)
     i = settings_choice_index(s, S_DRAW_DISTANCE);
     c->draw_dist = i > 0 ? i : 0;
     c->snow_look = strcmp(settings_get(s, S_SNOW_LOOK), "original") != 0;
+    c->weather = strcmp(settings_get(s, S_WEATHER), "original") != 0;
     c->lightmap_smooth = settings_get_bool(s, S_LIGHTMAP_SMOOTH);
     c->render_scale = render_scale_ok(atoi(settings_get(s, S_RENDER_SCALE)));
     c->hd_hud = settings_get_bool(s, S_HD_HUD);
@@ -346,6 +349,7 @@ static void fork_from_settings(LauncherConfig *c, const Settings *s)
     c->smooth_legs   = settings_get_bool(s, S_SMOOTH_LEGS);
     c->smooth_seams  = settings_get_bool(s, S_SMOOTH_SEAMS);
     c->unlock_all    = settings_choice_index(s, S_SAVE_PROFILE) == 1;   /* "unlockall" */
+    c->ps_pads       = settings_get_bool(s, S_PS_CONTROLLERS);
 }
 
 /* A path setting from the LauncherConfig: kept as it is in the file (relative,
@@ -383,6 +387,7 @@ static void fork_to_settings(Settings *s, const LauncherConfig *c)
     settings_set(s, S_SHADOW_SOFTNESS, v);
     settings_set(s, S_DRAW_DISTANCE, k_drawdist_name[(c->draw_dist >= 0 && c->draw_dist <= 2) ? c->draw_dist : 0]);
     settings_set(s, S_SNOW_LOOK, c->snow_look ? "ps2" : "original");
+    settings_set(s, S_WEATHER, c->weather ? "ps2" : "original");
     settings_set(s, S_LIGHTMAP_SMOOTH, c->lightmap_smooth ? "1" : "0");
     snprintf(v, sizeof v, "%d", render_scale_ok(c->render_scale));
     settings_set(s, S_RENDER_SCALE, v);
@@ -397,6 +402,7 @@ static void fork_to_settings(Settings *s, const LauncherConfig *c)
     settings_set(s, S_SMOOTH_LEGS, c->smooth_legs ? "1" : "0");
     settings_set(s, S_SMOOTH_SEAMS, c->smooth_seams ? "1" : "0");
     settings_set(s, S_SAVE_PROFILE, c->unlock_all ? "unlockall" : "mine");
+    settings_set(s, S_PS_CONTROLLERS, c->ps_pads ? "1" : "0");
 }
 
 /* XBOX_FORK_INI (test runs): the options of a settings.ini (settings.h);
@@ -479,12 +485,18 @@ void launcher_fork_apply(const LauncherConfig *cfg, const char *source)
     fork_set(line, sizeof line, "XBOX_TERRAIN_CLAMP", cfg->smooth_seams ? "2" : NULL, source);
     /* Save profile: Unlock all = the game's own cheat and a save folder of its own (main.c) */
     fork_set(line, sizeof line, "XBOX_UNLOCK_ALL", cfg->unlock_all ? "1" : "0", source);
+    /* PlayStation controllers (experimental, pad_sdl.h): only when turned on,
+     * so with the option off nothing is set and nothing is reported. */
+    if (cfg->ps_pads) fork_set(line, sizeof line, "XBOX_PS_PADS", "1", source);
     /* Original = no hook. */
     fork_set(line, sizeof line, "XBOX_DRAW_DISTANCE",
              k_drawdist_name[(cfg->draw_dist >= 0 && cfg->draw_dist <= 2) ? cfg->draw_dist : 0], source);
     /* Snow look: Soft, token "ps2" (default) = the terrain's snow lit without the clamp
      * that burns it white, no relief; original = the title's shader as is. */
     fork_set(line, sizeof line, "XBOX_SNOW_LOOK", cfg->snow_look ? "ps2" : "original", source);
+    /* Weather: PS2 (default) = the snowfall alone, the fog, sky and lights as in
+     * clear weather (weather.h); original = the title's snowfall fog. */
+    fork_set(line, sizeof line, "XBOX_WEATHER", cfg->weather ? "ps2" : "original", source);
     /* Lightmap smoothing (nv2a_psh.c): the terrain's lightmap read with a bounded
      * Catmull-Rom (passes through its texels); off = the title's bilinear. */
     fork_set(line, sizeof line, "XBOX_LIGHTMAP_FILTER", cfg->lightmap_smooth ? "catmull" : "off", source);

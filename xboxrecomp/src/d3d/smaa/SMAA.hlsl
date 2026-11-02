@@ -629,7 +629,7 @@ void SMAAMovc(bool2 cond, inout float2 variable, float2 value) {
     SMAA_FLATTEN if (cond.y) variable.y = value.y;
 }
 
-void SMAAMovc(bool4 cond, inout float4 variable, float4 value) {
+void SMAAMovc4(bool4 cond, inout float4 variable, float4 value) {
     SMAAMovc(cond.xy, variable.xy, value.xy);
     SMAAMovc(cond.zw, variable.zw, value.zw);
 }
@@ -851,7 +851,7 @@ float2 SMAADecodeDiagBilinearAccess(float2 e) {
     return round(e);
 }
 
-float4 SMAADecodeDiagBilinearAccess(float4 e) {
+float4 SMAADecodeDiagBilinearAccess4(float4 e) {
     e.rb = e.rb * abs(5.0 * e.rb - 5.0 * 0.75);
     return round(e);
 }
@@ -936,7 +936,7 @@ float2 SMAACalculateDiagWeights(SMAATexture2D(edgesTex), SMAATexture2D(areaTex),
         float4 c;
         c.xy = SMAASampleLevelZeroOffset(edgesTex, coords.xy, int2(-1,  0)).rg;
         c.zw = SMAASampleLevelZeroOffset(edgesTex, coords.zw, int2( 1,  0)).rg;
-        c.yxwz = SMAADecodeDiagBilinearAccess(c.xyzw);
+        c.yxwz = SMAADecodeDiagBilinearAccess4(c.xyzw);
 
         // Non-optimized version:
         // float4 coords = mad(float4(-d.x, d.x, d.y, -d.y), SMAA_RT_METRICS.xyxy, texcoord.xyxy);
@@ -1282,7 +1282,7 @@ float4 SMAANeighborhoodBlendingPS(float2 texcoord,
         // Calculate the blending offsets:
         float4 blendingOffset = float4(0.0, a.y, 0.0, a.w);
         float2 blendingWeight = a.yw;
-        SMAAMovc(bool4(h, h, h, h), blendingOffset, float4(a.x, 0.0, a.z, 0.0));
+        SMAAMovc4(bool4(h, h, h, h), blendingOffset, float4(a.x, 0.0, a.z, 0.0));
         SMAAMovc(bool2(h, h), blendingWeight, a.xz);
         blendingWeight /= dot(blendingWeight, float2(1.0, 1.0));
 

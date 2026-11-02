@@ -20,6 +20,36 @@ enable_language(RC)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# ── PlayStation controllers (src/pad_sdl.c), experimental ──────────────────
+# SDL3 from port/third_party/sdl3 (the launcher's copy, zlib licence), built
+# with the launcher's options and linked statically: no DLL to ship. Only
+# pad_sdl.c uses it, and only when the player turns the option on
+# (XBOX_PS_PADS=1). OFF: no SDL3 in the executable, XInput only. Added
+# before the definitions below so that SDL builds as the launcher's does.
+option(SSX_PS_PADS "Build the PlayStation controllers support (SDL3, experimental)" ON)
+if(SSX_PS_PADS)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+    set(SDL_GPU OFF CACHE BOOL "" FORCE)
+    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    set(SDL_TRAY OFF CACHE BOOL "" FORCE)
+    set(SDL_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/sdl3 ${CMAKE_BINARY_DIR}/sdl3 EXCLUDE_FROM_ALL)
+    # No debug information for SDL in the game: a few MB less, and the game's
+    # own code keeps its symbols for the crash reports.
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(SDL3-static PRIVATE -g0)
+    endif()
+    message(STATUS "PlayStation controllers: SDL3 (static, experimental option)")
+else()
+    message(STATUS "PlayStation controllers: not built (SSX_PS_PADS=OFF), XInput only")
+endif()
+
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
     NOMINMAX
@@ -133,6 +163,7 @@ set(GAME_SOURCES
     src/chantfix.c
     src/riderlod.c
     src/shadowvb.c
+    src/weather.c
     src/ctlscheme.c
     src/ps2legend.c
     src/extras_off.c
@@ -184,6 +215,17 @@ message(STATUS "Executable will be named: ${GAME_TITLE}.exe")
 
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
+# Only pad_sdl.c knows about SDL, in a library of its own: SDL's headers and
+# definitions never reach the other sources, and turning SSX_PS_PADS on or
+# off rebuilds nothing else. (SDL's two GameInput sources are C++, empty with
+# MinGW: the game is then linked by g++, with the static runtimes below.)
+add_library(ssx_pad_sdl STATIC src/pad_sdl.c)
+if(SSX_PS_PADS)
+    target_compile_definitions(ssx_pad_sdl PRIVATE SSX_HAVE_SDL3)
+    target_link_libraries(ssx_pad_sdl PRIVATE SDL3::SDL3-static)
+endif()
+target_link_libraries(${PROJECT_NAME} PRIVATE ssx_pad_sdl)
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # no C / C++ runtime DLL beside the game
     target_link_options(${PROJECT_NAME} PRIVATE -static-libstdc++ -static-libgcc)
@@ -204,9 +246,6 @@ option(OT_RELEASE "Release build (version without -dev)" OFF)
 if(OT_RELEASE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE OT_RELEASE=1)
 endif()
-# Modules of the private test builds (src/netplay/np_build.cmake): not in the
-# public tree, where this line does nothing (np_net.h is then the empty stub).
-include(${CMAKE_CURRENT_SOURCE_DIR}/src/netplay/np_build.cmake OPTIONAL)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -241,6 +280,32 @@ if(SSX_BUILD_TESTS)
     add_executable(clock_test tests/clock_test.c)
     target_include_directories(clock_test PRIVATE
         ${XBOXRECOMP_DIR}/src/nv2a)
+    if(WIN32)
+        # The kernel's waits on NT timeouts of any length: the real
+        # kernel_sync.c and kernel_thread.c, on a simulated clock
+        add_executable(wait_test tests/wait_test.c)
+        target_include_directories(wait_test PRIVATE
+            ${XBOXRECOMP_DIR}/src/kernel ${XBOXRECOMP_DIR}/src)
+        # What NtQueryDirectoryFile writes into the caller's buffer: the
+        # real kernel_file.c, a made-up disc directory and a real host one
+        add_executable(dir_query_test tests/dir_query_test.c)
+        target_include_directories(dir_query_test PRIVATE
+            ${XBOXRECOMP_DIR}/src/kernel ${XBOXRECOMP_DIR}/src)
+    endif()
+endif()
+
+# Host test of the PlayStation controllers and of how controls.c reads them,
+# with SDL's virtual pads and a stand-in XInput (no controller needed):
+#   pad_sdl_test off (XBOX_PS_PADS unset), pad_sdl_test on (XBOX_PS_PADS=1)
+if(SSX_BUILD_TESTS AND SSX_PS_PADS)
+    add_executable(pad_sdl_test tests/pad_sdl_test.c src/pad_sdl.c src/controls.c src/settings.c)
+    target_include_directories(pad_sdl_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(pad_sdl_test PRIVATE SSX_HAVE_SDL3 XInputGetState=pad_test_XInputGetState
+                               XInputSetState=pad_test_XInputSetState)
+    target_link_libraries(pad_sdl_test PRIVATE SDL3::SDL3-static shell32 ole32 uuid)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_link_options(pad_sdl_test PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
 endif()
 
 # The extras (extras.cmake): not in the stable build, OFF by default; not in

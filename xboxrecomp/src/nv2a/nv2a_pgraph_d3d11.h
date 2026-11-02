@@ -35,6 +35,21 @@ void pgraph_d3d11_shutdown(void);
  * Returns 1 if handled, 0 if unhandled (caller should log/ignore). */
 int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param);
 
+/* Images presented by the translator so far (XBOX_PERF method profile). */
+unsigned pgraph_d3d11_frame_count(void);
+
+/* XBOX_FIX_PUMP_IDX, default 1: a run of n ARRAY_ELEMENT16 words, or
+ * of incrementing SET_TRANSFORM_CONSTANT words from `method`, taken in one
+ * call as pgraph_d3d11_method would take them word by word. index16 returns
+ * 1 if it took all of them, 0 if the caller must go word by word; xfconst
+ * returns how many words it took from the front of the run (0 = none). */
+int      pgraph_d3d11_index16_run(int subchannel, const uint32_t *w, uint32_t n);
+uint32_t pgraph_d3d11_xfconst_run(int subchannel, uint32_t method, const uint32_t *w, uint32_t n);
+/* The same for every plain register array the title sends in runs --
+ * transform constants and program, vertex stream offsets and formats,
+ * SET_VERTEX_DATA4F_M -- returns how many words it took (0 = none). */
+uint32_t pgraph_d3d11_run(int subchannel, uint32_t method, const uint32_t *w, uint32_t n);
+
 /* Flush any pending draw commands (call at end of frame). */
 void pgraph_d3d11_flush(void);
 
@@ -154,7 +169,7 @@ typedef void (*pgraph_pass_phase_fn)(int old_phase, int new_phase, uint32_t tag)
 void pgraph_d3d11_set_pass_phase_callback(pgraph_pass_phase_fn fn);
 int  pgraph_d3d11_pass_phase(void);
 
-/* Image end (fork, online waiting banner): called on the pump thread at each
+/* Image end (fork, hook of an optional module): called on the pump thread at each
  * presented image, after the title's last draw of that image and before the
  * present, so what it draws on the default render target lies over the HUD
  * and the menus. NULL (the default) = nothing called. */
@@ -179,7 +194,9 @@ void pgraph_d3d11_set_hud_scale(float kx, float ky);
  * port/src/hud_anchor.c). PGRAPH_BOX_TAG_MAGIC in the 16 high bits, low
  * bits: 0 = the records that follow are drawn as is, 1 = framed (x scaled
  * by k about the centre, wide images only), 2 = the frame is shown whole
- * in a 16:9 frame (the host presents it at 16:9), 3 = the frame is wide.
+ * in a 16:9 frame (the host presents it at 16:9), 3 = the frame is wide,
+ * 4 = the frame is shown whole in a centred 16:9 frame whatever the menus,
+ * its 2D as in a wide image on a 16:9 screen (pgraph_d3d11_set_box169).
  * k = (16/9) / screen shape; 0 (default) = off, nothing changes. */
 #define PGRAPH_BOX_TAG_MAGIC   0x4857u
 
@@ -216,6 +233,12 @@ void pgraph_d3d11_set_box_race2d(float k2d);
  * 0.75 for the 16:9 frame (default), 1 for the 4:3 frame (the menus at
  * 4:3: the image is already at the title's proportions). */
 void pgraph_d3d11_set_box_frame(float kboxed);
+/* Frame tag 4 (the title's staged shots in a race, wider than 16:9):
+ * k169 = (16/9) / screen shape. Such an image is drawn as a wide one, its
+ * 2D x-scales (race 2D, panels, proportional HUD) divided by k169, and the
+ * host presents it squeezed by k169 into a centred 16:9 frame: as a wide
+ * image on a 16:9 screen. 0 (default) = no such image. */
+void pgraph_d3d11_set_box169(float k169);
 /* How the terrain reads its lightmap (t1, an atlas of 8 x 8-texel tiles, one
  * texel per patch vertex): 0 the title's bilinear read, 1 bounded Catmull-
  * Rom (passes through the texels: the lighting is unchanged, only how finely

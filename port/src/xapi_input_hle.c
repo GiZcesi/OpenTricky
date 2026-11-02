@@ -38,7 +38,6 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include "netplay/np_net.h"
 #include <stdlib.h>
 
 #include "recomp/recomp_types.h"
@@ -92,7 +91,11 @@ static int pad_connected(unsigned port)
     if (g_pad_present[port] || now - g_pad_checked[port] >= 1000) {
         hle_state_t s;
         g_pad_checked[port] = now;
-        g_pad_present[port] = (xbox_InputGetState(port, &s) == 0);
+        /* the Xbox controller of the port's XInput index; with the experimental
+         * PlayStation controllers on, the controller (Xbox or PlayStation)
+         * that plays on the port (controls.c) */
+        g_pad_present[port] = controls_ps_on() ? controls_port_present(port)
+                                               : (xbox_InputGetState(port, &s) == 0);
     }
     return g_pad_present[port];
 }
@@ -353,12 +356,6 @@ void sub_00180B89(void)   /* XInputGetState */
         s.Gamepad.sThumbRX = cp.rx;
         s.Gamepad.sThumbRY = cp.ry;
         if (port == 0) autopress_into(&s);
-        /* online race: no pause (the others would wait), START is dropped; a build without the online
-         * mode has the constant 0 here */
-        if (port == 0 && np_net_block_pause()) s.Gamepad.wButtons &= (WORD)~0x0010u;   /* XINPUT_GAMEPAD_START */
-        /* online, after this player's arrival and until the final ranking (or the host gone, or the wait over):
-         * nothing reaches the game's results menu */
-        if (port == 0 && np_direct_block_menu()) memset(&s.Gamepad, 0, sizeof s.Gamepad);
         if (port == 1 && pad2_test()) {
             rc = 0;
             autopress_into(&s);
@@ -402,7 +399,14 @@ void sub_00180BFA(void)   /* XInputSetState -- rumble, completed at once */
         hle_vib_t v;
         v.wLeftMotorSpeed  = MEM16(fb + 0x42);
         v.wRightMotorSpeed = MEM16(fb + 0x44);
-        xbox_InputSetState((DWORD)port, &v);
+        /* The port's XInput index, as before; with the experimental
+         * PlayStation controllers on, the controller that plays on the port
+         * (not in a test run that ignores the physical pads, nor with the
+         * test controller: then as before) */
+        if (controls_ps_on() && host_input_enabled() && !controls_fake_enabled())
+            controls_port_rumble((DWORD)port, v.wLeftMotorSpeed, v.wRightMotorSpeed);
+        else
+            xbox_InputSetState((DWORD)port, &v);
         MEM32(fb + 0) = 0;       /* Header.dwStatus: done (the title polls it) */
     }
     hle_return(port >= 0 ? ERR_IO_PENDING : ERR_NOT_CONNECTED, 8);

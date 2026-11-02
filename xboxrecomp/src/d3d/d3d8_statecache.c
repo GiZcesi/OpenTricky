@@ -27,6 +27,7 @@ static struct {
     ID3D11SamplerState *smp[16]; unsigned smp_ok;
     ID3D11Buffer *vcb[4]; UINT vfirst[4], vnum[4]; unsigned vcb_ok;   /* num 0 = bound without offset */
     ID3D11Buffer *pcb[4]; UINT pfirst[4], pnum[4]; unsigned pcb_ok;
+    ID3D11ShaderResourceView *srv[16]; unsigned srv_ok;            /* pixel-shader textures */
 } S;
 
 int d3d8_pump_state_on(void);           /* d3d8_nv2a.c (switch + alternation) */
@@ -163,6 +164,82 @@ void sc_PSSetShader(ID3D11DeviceContext *c, ID3D11PixelShader *s, ID3D11ClassIns
     VT(c)->PSSetShader(c, s, ci, nci);
 }
 
+/* (XBOX_FIX_PUMP_SRV, default 1; with XBOX_FIX_PUMP_STATE, and off on
+ * the frames XBOX_FIX_PUMP_ALT turns the pump optimizations off): the pixel
+ * shader's textures, filtered like the other bindings. The runtime unbinds a
+ * texture by itself only when its resource is bound for output; every
+ * render-target change forgets them all (sc_OMSetRenderTargets), so a skipped
+ * call always leaves the slot as the real call would have: the same view, or,
+ * for a resource still bound as a target, NULL as the runtime forces it.
+ * The mirror holds a reference on every view it records (a view the runtime
+ * forced to NULL has no other), so a recorded pointer can never be a new view
+ * created at the same address. */
+static int srv_skip_ok(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_SRV"); on = !(e && e[0] == '0'); }
+    return on && skip_ok();
+}
+
+/* Forgets every recorded view (and drops the mirror's references). */
+static void srv_forget(void)
+{
+    unsigned i;
+    for (i = 0; i < 16; i++)
+        if (S.srv[i]) { ID3D11ShaderResourceView_Release(S.srv[i]); S.srv[i] = NULL; }
+    S.srv_ok = 0;
+}
+
+void sc_PSSetShaderResources(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11ShaderResourceView *const *v)
+{
+    if (mine(c)) {
+        UINT i;
+        int same = start + n <= 16 && v && n;
+        for (i = 0; same && i < n; i++)
+            same = (S.srv_ok >> (start + i) & 1u) && S.srv[start + i] == v[i];
+        if (same && srv_skip_ok()) { if (g_perf_detail) perf_count(PC_SRVSKIP, 1); return; }   /* counted where it skips only: XBOX_PERF_DETAIL */
+        for (i = 0; i < n && start + i < 16; i++) {
+            UINT s = start + i;
+            ID3D11ShaderResourceView *nv = v ? v[i] : NULL;
+            if (nv) ID3D11ShaderResourceView_AddRef(nv);
+            if (S.srv[s]) ID3D11ShaderResourceView_Release(S.srv[s]);
+            S.srv[s] = nv;
+            if (v) S.srv_ok |= 1u << s;
+            else S.srv_ok &= ~(1u << s);
+        }
+    }
+    VT(c)->PSSetShaderResources(c, start, n, v);
+}
+
+void sc_OMSetRenderTargets(ID3D11DeviceContext *c, UINT n, ID3D11RenderTargetView *const *rtv, ID3D11DepthStencilView *dsv)
+{
+    if (mine(c)) srv_forget();          /* the runtime may unbind textures now bound for output */
+    VT(c)->OMSetRenderTargets(c, n, rtv, dsv);
+}
+
+void sc_OMSetRenderTargetsAndUnorderedAccessViews(ID3D11DeviceContext *c, UINT n, ID3D11RenderTargetView *const *rtv,
+                                                  ID3D11DepthStencilView *dsv, UINT uav_start, UINT nuav,
+                                                  ID3D11UnorderedAccessView *const *uav, const UINT *counts)
+{
+    if (mine(c)) srv_forget();
+    VT(c)->OMSetRenderTargetsAndUnorderedAccessViews(c, n, rtv, dsv, uav_start, nuav, uav, counts);
+}
+
+/* Anything else that may change what is bound behind the mirror's back (a
+ * buffer resize). Same thread as the context's other calls. */
+void sc_ForgetTextures(void) { srv_forget(); }
+
+/* Everything recorded forgotten, the views' references dropped: after code
+ * that binds through the context directly. The tuning panel (development
+ * builds) restores what it changed that way, the vertex
+ * constant buffer without its offset: a constant-ring binding the mirror
+ * still recorded would otherwise be skipped while slot 0 reads the ring from
+ * its start. Present too, once per frame: the runtime may unbind the back
+ * buffer there (flip model), and an overlay hooked on Present (a third-party
+ * tool drawing over the game) changes bindings and restores them
+ * the same way. Every next call goes through. */
+void sc_ForgetAll(void) { srv_forget(); memset(&S, 0, sizeof S); }
+
 void sc_PSSetSamplers(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11SamplerState *const *s)
 {
     if (mine(c)) {
@@ -253,12 +330,12 @@ void sc_PSSetConstantBuffers1(ID3D11DeviceContext1 *c, UINT start, UINT n, ID3D1
 
 void sc_ClearState(ID3D11DeviceContext *c)
 {
-    if (mine(c)) memset(&S, 0, sizeof S);
+    if (mine(c)) { srv_forget(); memset(&S, 0, sizeof S); }   /* the views' references first */
     VT(c)->ClearState(c);
 }
 
 void sc_ClearState1(ID3D11DeviceContext1 *c)
 {
-    if (mine((ID3D11DeviceContext *)c)) memset(&S, 0, sizeof S);
+    if (mine((ID3D11DeviceContext *)c)) { srv_forget(); memset(&S, 0, sizeof S); }
     VT(c)->ClearState(c);
 }
