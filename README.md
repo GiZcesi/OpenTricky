@@ -9,37 +9,18 @@
 
 <p align="center">
   <a href="https://opentricky.com"><img alt="Website: opentricky.com" src="https://img.shields.io/badge/website-opentricky.com-0b5cd5"></a>
-  <a href="https://github.com/GiZcesi/OpenTricky/releases"><img alt="Release" src="https://img.shields.io/github/v/release/GiZcesi/OpenTricky?label=release&color=green"></a>
-  <img alt="Status: stable" src="https://img.shields.io/badge/status-stable-green">
-  <img alt="Platform: Windows 10/11 x64, Linux / Steam Deck (Proton)" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64%20%C2%B7%20Linux%20%2F%20Steam%20Deck%20(Proton)-blue">
-  <img alt="Graphics: Direct3D 11" src="https://img.shields.io/badge/graphics-Direct3D%2011-blue">
-  <a href="LICENSE"><img alt="License: GPL-3.0-only" src="https://img.shields.io/badge/license-GPL--3.0--only-green"></a>
+  <a href="https://github.com/GiZcesi/OpenTricky/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/GiZcesi/OpenTricky?label=release&color=green"></a>
   <a href="https://discord.gg/r38sThsqnj"><img alt="Discord" src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white"></a>
   <a href="https://ko-fi.com/giz_music/"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-buy%20me%20a%20coffee-FF5E5B?logo=ko-fi&logoColor=white"></a>
 </p>
 
-<p align="center"><b>Join the <a href="https://discord.gg/r38sThsqnj">OpenTricky Discord</a></b> for help, screenshots and news about the next builds.</p>
+<p align="center">
+  <img width="49%" alt="Screenshot: a Showoff at sunset" src="https://github.com/user-attachments/assets/730af3cb-192e-4383-9518-7ed4474719bb" />
+  <img width="49%" alt="Screenshot: Tokyo Megaplex" src="https://github.com/user-attachments/assets/c170d174-e8dd-491a-9ad1-54dc1adf8032" />
+</p>
 
 > [!IMPORTANT]
 > **You need your own game.** No disc image, music or video from the game is distributed: you need a disc image (`.iso` or `.xiso`) of ***SSX Tricky* for the original Xbox, USA release**.
-
----
-
-## Contents
-
-- [What is this?](#what-is-this)
-- [What's new in 0.1.5](#whats-new-in-015)
-- [What's new in 0.1.4](#whats-new-in-014)
-- [Install and play](#install-and-play)
-- [Controls and settings](#controls-and-settings)
-- [Known issues](#known-issues)
-- [FAQ](#faq)
-- [Building from source](#building-from-source)
-- [Reporting a bug](#reporting-a-bug)
-- [Credits](#credits)
-- [Legal](#legal)
-
----
 
 ## What is this?
 
@@ -47,50 +28,32 @@ OpenTricky runs *SSX Tricky* (2001) natively on Windows. It is not an emulator: 
 [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and compiled into an ordinary Windows program, and the Xbox's graphics, sound and input chips
 are reimplemented on Direct3D 11, XAudio2 and XInput. OpenTricky continues [**SSX Tricky PC**](https://github.com/MatiasRiveraC/SSX-Tricky-PC) by MatiasRiveraC.
 
-The goals:
+- **Feature complete**: built from the original game, with all its features restored (fog, lens flares, colours, 5.1 sound).
+- **A modern PC release**: Xbox and PlayStation controllers, the original PS2 controls, Xbox, PlayStation and PS2 button styles, full remapping, any resolution, ultrawide and high frame rates, all set up in one launcher.
+- **New options on top**: smoother edges, soft shadows, longer draw distance, HD HUD. The *Original Xbox* preset turns them all off at once.
 
-1. **Feature complete.** Built from the original game, with all its features restored: fog, lens flares, colours, 5.1 sound.
-2. **A modern PC release**: modern controllers and button styles (Xbox, PlayStation, PS2 original), the original PS2 controls with all 15 grabs, full keyboard and controller remapping, any resolution, ultrawide, high frame rates, all set up in one launcher.
-3. **New options on top**: smoother edges, soft shadows, longer draw distance, optional HD textures. The *Original Xbox* preset turns them all off at once.
+## Latest: 0.1.5
 
-## What's new in 0.1.5
-
-Faster when the processor is the limit, and a round of fixes.
-- **Faster**: the part of OpenTricky that turns the game's graphics commands into Direct3D 11 does less work for the same picture: on our test PC, without a frame rate limit, 24 to 31% more frames per second than 0.1.4.
+- **Faster**: on our test PC, without a frame rate limit, 24 to 31% more frames per second than 0.1.4.
 - **Closer to the original game**: the sun's glare no longer drops out when the graphics card falls behind, and the game's videos play at their own pace.
-- **Fixes**: split screen at *Draw distance Max* keeps its colours; a camera cut above 60 FPS no longer slides between the two shots; on screens wider than 16:9, the scene after the finish line is shown in a 16:9 frame instead of cropped (the Top 5 and the replay stay wide); *Find my disc image* no longer crashes the launcher; the launcher no longer deletes files that aren't its own; F12 screenshots go to `Documents\My Games\SSX Tricky\Screenshots` when the game's folder can't be written.
-- **Weather** (*Graphics*): when it snows, *PS2* leaves out the original game's thick fog, as in the PS2 version, so the night sky and the distant slopes stay in view; the falling snow itself is the original game's. *PS2* is the value of *Recommended* and *Steam Deck*; *Original Xbox* keeps the fog.
-- **PlayStation controllers (experimental)** (*Controls*, Off by default): the DualShock 4 and DualSense work without any other tool.
-- **Presets**: above 60 FPS, *Smoother legs in turns* (on in *Recommended*) now catches up with the game over one game step, without a jump; the *Steam Deck* preset turns it off, with *Smoother terrain seams* and *Lightmap smoothing*.
-
-## What's new in 0.1.4
-
-The first stable release.
-- **Closer to the original game**: no more flickering towers on Garibaldi or windows on Merqury City, and the race display (Tricky meter, rival icon, trick names) behaves at any frame rate and *Race HUD size*.
-- **Steadier frames**: at 60 FPS with *VSync* on, on a 60, 120 or 240 Hz screen that reports its refresh timing, almost every frame stays on screen for the same time; on a screen above 60 Hz, *Match screen* follows the screen's exact refresh rate, with less delay than 0.1.3.
-- **New options**: *HD HUD*, *Render scale*, *Lightmap smoothing*, *Snow look*, *Shadow softness*, *Smoother terrain seams*; *Texture filtering* 16x in *Recommended*. HUD art by Bl4ckH4nd.
-- **Stability**: rare freezes and crashes fixed, and `settings.ini` is saved safely.
-- **Launcher**: *Find my disc image* (click the disc label at the top), *Check now* and *Cancel* for updates, and menus that work with every connected controller.
+- **Fixes**: split screen at *Draw distance Max*, camera cuts above 60 FPS, the scene after the finish line on screens wider than 16:9, and *Find my disc image*.
+- **New settings**: *Weather* (snowfall without the thick fog, as in the PS2 version) and *PlayStation controllers (experimental)*.
 
 Everything else: the [release notes](https://github.com/GiZcesi/OpenTricky/releases) and [CHANGELOG.md](CHANGELOG.md).
 
 ## Install and play
 
-**You need** Windows 10 or 11 (64-bit), a Direct3D 11 graphics card, and a disc image (`.iso` or `.xiso`) of your own ***SSX Tricky* Xbox disc, USA release**
-(the PS2, GameCube, PAL and Japanese versions won't work). A controller is optional: Xbox-style (XInput) controllers and the keyboard work, and the DualShock 4 and DualSense with *PlayStation controllers (experimental)* in *Controls*.
+**You need** Windows 10 or 11 (64-bit), or Linux / Steam Deck with Proton, a Direct3D 11 graphics card, and a disc image of your own ***SSX Tricky* Xbox disc, USA release**
+(the PS2, GameCube, PAL and Japanese versions won't work).
 
-1. Download `OpenTricky-<version>-win64.zip` from [**Releases**](https://github.com/GiZcesi/OpenTricky/releases) and extract it into a new, empty folder.
-2. Start **`OpenTricky.exe`**, the launcher, and choose your disc image: the launcher checks it and remembers it.
+1. Download `OpenTricky-<version>-win64.zip` from [**Releases**](https://github.com/GiZcesi/OpenTricky/releases/latest) and extract it into a new, empty folder.
+2. Start **`OpenTricky.exe`**, the launcher, and choose your disc image.
 3. Pick a preset or your own settings, then press **PLAY**.
 
-The game itself is `bin\SSX Tricky.exe`: it also starts the game straight away, with the same settings.
-
-**Coming from 0.1.2, 0.1.3 or 0.1.4:** let the launcher update you; your saves, settings and disc image are kept, and a preset takes its new values (if no update shows up: the 0.1.4 launcher has *Check now* in *Settings > Advanced > Updates*; a 0.1.2 or 0.1.3 launcher checks GitHub once a day, so close it, delete `update-cache.txt` next to `settings.ini`, and open it again). **Coming from 0.1.1:** install 0.1.5 fresh, in a new folder (the 0.1.1 launcher can't install it). Saves in `Documents\My Games\SSX Tricky\Saves` stay where they are; if your saves were inside the old folder (a `Saves` folder with `portable.txt`, or an `hdd` folder), copy that folder (and `portable.txt`) into the new one. Don't copy `settings.ini`: choose your disc image again (and your save folder, if you had chosen one), make your shortcuts again (the game is now `bin\SSX Tricky.exe`), then delete the old folder.
+**Updating:** the launcher installs new versions for you, only if you say so, and keeps your saves, settings and disc image. Coming from 0.1.1, or no update showing up: see the [install guide](https://opentricky.com/install#upgrade).
 
 > [!NOTE]
 > Windows SmartScreen may warn you because the program isn't code-signed. If you trust the download, choose **More info → Run anyway**.
-
-The launcher also installs the next versions for you, only if you say so. More in the [install guide](https://opentricky.com/install).
 
 ## Controls and settings
 
@@ -105,31 +68,29 @@ The game uses the **original PS2 layout**. Everything can be remapped in the lau
 | L3 (press the left stick) | Left stick press | `X` |
 | Left stick and D-pad | Left stick and D-pad | Arrow keys |
 
-In the game window: `Alt+Enter` or `F11` switches window / fullscreen, `F12` takes a screenshot and `Shift+F12` a burst, `Alt+F4` quits.
+In the game window: `Alt+Enter` or `F11` for window / fullscreen, `F12` for a screenshot, `Alt+F4` to quit.
 
-All settings are in the launcher, in six tabs (*Display*, *Graphics*, *Audio*, *Controls*, *Game*, *Advanced*). Three presets set the main ones at once:
-**Recommended** (the default), *Original Xbox* (60 FPS and every *Graphics* option at its original value) and *Steam Deck* (1280×800, 60 FPS).
-Every setting, with its choices and default, is explained in the [**Settings guide**](https://opentricky.com/settings) and the [controls page](https://opentricky.com/controls).
+Three presets set the main ones at once: **Recommended** (the default), *Original Xbox* (60 FPS, every *Graphics* option at its original value) and *Steam Deck* (1280×800, 60 FPS).
+Every setting is explained in the [**Settings guide**](https://opentricky.com/settings).
 
 ## Known issues
-
-The main ones, most serious first. The full list is on [opentricky.com/known-issues](https://opentricky.com/known-issues).
 
 | Problem | What to do |
 |---|---|
 | **Above 60 FPS, the controls respond one game step later** (about 17 ms). | Set *Frame rate limit* to *60 (Xbox)* for the original game's exact timing. |
-| **Natively, only Xbox-style (XInput) controllers are supported, and the DualShock 4 and DualSense with *PlayStation controllers (experimental)*.** | For other controllers, use Steam Input or DS4Windows, and choose *PlayStation modern* or *PS2 original* in *Button style*. |
-| **Linux / Steam Deck (Proton):** with Proton Experimental, performance may be lower. Report it with your logs. | Through Steam, pick *Proton 10* in *Properties → Compatibility*. Or, in Desktop Mode, run `OpenTricky.exe` with **PortProton** (Flatpak): WINE *PROTON_LG_10-28*, 3D API *DXVK (Newest)*, then the *Steam Deck* preset in the launcher. |
-| **At 60 FPS on a 60 Hz screen that doesn't report its refresh timing** (the Steam Deck, some laptops), frames can wait in a queue and reach the screen later than in 0.1.3. | Nothing to do. |
+| **Natively, only Xbox-style (XInput) controllers**, and the DualShock 4 and DualSense with *PlayStation controllers (experimental)*. | For other controllers, use Steam Input or DS4Windows. |
 
-## FAQ
+The full list, with the details: [opentricky.com/known-issues](https://opentricky.com/known-issues).
 
-Disc images, saves, updates, frame rates, controllers, Linux and the Steam Deck, help when something goes wrong:
-every answer is on [**opentricky.com/faq**](https://opentricky.com/faq).
+## Help
+
+- **Questions** about disc images, saves, updates, frame rates, controllers or the Steam Deck: the [**FAQ**](https://opentricky.com/faq).
+- **A bug?** Open an [issue](https://github.com/GiZcesi/OpenTricky/issues/new/choose) or post in #bug-reports on the [Discord](https://discord.gg/r38sThsqnj), with the zip from *Settings → Advanced → Bug report → Prepare…* (also offered after a crash). Nothing is ever sent by itself.
 
 ## Building from source
 
-The game code is translated **on your own PC, from your own disc image**. It is never in this repository.
+<details>
+<summary>The game code is translated <b>on your own PC, from your own disc image</b>. It is never in this repository.</summary>
 
 1. Install [MSYS2](https://www.msys2.org/), then run this in its **UCRT64** shell:
    ```bash
@@ -147,14 +108,10 @@ The game code is translated **on your own PC, from your own disc image**. It is 
 The script reads `default.xbe` from your disc image, translates it to C, applies the port's fix-up passes, then compiles the game and the launcher into `dist/OpenTricky/`.
 No other tool is needed. [docs/building.md](docs/building.md) has the details.
 
+</details>
+
 > [!CAUTION]
 > Please don't share your build: point people to the releases here instead.
-
-## Reporting a bug
-
-Open an [issue](https://github.com/GiZcesi/OpenTricky/issues/new/choose), or post in #bug-reports on the [Discord](https://discord.gg/r38sThsqnj), with the version
-(*Settings → Advanced → About OpenTricky*), your settings, your PC, and `SSX Tricky.log` (next to `settings.ini`) or the zip from *Settings → Advanced → Bug report → Prepare…* (also offered after a crash).
-Nothing is ever sent by itself. More in [Help & bug reports](https://opentricky.com/faq#help).
 
 ## Credits
 
@@ -174,13 +131,8 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ## Legal
 
-- OpenTricky is an unofficial fan project. It is not affiliated with or endorsed by Electronic Arts, EA Canada or Microsoft.
-  *SSX* and *SSX Tricky* are trademarks of Electronic Arts, and Xbox is a trademark of Microsoft.
-- **No disc image, music or video from the game is distributed.** You need your own copy of the game.
-- Licences: OpenTricky's code is under the **GNU General Public License v3.0 only** (`GPL-3.0-only`, see [LICENSE](LICENSE)), unless a file says otherwise.
-  `xboxrecomp/` keeps its MIT licence (`xboxrecomp/LICENSE`). Files adapted from xemu stay under LGPL-2.1-or-later, as their headers say. SMAA is MIT.
-  The launcher uses RmlUi (MIT), SDL 3 (zlib), FreeType (FreeType License) and the fonts Inter and Exo 2 (SIL Open Font License);
-  their licences are in `port/third_party/` and `port/launcher/app/ui/fonts/`, and in `THIRD-PARTY-LICENSES.txt` in the release.
-  The Bullet font (House Industries) has its own licence and is not covered by these licences (see `port/launcher/app/licenses-head.txt`).
+- OpenTricky is an unofficial fan project, not affiliated with or endorsed by Electronic Arts, EA Canada or Microsoft. *SSX* and *SSX Tricky* are trademarks of Electronic Arts, and Xbox is a trademark of Microsoft. **No disc image, music or video from the game is distributed.**
+- OpenTricky's code is under the **GNU General Public License v3.0 only** (`GPL-3.0-only`, see [LICENSE](LICENSE)), unless a file says otherwise: `xboxrecomp/` keeps its MIT licence, files adapted from xemu stay under LGPL-2.1-or-later, and SMAA is MIT.
+  The other licences (RmlUi, SDL 3, FreeType, and the fonts Inter and Exo 2) are in `port/third_party/`, `port/launcher/app/ui/fonts/` and the release's `THIRD-PARTY-LICENSES.txt`; the Bullet font (House Industries) has its own licence (`port/launcher/app/licenses-head.txt`).
   Portions of this software are copyright © 2026 The FreeType Project (https://freetype.org). All rights reserved.
 - Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
