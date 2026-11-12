@@ -320,3 +320,40 @@ void vshcpu_format(const vshcpu_insn *i, char *buf, int len)
              s[0], s[1], s[2], i->orb ? "o" : "c", i->out_addr, i->o_mask,
              i->out_mux ? "ilu" : "mac", i->final ? " FINAL" : "");
 }
+
+uint64_t vshcpu_digest(const vshcpu_insn *p, int n, uint16_t *inputs, int *writes_c)
+{
+    uint64_t h = 14695981039346656037ull;
+    uint16_t in = 0;
+    int k, j, wc = 0;
+    for (k = 0; k < n; k++) {
+        const uint8_t *b = (const uint8_t *)&p[k];
+        size_t q;
+        for (j = 0; j < 3; j++)
+            if (p[k].src[j].mux == MUX_V)
+                in |= (uint16_t)(1u << p[k].vidx);
+        if (p[k].o_mask && !p[k].orb)
+            wc = 1;
+        for (q = 0; q < sizeof p[k]; q++)
+            h = (h ^ b[q]) * 1099511628211ull;
+    }
+    if (inputs) *inputs = in;
+    if (writes_c) *writes_c = wc;
+    return h;
+}
+
+void vshcpu_t0z_append(vshcpu_insn *p, int n, uint16_t *inputs, uint64_t *hash)
+{
+    vshcpu_insn *ins = &p[n];
+    memset(ins, 0, sizeof *ins);
+    ins->mac = MAC_MOV;
+    ins->vidx = 15;
+    ins->src[0].mux = MUX_V;
+    ins->o_mask = 2;                    /* z */
+    ins->orb = 1;                       /* output register */
+    ins->out_addr = VSHCPU_OUT_T0;
+    ins->final = 1;
+    p[n - 1].final = 0;
+    *inputs = (uint16_t)(*inputs | 0x8000u);
+    *hash = (*hash ^ 0x5EA3B1E7D0C4A1F5ull) * 1099511628211ull;
+}

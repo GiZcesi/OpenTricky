@@ -22,6 +22,13 @@
  *
  * XBOX_FRAME_CLOCK=0: off, the title's own expiries (diagnostic comparison).
  *
+ * The presenting thread can shift this grid against the title's own points, so
+ * that its phase follows the display's refreshes (d3d8_sync.c, follow_refresh);
+ * the shift is taken at the next callback. The same callbacks run in the same
+ * order and each does the same; only their instants move. The title's own
+ * points do not move: its accumulator stays near -shift, and its catch-up
+ * starts below -13.7 ms (delay <= 2 ms), which bounds the shift from above.
+ *
  * The grid point of each callback is also the time its tick was produced:
  * the interpolation above 60 fps measures every image from it
  * (frame_clock_tick_ref), rather than from the moment the main loop saw the
@@ -39,7 +46,7 @@
 void sub_000B26A0(void);                       /* Application_FrameTimerCallback_StdcallThunk (stdcall, ret 20) */
 extern LONGLONG (*g_xbox_ktimer_due_filter)(uint32_t timer_va, LONGLONG rel_100ns);
 LONGLONG xbox_kt_qpf(void);
-void d3d8_sync_set_frame_clock(void);                                         /* d3d8_sync.h */
+void d3d8_sync_set_frame_clock(void (*shift)(double ms));                      /* d3d8_sync.h */
 
 #define FRAME_CB        0x000B26A0u
 #define SLOT_PROC       0x28u                  /* XAPI timeSetEvent entry: lpTimeProc */
@@ -52,7 +59,9 @@ void d3d8_sync_set_frame_clock(void);                                         /*
 static struct {
     int on;
     double qf;
-    double next;                /* planned instant of the next callback (ms, QPC) */
+    double next;                /* planned instant of the next callback (ms, QPC), the shift included */
+    double shift;               /* the grid against the title's own points (ms), included in next */
+    volatile double want;       /* shift asked by the presenting thread, applied at the next callback */
     uint32_t user;
     /* The tick of the last callback (frame_clock_tick_ref): its grid point, the
      * callbacks entered so far and the one that set it. */
@@ -74,8 +83,11 @@ static LONGLONG due_filter(uint32_t timer_va, LONGLONG rel_100ns)
     if (MEM32(timer_va + SLOT_PROC) != FRAME_CB) return 0;
     F.user = MEM32(timer_va + SLOT_USER);
     natural = now_ms() + (double)rel_100ns / 1e4;
-    grid = F.next;
-    if (F.next <= 0.0 || fabs(natural - grid) > REANCHOR_MS) F.next = natural;
+    /* The title's own point of the grid: ours without the shift. */
+    grid = F.next - F.shift;
+    if (F.next <= 0.0 || fabs(natural - grid) > REANCHOR_MS) {
+        F.next = natural + F.shift;
+    }
     return (LONGLONG)((F.next - EARLY_MS) * F.qf / 1000.0);
 }
 
@@ -108,6 +120,11 @@ void hook_fclock_000B26A0(void)
         ref = fire - plan > 0.5 * PERIOD_MS ? fire : plan;
         /* the next point of the grid; far behind (a stall): from now */
         F.next = fire - plan > 0.5 * PERIOD_MS ? fire + PERIOD_MS : plan + PERIOD_MS;
+        {   /* the shift asked since, on this thread only */
+            double w = F.want;
+            F.next += w - F.shift;
+            F.shift = w;
+        }
     }
     /* The callback produces its tick now (pad sample, frame event): counted
      * first, then its time published (frame_clock_tick_ref reads in the
@@ -122,6 +139,10 @@ void hook_fclock_000B26A0(void)
 }
 
 int frame_clock_on(void) { return F.on; }
+
+/* The presenting thread: the grid's shift against the title's own points (ms),
+ * applied by the timer's thread at its next callback. */
+static void shift_grid(double ms) { F.want = ms; }
 
 /* Any thread: the time (QPC ms) the tick of the last callback was produced,
  * its point of the grid; 0 when unknown (clock off, the last callback outside
@@ -147,7 +168,7 @@ void frame_clock_init(void)
     F.qf = (double)xbox_kt_qpf();
     if (F.on) {
         g_xbox_ktimer_due_filter = due_filter;
-        d3d8_sync_set_frame_clock();
+        d3d8_sync_set_frame_clock(shift_grid);
     }
     fprintf(stderr, "[FCLOCK] XBOX_FRAME_CLOCK=%d (%s)\n", F.on,
             F.on ? "the title's frame timer on an exact 60 Hz grid" : "the title's whole-millisecond expiries");

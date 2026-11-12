@@ -483,11 +483,26 @@ void xbox_pfifo_get_wait(volatile uint32_t *get, uint32_t seen, uint32_t spins);
  * XBOX_FIX_OCCLWAIT=count); with the developer tools it reads XBOX_OCCLWAIT_BOUND_MS,
  * XBOX_OCCLWAIT_LOOP, XBOX_OCCLWAIT_LOOP_MARGIN and XBOX_OCCLWAIT_TRACE.
  * xbox_occl_wake: the pump, just after it wrote a report's status.
+ * xbox_occl_set_older: the frame limit, on above 60 and off at 60: above 60 a
+ * report still pending at the title's first read is read as its halo's own
+ * newest count, without a wait (see the .c); xbox_occl_older_on: the pump,
+ * which then sends no query early.
+ * xbox_occl_rect / xbox_occl_emit: generated code (fork pass fix_occlemit.py),
+ * the game thread: a visibility rectangle given out to a halo, and the number
+ * the title gave that rectangle's test. The pump:
+ * xbox_occl_request when it translates a report (its 16 bytes; returns the
+ * halo's slot, -1 if not sure), xbox_occl_written when it writes one.
  */
 void xbox_occl_wait_init(int count);
 uint32_t xbox_occl_wait(volatile uint32_t *status, uint32_t rounds);
 void xbox_occl_wake(void);
 void xbox_occl_wait_report(void);
+void xbox_occl_set_older(int on);
+int xbox_occl_older_on(void);
+void xbox_occl_emit(uint32_t number, uint32_t rect);
+void xbox_occl_rect(uint32_t rect, uint32_t halo, uint32_t ctx);
+int xbox_occl_request(const volatile void *report);
+void xbox_occl_written(int halo, const volatile void *report, uint32_t count);
 
 #ifdef __cplusplus
 }

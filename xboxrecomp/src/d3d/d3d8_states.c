@@ -26,10 +26,14 @@ static ID3D11DepthStencilState *g_ds_state = NULL;
 static ID3D11RasterizerState   *g_raster_state = NULL;
 static ID3D11SamplerState      *g_sampler_states[4] = { NULL, NULL, NULL, NULL };
 
-/* Last known render state hash for dirty detection */
-static DWORD g_last_blend_hash = 0;
-static DWORD g_last_ds_hash = 0;
-static DWORD g_last_raster_hash = 0;
+/* The render states each object above was last built from (its key), for
+ * dirty detection: see states_key. */
+#define BLEND_KEY  5
+#define DS_KEY     10
+#define RASTER_KEY 3
+static DWORD g_last_blend_key[BLEND_KEY];
+static DWORD g_last_ds_key[DS_KEY];
+static DWORD g_last_raster_key[RASTER_KEY];
 
 /* NV2A window clip as a scissor rectangle. The frontend draws with
  * the window clip set to the TV-safe area (30..609 x 22..457) and clears with
@@ -124,42 +128,25 @@ static D3D11_BLEND_OP d3d8_to_d3d11_blendop(DWORD op)
     }
 }
 
-/* Hash of the render states each D3D11 state object is built from, for dirty
- * detection. These were XORs of shifted values, which collide (and
- * the depth-stencil one left out the stencil ops and write mask, so a change
- * of op alone reused the old state object). FNV-1a over every input. */
-static DWORD hash_states(const DWORD *rs, const int *idx, int n)
+/* The key of a D3D11 state object: every render state it is built from, in
+ * a fixed order, kept and compared whole for dirty detection. The
+ * old XORs of shifted values collided (and the depth-stencil one left out
+ * the stencil ops and write mask, so a change of op alone reused the old
+ * state object); the FNV-1a hash that replaced them was still trusted alone,
+ * and 1 332 pairs of depth / stencil combinations share one (the second of
+ * two such draws in a row would have kept the first one's object). */
+static const int k_blend_rs[BLEND_KEY] = {
+    D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE };
+static const int k_ds_rs[DS_KEY] = {
+    D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC,
+    D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK,
+    D3DRS_STENCILWRITEMASK, D3DRS_STENCILFAIL, D3DRS_STENCILZFAIL, D3DRS_STENCILPASS };
+static const int k_raster_rs[RASTER_KEY - 1] = { D3DRS_CULLMODE, D3DRS_FILLMODE };  /* + the window clip */
+
+static void states_key(const DWORD *rs, const int *idx, int n, DWORD *key)
 {
-    DWORD h = 2166136261u;
     int i;
-    for (i = 0; i < n; i++) {
-        DWORD v = rs[idx[i]];
-        int k;
-        for (k = 0; k < 4; k++) { h ^= (v >> (8 * k)) & 0xFF; h *= 16777619u; }
-    }
-    return h;
-}
-
-static DWORD hash_blend_states(const DWORD *rs)
-{
-    static const int idx[] = { D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
-                               D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE };
-    return hash_states(rs, idx, (int)(sizeof idx / sizeof idx[0]));
-}
-
-static DWORD hash_ds_states(const DWORD *rs)
-{
-    static const int idx[] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC,
-                               D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK,
-                               D3DRS_STENCILWRITEMASK, D3DRS_STENCILFAIL, D3DRS_STENCILZFAIL,
-                               D3DRS_STENCILPASS };
-    return hash_states(rs, idx, (int)(sizeof idx / sizeof idx[0]));
-}
-
-static DWORD hash_raster_states(const DWORD *rs)
-{
-    static const int idx[] = { D3DRS_CULLMODE, D3DRS_FILLMODE };
-    return hash_states(rs, idx, (int)(sizeof idx / sizeof idx[0]));
+    for (i = 0; i < n; i++) key[i] = rs[idx[i]];
 }
 
 /* ================================================================
@@ -168,12 +155,13 @@ static DWORD hash_raster_states(const DWORD *rs)
 
 static void update_blend_state(const DWORD *rs)
 {
-    DWORD hash = hash_blend_states(rs);
+    DWORD key[BLEND_KEY];
     D3D11_BLEND_DESC bd;
     HRESULT hr;
 
-    if (hash == g_last_blend_hash && g_blend_state) return;
-    g_last_blend_hash = hash;
+    states_key(rs, k_blend_rs, BLEND_KEY, key);
+    if (g_blend_state && !memcmp(key, g_last_blend_key, sizeof key)) return;
+    memcpy(g_last_blend_key, key, sizeof key);
 
     if (g_blend_state) {
         ID3D11BlendState_Release(g_blend_state);
@@ -200,12 +188,13 @@ static void update_blend_state(const DWORD *rs)
 
 static void update_depth_stencil_state(const DWORD *rs)
 {
-    DWORD hash = hash_ds_states(rs);
+    DWORD key[DS_KEY];
     D3D11_DEPTH_STENCIL_DESC dsd;
     HRESULT hr;
 
-    if (hash == g_last_ds_hash && g_ds_state) return;
-    g_last_ds_hash = hash;
+    states_key(rs, k_ds_rs, DS_KEY, key);
+    if (g_ds_state && !memcmp(key, g_last_ds_key, sizeof key)) return;
+    memcpy(g_last_ds_key, key, sizeof key);
 
     if (g_ds_state) {
         ID3D11DepthStencilState_Release(g_ds_state);
@@ -235,12 +224,14 @@ static void update_depth_stencil_state(const DWORD *rs)
 
 static void update_rasterizer_state(const DWORD *rs)
 {
-    DWORD hash = hash_raster_states(rs) ^ (g_wclip_on ? 0x9E3779B9u : 0u);
+    DWORD key[RASTER_KEY];
     D3D11_RASTERIZER_DESC rd;
     HRESULT hr;
 
-    if (hash == g_last_raster_hash && g_raster_state) return;
-    g_last_raster_hash = hash;
+    states_key(rs, k_raster_rs, RASTER_KEY - 1, key);
+    key[RASTER_KEY - 1] = g_wclip_on ? 1u : 0u;
+    if (g_raster_state && !memcmp(key, g_last_raster_key, sizeof key)) return;
+    memcpy(g_last_raster_key, key, sizeof key);
 
     if (g_raster_state) {
         ID3D11RasterizerState_Release(g_raster_state);
@@ -398,20 +389,16 @@ void d3d8_states_apply_sampler(DWORD stage)
  * from tables keyed by every render / stage state they are built from, and
  * compared on all of it -- the one-entry caches above release and recreate
  * an object whenever two draws in a row differ (a trip into the runtime,
- * which then hands back the object it already had), and their 32-bit hash
- * can collide. Same descriptions, same objects as D3D11 would return; the
- * tables own their objects for the life of the device. Off on the frames
+ * which then hands back the object it already had). Same descriptions, same
+ * objects as D3D11 would return; the tables own their objects for the life
+ * of the device. Off on the frames
  * XBOX_FIX_PUMP_ALT turns the pump optimizations off.
  * ================================================================ */
 
 extern int d3d8_pump_alt_off(void);
+#include "d3d8_pumpflags.h"
 
-static int pump_sobj_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_SOBJ"); on = !(e && e[0] == '0'); }
-    return on && !d3d8_pump_alt_off();
-}
+static int pump_sobj_on(void) { return (d3d8_pump_flags() & PF_SOBJ) != 0; }   /* d3d8_pumpflags.h */
 
 #define SO_TAB 256                      /* per kind; far more than the title uses */
 #define SO_KEY 14                       /* DWORDs of a key (the sampler description is 13) */
@@ -531,12 +518,7 @@ static const D3DTEXTURESTAGESTATETYPE k_smemo_tss[8] = {
 };
 static struct { DWORD in[10]; ID3D11SamplerState *ss; } s_smemo[4];
 
-static int pump_smemo_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_SMEMO"); on = !(e && e[0] == '0'); }
-    return on && !d3d8_pump_alt_off();
-}
+static int pump_smemo_on(void) { return (d3d8_pump_flags() & PF_SMEMO) != 0; }
 
 /* ctx: the caller's context; memo: pump_smemo_on(), decided by the caller
  * once per draw (XBOX_FIX_PUMP_ALT changes only from one frame to the next). */
@@ -634,9 +616,9 @@ void d3d8_states_shutdown(void)
             g_sampler_states[i] = NULL;
         }
     }
-    g_last_blend_hash = 0;
-    g_last_ds_hash = 0;
-    g_last_raster_hash = 0;
+    memset(g_last_blend_key, 0, sizeof g_last_blend_key);
+    memset(g_last_ds_key, 0, sizeof g_last_ds_key);
+    memset(g_last_raster_key, 0, sizeof g_last_raster_key);
 }
 
 void d3d8_states_apply(void)

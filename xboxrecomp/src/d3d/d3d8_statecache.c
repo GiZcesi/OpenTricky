@@ -31,6 +31,7 @@ static struct {
 } S;
 
 int d3d8_pump_state_on(void);           /* d3d8_nv2a.c (switch + alternation) */
+#include "d3d8_pumpflags.h"
 
 static int mine(ID3D11DeviceContext *c)
 {
@@ -40,7 +41,7 @@ static int mine(ID3D11DeviceContext *c)
 
 /* Filter: only when the switch is on; the mirror itself is always kept up
  * to date. */
-static int skip_ok(void) { return d3d8_pump_state_on(); }
+static int skip_ok(void) { return (d3d8_pump_flags() & PF_STATE) != 0; }   /* d3d8_pumpflags.h */
 
 static void count(int skipped)
 {
@@ -174,12 +175,7 @@ void sc_PSSetShader(ID3D11DeviceContext *c, ID3D11PixelShader *s, ID3D11ClassIns
  * The mirror holds a reference on every view it records (a view the runtime
  * forced to NULL has no other), so a recorded pointer can never be a new view
  * created at the same address. */
-static int srv_skip_ok(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_SRV"); on = !(e && e[0] == '0'); }
-    return on && skip_ok();
-}
+static int srv_skip_ok(void) { return (d3d8_pump_flags() & PF_SRV) != 0; }   /* XBOX_FIX_PUMP_SRV and skip_ok() */
 
 /* Forgets every recorded view (and drops the mirror's references). */
 static void srv_forget(void)
@@ -209,6 +205,14 @@ void sc_PSSetShaderResources(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11S
         }
     }
     VT(c)->PSSetShaderResources(c, start, n, v);
+}
+
+/* 1 when sc_PSSetShaderResources(c, slot, 1, &v) would skip right now: the
+ * mirror records exactly this view (or NULL) in that slot, and skipping is
+ * allowed (the switch, the XBOX_FIX_PUMP_ALT frames). */
+int sc_PSSRVBound(UINT slot, ID3D11ShaderResourceView *v)
+{
+    return slot < 16 && (S.srv_ok >> slot & 1u) && S.srv[slot] == v && srv_skip_ok();
 }
 
 void sc_OMSetRenderTargets(ID3D11DeviceContext *c, UINT n, ID3D11RenderTargetView *const *rtv, ID3D11DepthStencilView *dsv)

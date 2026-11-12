@@ -201,7 +201,7 @@ static const SettingDef k_reg[SETTINGS_COUNT] = {
         "The size of the race display (timer, position, boost). Stretched (Xbox) spreads it across the screen, as in the original game.",
         CHOICE(k_race_hud, "85"), "XBOX_HUD_SHAPE, XBOX_HUD_SIZE", 0, P("xbox", "85", "85") },
     [S_FPS_LIMIT] = { "Display", "FrameRateLimit", T_DISPLAY, "FRAME RATE", "Frame rate limit",
-        "The highest frame rate shown. Above 60, extra frames are smoothed in between; the game itself always runs at 60, like the original game.",
+        "The highest frame rate shown. Above 60, extra frames are smoothed in between; the game itself always runs at 60, like the original game. Started on a 60 Hz screen with Match screen or VSync, the game stays at 60: restart it on a faster screen.",
         CHOICE(k_fps_limit, "monitor"), "XBOX_FPS_CAP", SETTING_PC, P("60", "monitor", "60") },
     [S_VSYNC] = { "Display", "VSync", T_DISPLAY, "FRAME RATE", "VSync",
         "On: no tearing. Adaptive: smoother when the frame rate drops, with some tearing. Off: lowest input delay, with tearing.",

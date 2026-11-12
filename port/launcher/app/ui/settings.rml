@@ -9,7 +9,7 @@
 <body data-model="ot" class="settings">
     <div class="bg">
         <img class="grad" src="ot:bg/$track$"/>
-        <div class="carpet" data-if="have_disc"><span data-for="c : carpet"><img data-attr-src="'ot:carpet/' + c"/></span></div>
+        <div class="carpet" data-if="have_art"><span data-for="c : carpet"><img data-attr-src="'ot:carpet/' + c"/></span></div>
         <div class="shade"></div>
     </div>
 

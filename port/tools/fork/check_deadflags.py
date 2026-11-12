@@ -8,6 +8,10 @@ function outside the list has one, if a listed function has more than its
 count, or if `_flags` is used in a form this guard does not know. A listed site
 that is gone is only reported.
 
+It also fails on an adc / sbb that reads the CF of a shift or of another
+adc / sbb in another block: the lifter sets that CF only for a reader in the
+same block, and marks any other reader (lifter._CF_NOT_MODELLED).
+
     check_deadflags.py GEN_DIR
 """
 import glob, io, os, re, sys
@@ -34,12 +38,20 @@ DECL = "int _flags = 0; /* fallback flag var */"
 DEAD = re.compile(r"^\s*if \(_flags /\* [a-z]+:")
 SWITCHED = re.compile(r"\bg_fix_[a-z_]+\b.*\? .* : _flags /\* j[a-z]+:")
 USE = re.compile(r"\b_flags\b")
+CF_NOT_MODELLED = "from another block: not modelled"   # lifter._CF_NOT_MODELLED
+# Readers of such a CF proven harmless (function -> count).
+CF_ALLOWED = {
+    # Not code: the seven-arm jump table at 0x12CD6C and the byte index table at
+    # 0x12CD88 of the switch before them, decoded from the padding at 0x12CD69
+    # (`adc al, [eax]` is 12 00, a table word). Nothing references 0x12CD69.
+    "sub_0012CD69": 1,
+}
 
 
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
-    found, odd = {}, []
+    found, odd, cfmiss = {}, [], []
     for path in sorted(glob.glob(os.path.join(sys.argv[1], "recomp_*.c"))):
         name = None
         lines = io.open(path, encoding="utf-8", errors="surrogateescape").read().split("\n")
@@ -47,6 +59,12 @@ def main():
             m = FUNC.match(l)
             if m:
                 name = m.group(1)
+                continue
+            if CF_NOT_MODELLED in l:
+                # An adc / sbb reading the CF of a shift or adc / sbb in another
+                # block: the lifter sets that CF only within the setter's block,
+                # so `_cf` would be stale here (lifter._shift_cf_stmt).
+                cfmiss.append((name, "%s:%d %s" % (os.path.basename(path), i + 1, l.strip()[:100])))
                 continue
             if "_flags" not in l or not USE.search(l) or l.strip() == DECL:
                 continue
@@ -58,15 +76,24 @@ def main():
     bad = ["%s: %d dead branch(es), %d allowed (%s)" % (n, len(v), ALLOWED.get(n, 0), ", ".join(v))
            for n, v in sorted(found.items()) if len(v) > ALLOWED.get(n, 0)]
     gone = sorted(n for n in ALLOWED if n not in found)
+    cfcount = {}
+    for n, _ in cfmiss:
+        cfcount[n] = cfcount.get(n, 0) + 1
+    cfbad = [where for n, where in cfmiss if cfcount[n] > CF_ALLOWED.get(n, 0)]
     print("check_deadflags: %d never-taken `if (_flags` branch(es) in %d function(s), "
           "%d listed function(s) gone" % (total, len(found), len(gone)))
     for n in gone:
         print("    gone (fine): %s" % n)
-    if bad or odd:
+    if cfmiss:
+        print("check_deadflags: %d adc / sbb reading a CF set in another block, %d allowed"
+              % (len(cfmiss), len(cfmiss) - len(cfbad)))
+    if bad or odd or cfbad:
         for b in bad:
             print("NEW DEAD BRANCH: " + b)
         for o in odd:
             print("UNKNOWN _flags USE: " + o)
+        for c in cfbad:
+            print("CF READ IN ANOTHER BLOCK: " + c)
         print("check_deadflags: FAILED -- a branch the lifter cut from its flags is never "
               "taken; fix it (fix_deadflags.py) or, if proven harmless, list it in ALLOWED")
         sys.exit(1)

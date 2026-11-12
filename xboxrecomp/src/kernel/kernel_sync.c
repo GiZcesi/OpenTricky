@@ -728,6 +728,10 @@ BOOLEAN __stdcall xbox_KeRemoveQueueDpc(PXBOX_KDPC Dpc)
  *
  * On Xbox, this raises IRQL to the interrupt's level and executes a routine.
  * Since we don't have real IRQLs, we just call the routine directly.
+ *
+ * For a host routine only. A title's call (ordinal 153) goes through
+ * bridge_KeSynchronizeExecution, which runs the guest routine through the
+ * dispatch table; a guest address must never be called as a host pointer.
  * ============================================================================ */
 
 BOOLEAN __stdcall xbox_KeSynchronizeExecution(

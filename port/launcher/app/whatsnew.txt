@@ -1,13 +1,13 @@
 <!-- launcher
-version: 0.1.5
-title: Faster, and a round of fixes
-card: tokyo
-fixes: Find my disc image no longer crashes the launcher
-fixes: The game's videos play at their own pace, as in the original game
-fixes: The sun's glare no longer drops out when the GPU falls behind
-new: Weather: no thick fog when it snows, as on the PS2
-new: PlayStation controllers (experimental): DualShock 4, DualSense
-better: 24-31% more FPS uncapped on our test PC; lighter Deck preset
+version: 0.1.6
+title: A faster graphics pipeline
+card: pipedream
+fixes: No more freeze after hours of play in one session
+fixes: Above 60 FPS, the trail and snow sprays stay with the board
+better: Light halos no longer slow the game above 60 FPS
+better: Lighter draw translation: every draw costs less
+better: Up to 56% more FPS uncapped in the heaviest scenes
+better: About 5 ms less input delay at 60 FPS on 60 Hz screens
 -->
 This file is the "What's new" block of the installed version, built into
 OpenTricky.exe (the launcher shows it without a network). The release zip

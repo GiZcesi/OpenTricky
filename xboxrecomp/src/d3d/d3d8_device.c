@@ -1646,6 +1646,7 @@ int d3d8_OcclusionPollDone(int h, unsigned long long *samples)
     return hr == S_FALSE ? 0 : -1;
 }
 
+
 /* The pump has run out of commands. The D3D11 driver keeps what
  * was recorded since the last submission until a Present, a Flush or a full
  * buffer: at 60 fps the scene of frame N-1, translated right after its flip,
@@ -1963,15 +1964,45 @@ void d3d8_SetPresentImageOverlay(int (*fn)(ID3D11Texture2D *img, ID3D11Texture2D
 /* Closing the window ends the game at once: the title has no quit path of
  * its own (a console is switched off), and waiting on its threads is what
  * left the window unclosable -- WM_CLOSE used to set a flag nothing read. */
-void d3d8_HostExit(void)
+void d3d8_HostExitCode(unsigned code)
 {
     int i;
     for (i = 0; i < HOST_EXIT_HOOKS && s_host_exit_hooks[i]; i++) s_host_exit_hooks[i]();
     d3d8_sync_report();                 /* [PACING] summary */
     fflush(stdout);
     fflush(stderr);
-    TerminateProcess(GetCurrentProcess(), 0);
+    TerminateProcess(GetCurrentProcess(), code);
 }
+
+void d3d8_HostExit(void)
+{
+    d3d8_HostExitCode(0);
+}
+
+/* Direct3D failed for good (d3d8_xbox.h). */
+static D3D8GpuFailFn volatile s_gpu_fail_hook;
+/* The step of d3d8_CreateDevice that failed, in words: the player reads it. */
+static char s_gpu_step[64] = "the Direct3D 11 device";
+
+void d3d8_SetGpuFailHook(D3D8GpuFailFn fn)
+{
+    s_gpu_fail_hook = fn;
+}
+
+static void gpu_fail(int lost, const char *what, unsigned long hr, unsigned long reason)
+{
+    D3D8GpuFailFn fn = s_gpu_fail_hook;
+    if (!fn) return;
+    /* A black or frozen window says nothing: out of the message's way. */
+    if (s_host_window) ShowWindowAsync(s_host_window, SW_HIDE);
+    fn(lost, what, hr, reason);
+}
+
+void d3d8_GpuStartFailed(unsigned long hr)
+{
+    gpu_fail(0, s_gpu_step, hr, 0);
+}
+
 
 /* XBOX_NO_ACTIVATE=1 (test tools only, never set by the launcher): the
  * window never takes the focus from the program in front. It is shown
@@ -3821,6 +3852,27 @@ static HRESULT host_present(void)
     return hr;
 }
 
+/* Present refused. After a driver reset or update, or with the graphics card
+ * gone, Present says REMOVED or RESET and GetDeviceRemovedReason why: nothing
+ * drawn from then on reaches the screen, while the game runs on behind the
+ * last image and the freeze watchdog sees nothing wrong (it counts the draws
+ * translated, not shown). The renderer's objects all hang on this device, so
+ * none is made again: the hook says so and ends the process. Any other refusal
+ * is said once per code, and the frames go on. Called on a failed Present
+ * only: nothing on a frame's path. */
+static void present_failed(D3D8DeviceState *s, HRESULT hr)
+{
+    static HRESULT told;
+    HRESULT why = s->d3d11_device ? ID3D11Device_GetDeviceRemovedReason(s->d3d11_device) : S_OK;
+    if (hr != told) {
+        told = hr;
+        fprintf(stderr, "D3D8: Present failed: 0x%08lX, device state 0x%08lX\n",
+                (unsigned long)hr, (unsigned long)why);
+    }
+    if (why != S_OK || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+        gpu_fail(1, "Present", (unsigned long)hr, (unsigned long)why);
+}
+
 static HRESULT host_present_impl(void)
 {
     D3D8DeviceState *s = &g_device_state;
@@ -3918,6 +3970,7 @@ static HRESULT host_present_impl(void)
         if (plog) QueryPerformanceCounter(&p0);
         d3d8_sync_video_frame(s_video_frame);   /* a video frame keeps the file's pace */
         hr = d3d8_sync_present(s->swap_chain, &dxgi_ms);
+        if (FAILED(hr)) present_failed(s, hr);
         if (s_video_frame && d3d8_sync_left_out()) g_video_left_out++;
         {   /* one line: the time from the start to the first image shown */
             static int told;
@@ -4089,7 +4142,10 @@ static HRESULT d3d11_create_device_and_swap_chain(
     scd.OutputWindow = (pp->hDeviceWindow && IsWindow(pp->hDeviceWindow))
                      ? pp->hDeviceWindow
                      : host_window_create(state->width, state->height);
-    if (!scd.OutputWindow) return E_FAIL;
+    if (!scd.OutputWindow) {
+        snprintf(s_gpu_step, sizeof s_gpu_step, "the window");
+        return E_FAIL;
+    }
     scd.SampleDesc.Count = 1;
     scd.SampleDesc.Quality = 0;
     /* Always windowed: an exclusive-fullscreen swap chain on a synthesised
@@ -4122,6 +4178,15 @@ static HRESULT d3d11_create_device_and_swap_chain(
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
         return hr;
+    }
+
+    /* All the renderer's shaders are of shader model 5 (vs_5_0, ps_5_0), which
+     * a device below feature level 11_0 refuses. */
+    if (feature_level < D3D_FEATURE_LEVEL_11_0) {
+        snprintf(s_gpu_step, sizeof s_gpu_step, "feature level %u_%u, 11_0 is needed",
+                 ((unsigned)feature_level >> 12) & 15u, ((unsigned)feature_level >> 8) & 15u);
+        fprintf(stderr, "D3D8: the graphics card offers Direct3D %s\n", s_gpu_step);
+        return DXGI_ERROR_UNSUPPORTED;
     }
 
     state->hwnd = scd.OutputWindow;
@@ -4570,6 +4635,22 @@ static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDi
     }
     return S_OK;
 }
+
+/* 1 when dev_SetTexture(Stage, pTexture) would change nothing: the same
+ * texture recorded for the stage, its view (or NULL) already bound there as
+ * the state cache records it (so its bind would be skipped), and the colour
+ * operation already as the call leaves it. The pump then skips the call. */
+int d3d8_SetTextureNoop(DWORD Stage, IDirect3DBaseTexture8 *pTexture)
+{
+    if (Stage >= 4 || g_cur_textures[Stage] != pTexture) return 0;
+    if (pTexture) {
+        ID3D11ShaderResourceView *v = ((D3D8Texture *)pTexture)->srv;
+        if (v && !sc_PSSRVBound(Stage, v)) return 0;
+        return g_device_state.tss[Stage][D3DTSS_COLOROP] != D3DTOP_DISABLE;
+    }
+    return sc_PSSRVBound(Stage, NULL) && g_device_state.tss[Stage][D3DTSS_COLOROP] == D3DTOP_DISABLE;
+}
+
 
 static HRESULT __stdcall dev_GetTexture(IDirect3DDevice8 *self, DWORD Stage, IDirect3DBaseTexture8 **ppTexture)
 {
@@ -5496,7 +5577,10 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     if (FAILED(hr)) return hr;
 
     hr = d3d11_create_render_targets(&g_device_state);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) {
+        snprintf(s_gpu_step, sizeof s_gpu_step, "the render targets");
+        return hr;
+    }
 
     d3d8_init_default_states(&g_device_state);
 
@@ -5516,12 +5600,14 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     hr = d3d8_shaders_init();
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Shader init failed: 0x%08lX\n", hr);
+        snprintf(s_gpu_step, sizeof s_gpu_step, "the shaders");
         return hr;
     }
 
     hr = d3d8_states_init();
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: State init failed: 0x%08lX\n", hr);
+        snprintf(s_gpu_step, sizeof s_gpu_step, "the render states");
         return hr;
     }
 

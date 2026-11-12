@@ -481,7 +481,7 @@ uint64_t nv2a_psh_key(const Nv2aPshState *st)
     return h;
 }
 
-int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
+static int psh_generate(const Nv2aPshState *st, char *buf, int size)
 {
     static Ps ps;
     static char declbuf[8192], varsbuf[16384], codebuf[65536], asgbuf[16384];
@@ -719,4 +719,17 @@ int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
     if (out.overflow || decl.overflow || vars.overflow || code.overflow)
         return -1;
     return out.len;
+}
+
+/* The generator works in static buffers; the pump and the
+ * shader prewarm thread (d3d8_shprewarm.c) both call it, one at a time. */
+int nv2a_psh_generate(const Nv2aPshState *st, char *buf, int size)
+{
+    static volatile char lock;
+    int n;
+    while (__atomic_test_and_set(&lock, __ATOMIC_ACQUIRE))
+        __builtin_ia32_pause();
+    n = psh_generate(st, buf, size);
+    __atomic_clear(&lock, __ATOMIC_RELEASE);
+    return n;
 }

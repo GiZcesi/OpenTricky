@@ -1,5 +1,5 @@
 /*
- * crashreport.c -- a report folder for crashes and freezes (crashreport.h).
+ * crashreport.c -- a report folder for crashes, freezes and lost graphics (crashreport.h).
  *
  * Design notes.
  *
@@ -85,6 +85,7 @@ static DWORD  s_fault_tid;
 static const char *s_details;
 static int    s_written;
 static volatile int s_fatal;         /* stack overflow: the report thread ends the process */
+static volatile int s_gpu_report;    /* set before s_crash_event: 1 lost graphics, 2 they never started; not a crash */
 static wchar_t s_dir[MAX_PATH];     /* the last report folder */
 
 /* Log: either a file (tail read at report time) or the ring buffer. */
@@ -1071,6 +1072,53 @@ static void write_crash_report(void)
     s_written = 1;
 }
 
+/* Direct3D failed for good: no exception, so no registers and no minidump. */
+static void write_gpu_report(void)
+{
+    s_written = 0;
+    if (!make_report_dir(L"graphics")) return;
+    report_header("graphics");
+    tadd("What:      %s\n", s_gpu_report == 1 ? "the graphics device was lost while the game was running"
+                                              : "the game could not start its graphics");
+    if (s_details && s_details[0]) tadd("%s", s_details);
+    write_common_files();
+    write_file(s_dir, L"report.txt", s_text, strlen(s_text));
+    s_written = 1;
+}
+
+void crashreport_gpu_dialog(int lost, const char *what, unsigned long hr, unsigned long reason,
+                            const wchar_t *dir)
+{
+    static wchar_t msg[2 * MAX_PATH + 1024];
+    const size_t cap = sizeof msg / sizeof msg[0];
+    size_t n = 0;
+    if (lost)
+        _snwprintf(msg, cap,
+                   L"SSX Tricky lost its graphics card and has to close.\n\n"
+                   L"The graphics driver stopped responding or was reset (error 0x%08lX, reason 0x%08lX). "
+                   L"Update your graphics driver if this happens again.", hr, reason);
+    else
+        _snwprintf(msg, cap,
+                   L"SSX Tricky couldn't start its graphics.\n\n"
+                   L"It needs a graphics card with Direct3D 11 (feature level 11_0) and an up-to-date driver. "
+                   L"Update your graphics driver, then try again.\n\n"
+                   L"Details: %hs (error 0x%08lX).", what, hr);
+    msg[cap - 1] = 0;
+    if (!dir) {
+        MessageBoxW(NULL, msg, L"SSX Tricky", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+        return;
+    }
+    n = wcslen(msg);
+    _snwprintf(msg + n, cap - n,
+               L"\n\nA report was saved in:\n%ls\n\n"
+               L"If this keeps happening, please attach the files in this folder to a bug report (" ISSUES_URL_W L").\n\n"
+               L"Open the folder now?", dir);
+    msg[cap - 1] = 0;
+    if (MessageBoxW(NULL, msg, L"SSX Tricky",
+                    MB_YESNO | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND) == IDYES)
+        crashreport_open_folder(dir);
+}
+
 void crashreport_crash_dialog(DWORD code, const wchar_t *dir)
 {
     static wchar_t msg[2 * MAX_PATH + 512];
@@ -1123,6 +1171,31 @@ int crashreport_on_crash(EXCEPTION_POINTERS *ep, const char *details,
         dir_out[dir_out_len - 1] = 0;
     }
     fprintf(stderr, "[CRASHREPORT] report written\n");
+    return 1;
+}
+
+int crashreport_on_gpu_failure(int lost, const char *details,
+                               wchar_t *dir_out, size_t dir_out_len)
+{
+    if (!s_on || !s_thread) return 0;
+    if (GetCurrentThreadId() == s_thread_id) return 0;     /* the reporter itself */
+    if (InterlockedCompareExchange(&s_crash_claimed, 1, 0) != 0) {
+        /* A crash is being reported: its report goes first. */
+        WaitForSingleObject(s_done_event, REPORT_WAIT_MS);
+        return 0;
+    }
+    s_details = details;
+    s_gpu_report = lost ? 1 : 2;
+    SetEvent(s_crash_event);
+    /* The report thread ends with it: no freeze report, nor its message, while
+     * the caller's message is up. */
+    if (WaitForSingleObject(s_done_event, REPORT_WAIT_MS) != WAIT_OBJECT_0 || !s_written)
+        return 0;
+    if (dir_out && dir_out_len) {
+        wcsncpy(dir_out, s_dir, dir_out_len - 1);
+        dir_out[dir_out_len - 1] = 0;
+    }
+    fprintf(stderr, "[CRASHREPORT] graphics report written\n");
     return 1;
 }
 
@@ -1242,6 +1315,11 @@ static DWORD WINAPI report_thread(LPVOID arg)
     (void)arg;
     for (;;) {
         DWORD r = WaitForSingleObject(s_crash_event, 1000);
+        if (r == WAIT_OBJECT_0 && s_gpu_report) {
+            write_gpu_report();         /* the caller says so and ends the process (its pads with it) */
+            SetEvent(s_done_event);
+            return 0;
+        }
         if (r == WAIT_OBJECT_0) {
             DWORD code = s_ep->ExceptionRecord->ExceptionCode;
             padsdl_quit(150);           /* PlayStation pads: no motor left running (nothing when off) */

@@ -47,4 +47,17 @@ void vshcpu_run(const vshcpu_insn *p, int n, const float in[16][4],
 /* One-line disassembly of an instruction, for logs. */
 void vshcpu_format(const vshcpu_insn *i, char *buf, int len);
 
+/* A decoded program's identity (FNV-1a 64 of its n instructions), the inputs
+ * it reads (bit k: v[k]) and whether it writes constant registers. One
+ * definition for the push-buffer translator and the shader prewarm thread
+ *, so a program rebuilt from the disc hashes as the drawn one. */
+uint64_t vshcpu_digest(const vshcpu_insn *p, int n, uint16_t *inputs, int *writes_c);
+
+/* The blend overlay of a substituted draw (terrain seams, terrain_seams.c) runs the
+ * title's program p[0..n) plus "mov oT0.z, v15.x" (v15 = the blend weights):
+ * writes it at p[n] (room for n + 1, n >= 1), moves FINAL to it, and turns
+ * the program's inputs and identity into the overlay's. One definition for
+ * the push-buffer translator and the shader prewarm thread. */
+void vshcpu_t0z_append(vshcpu_insn *p, int n, uint16_t *inputs, uint64_t *hash);
+
 #endif

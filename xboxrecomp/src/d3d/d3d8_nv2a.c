@@ -17,6 +17,8 @@
 #include "d3d8_internal.h"
 #include "d3d8_gpuprof.h"
 #include "d3d8_temporal.h"
+#include "d3d8_shprewarm.h"
+#include "d3d8_pumpflags.h"
 #include <d3dcompiler.h>
 #include <intrin.h>
 #include <math.h>
@@ -68,6 +70,13 @@ static int                 g_init_failed;
 /* ps NULL: the key's shader was tried once and failed. */
 static struct { uint64_t key; ID3D11PixelShader *ps; } g_ps_cache[NV_PS_CACHE];
 static int g_ps_count;
+/* Draws skipped because the pixel shader cache is full (it is never
+ * emptied: a draw that needs a shader it does not hold is skipped), and
+ * draws dropped without an input layout (its cache full, or the layout
+ * refused by the device): one line at the first, counted in [PUMP] Caches
+ * (XBOX_LOG_STATS=1, map_stats). The title uses a few percent of each
+ * bound. */
+static unsigned g_ps_full_skips, g_il_lost;
 
 static ID3D11Buffer *make_cb(ID3D11Device *dev, UINT size)
 {
@@ -186,31 +195,85 @@ static void kidx_put(KIdx *t, unsigned cap, uint64_t key, int pos)
  * one presented frame in two only; during a pause (frozen scene), every
  * captured frame must then be identical. */
 static unsigned g_pump_frame;
-static int pump_alt_off(void)
+
+/* The pump's switches (d3d8_pumpflags.h): each read once from the
+ * environment, all worked out here once per presented frame -- the only thing
+ * that changes them is the ALT parity of g_pump_frame, which changes at
+ * d3d8_pump_frame_tick only -- into g_pump_flags, which every switch reads.
+ * Same answers as when each switch worked its own out on every call. */
+unsigned g_pump_flags = PF_STALE;
+
+static int env_default_on(const char *name) { const char *e = getenv(name); return !(e && e[0] == '0'); }
+static int env_default_off(const char *name) { const char *e = getenv(name); return e && e[0] == '1'; }
+
+
+static int pf_alt, pf_state, pf_cb, pf_onemap, pf_onemap_alt, pf_cgen, pf_cache, pf_memo2, pf_group, pf_texmemo, pf_srv,
+           pf_sobj, pf_smemo, pf_rskip, pf_idx, pf_argb;
+
+/* The word for the current frame, from the switches read once (pf_*) and the
+ * parity of g_pump_frame. */
+static unsigned pump_flags_of_frame(void)
 {
-    static int alt = -1;
-    if (alt < 0) { const char *e = getenv("XBOX_FIX_PUMP_ALT"); alt = e && e[0] == '1'; }
-    return alt && (g_pump_frame & 1u);
+    unsigned f = 0;
+    int off = pf_alt && (g_pump_frame & 1u);
+    if (off) f |= PF_ALT_OFF;
+    if (pf_state && !off) f |= PF_STATE;
+    if (pf_cb && !off) f |= PF_CB;
+    if (pf_onemap && !(pf_onemap_alt && (g_pump_frame & 1u)) && !off) f |= PF_ONEMAP;
+    if (pf_cgen && !off) f |= PF_CGEN;
+    if (pf_cache && !off) f |= PF_CACHE;
+    if (pf_memo2 && !off) f |= PF_MEMO2;
+    if (pf_group && !off) f |= PF_GROUP;
+    if (pf_texmemo && (f & PF_CACHE)) f |= PF_TEXMEMO;  /* with the signature cache (nv2a_pgraph_d3d11.c, g_tm) */
+    if (pf_srv && (f & PF_STATE)) f |= PF_SRV;          /* with the state mirror's skipping (d3d8_statecache.c) */
+    if (pf_sobj && !off) f |= PF_SOBJ;
+    if (pf_smemo && !off) f |= PF_SMEMO;
+    if (pf_rskip && !off) f |= PF_RSKIP;
+    if (pf_idx && !off) f |= PF_IDX;
+    if (pf_argb && !off) f |= PF_ARGB;
+    return f;
 }
+
+unsigned d3d8_pump_flags_refresh(void)
+{
+    static int read;
+    unsigned f;
+    if (!read) {
+        pf_alt = env_default_off("XBOX_FIX_PUMP_ALT");
+        pf_state = env_default_on("XBOX_FIX_PUMP_STATE");      /* default 1 (proven identical) */
+        pf_cb = env_default_on("XBOX_FIX_PUMP_CB");            /* default 1 (proven identical) */
+        pf_onemap = env_default_on("XBOX_FIX_PUMP_ONEMAP");    /* default 1 (proven identical); 0 = previous path */
+        pf_onemap_alt = env_default_off("XBOX_FIX_PUMP_ONEMAP_ALT");
+        pf_cgen = env_default_on("XBOX_FIX_PUMP_CGEN");
+        pf_cache = env_default_on("XBOX_FIX_PUMP_CACHE");      /* default 1 (proven identical) */
+        pf_memo2 = env_default_on("XBOX_FIX_PUMP_MEMO2");
+        pf_group = env_default_on("XBOX_FIX_PUMP_GROUP");
+        pf_texmemo = env_default_on("XBOX_FIX_PUMP_TEXMEMO");
+        pf_srv = env_default_on("XBOX_FIX_PUMP_SRV");
+        pf_sobj = env_default_on("XBOX_FIX_PUMP_SOBJ");
+        pf_smemo = env_default_on("XBOX_FIX_PUMP_SMEMO");
+        pf_rskip = env_default_on("XBOX_FIX_PUMP_RSKIP");
+        pf_idx = env_default_on("XBOX_FIX_PUMP_IDX");
+        pf_argb = env_default_on("XBOX_FIX_PUMP_ARGB");
+        fprintf(stderr, "[PUMP] XBOX_FIX_PUMP_ONEMAP=%d%s\n", pf_onemap, pf_onemap_alt ? " (ALT: one frame in two)" : "");
+        fprintf(stderr, "[PUMP] XBOX_FIX_PUMP_MEMO2=%d\n", pf_memo2);
+        read = 1;
+    }
+    f = pump_flags_of_frame();
+    g_pump_flags = f;
+    return f;
+}
+
+
+static int pump_alt_off(void) { return (d3d8_pump_flags() & PF_ALT_OFF) != 0; }
 static void vi_present(void);
 /* At the head of host_present, before the post and the Present: the frame
  * ends here (also the vertex/index ring's query of the frame, vi_present). */
-void d3d8_pump_frame_tick(void) { vi_present(); g_pump_frame++; }
+void d3d8_pump_frame_tick(void) { vi_present(); g_pump_frame++; d3d8_pump_flags_refresh(); }
 int  d3d8_pump_alt_off(void) { return pump_alt_off(); }   /* also used by the post */
 
-int d3d8_pump_state_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_STATE"); on = !(e && e[0] == '0');   /* default 1 (proven identical) */ }
-    return on && !pump_alt_off();
-}
-
-int d3d8_pump_cb_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_CB"); on = !(e && e[0] == '0');   /* default 1 (proven identical) */ }
-    return on && !pump_alt_off();
-}
+int d3d8_pump_state_on(void) { return (d3d8_pump_flags() & PF_STATE) != 0; }
+int d3d8_pump_cb_on(void) { return (d3d8_pump_flags() & PF_CB) != 0; }
 
 /* XBOX_FIX_PUMP_ONEMAP (default 1; =0 previous path): one Map per GPU draw for its vertices and indices.
  * Constant attributes (stride 0) that sit close together in guest memory are
@@ -220,18 +283,7 @@ int d3d8_pump_cb_on(void)
  * previous draw. Same bytes and formats reach the shaders.
  * XBOX_FIX_PUMP_ONEMAP_ALT=1 (identity test): active on one presented frame
  * in two only. XBOX_FIX_PUMP_ALT turns it off with the other optimizations. */
-int d3d8_pump_onemap_on(void)
-{
-    static int on = -1, alt = -1;
-    if (on < 0) {
-        const char *e = getenv("XBOX_FIX_PUMP_ONEMAP");
-        on = !(e && e[0] == '0');       /* default 1 (proven identical); 0 = previous path */
-        e = getenv("XBOX_FIX_PUMP_ONEMAP_ALT");
-        alt = e && e[0] == '1';
-        fprintf(stderr, "[PUMP] XBOX_FIX_PUMP_ONEMAP=%d%s\n", on, alt ? " (ALT: one frame in two)" : "");
-    }
-    return on && !(alt && (g_pump_frame & 1u)) && !pump_alt_off();
-}
+int d3d8_pump_onemap_on(void) { return (d3d8_pump_flags() & PF_ONEMAP) != 0; }
 
 /* XBOX_FIX_PUMP_CGEN, default 1; 0 = previous path: the VS constants
  * of a GPU draw are compared only where the translator wrote a new value since
@@ -240,19 +292,9 @@ int d3d8_pump_onemap_on(void)
  * offset when their bytes have not changed, without writing them; a draw with
  * nothing new maps nothing. The shaders read the same bytes. Off on the frames
  * XBOX_FIX_PUMP_ALT turns the pump optimizations off. */
-int d3d8_pump_cgen_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_CGEN"); on = !(e && e[0] == '0'); }
-    return on && !pump_alt_off();
-}
+int d3d8_pump_cgen_on(void) { return (d3d8_pump_flags() & PF_CGEN) != 0; }
 
-int d3d8_pump_cache_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("XBOX_FIX_PUMP_CACHE"); on = !(e && e[0] == '0');   /* default 1 (proven identical) */ }
-    return on && !pump_alt_off();
-}
+int d3d8_pump_cache_on(void) { return (d3d8_pump_flags() & PF_CACHE) != 0; }
 
 /* XBOX_FIX_PUMP_MEMO2 (default 1; =0 one entry, the previous path): the
  * memos in front of the vertex shader, input layout and pixel shader key
@@ -262,16 +304,7 @@ int d3d8_pump_cache_on(void)
  * find theirs. The memos only spare a lookup: the caches behind them only
  * grow, so a remembered entry is the one the lookup returns. Off with the
  * other optimizations on the XBOX_FIX_PUMP_ALT frames. */
-int d3d8_pump_memo2_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("XBOX_FIX_PUMP_MEMO2");
-        on = !(e && e[0] == '0');
-        fprintf(stderr, "[PUMP] XBOX_FIX_PUMP_MEMO2=%d\n", on);
-    }
-    return on && !pump_alt_off();
-}
+int d3d8_pump_memo2_on(void) { return (d3d8_pump_flags() & PF_MEMO2) != 0; }
 
 static KIdx g_ps_idx[NV_PS_CACHE * 2];
 
@@ -293,11 +326,26 @@ static ID3D11PixelShader *ps_find(unsigned long long key)
     return i >= 0 ? g_ps_cache[i].ps : NULL;
 }
 
-/* 1: compiled; 0: never tried; -1: tried and failed. */
-int d3d8_nv2a_has_ps(unsigned long long key)
+/* The compiler arguments of the pump's two shaders, shared with
+ * the prewarm thread (d3d8_shprewarm.c): same HLSL, same bytecode. */
+#define NV_PS_NAME    "ps_nv2a"
+#define NV_PS_PROFILE "ps_5_0"
+#define NV_PS_FLAGS   D3DCOMPILE_OPTIMIZATION_LEVEL3
+#define NV_VS_NAME    "vs_nv2a_prog"
+#define NV_VS_PROFILE "vs_5_0"
+#define NV_VS_FLAGS   D3DCOMPILE_IEEE_STRICTNESS   /* IEEE strictness keeps the NaN and infinity rules of the CPU path */
+
+/* One [SHC] line for each shader the pump needs and does not
+ * have yet (a few dozen per session; capped): where it came from and what
+ * it cost the pump. "prewarmed" = built ahead by d3d8_shprewarm.c. */
+static void nv_pump_log(const char *what, unsigned long long key, const char *how, double ms)
 {
-    int i = ps_slot(key);
-    return i < 0 ? 0 : g_ps_cache[i].ps ? 1 : -1;
+    static int lines;
+    if (++lines <= 512)
+        fprintf(stderr, "[SHC] pump %s %016llX: %s, %.1f ms (t+%.0f ms)\n", what, key, how, ms,
+                d3d8_ms_since_start());
+    else if (lines == 513)
+        fprintf(stderr, "[SHC] (no more lines for the pump's shaders)\n");
 }
 
 static void ps_put(unsigned long long key, ID3D11PixelShader *ps)
@@ -306,6 +354,39 @@ static void ps_put(unsigned long long key, ID3D11PixelShader *ps)
     g_ps_cache[g_ps_count].ps = ps;
     kidx_put(g_ps_idx, NV_PS_CACHE * 2, key, g_ps_count);
     g_ps_count++;
+}
+
+/* 1: compiled; 0: never tried; -1: tried and failed. */
+int d3d8_nv2a_has_ps(unsigned long long key)
+{
+    int i = ps_slot(key);
+    ID3D11PixelShader *ps;
+    if (i >= 0) return g_ps_cache[i].ps ? 1 : -1;
+    /* Built ahead by the prewarm thread. */
+    if (g_ps_count >= NV_PS_CACHE || !(ps = (ID3D11PixelShader *)shpw_take_ps(key))) return 0;
+    ps_put(key, ps);
+    nv_pump_log("ps", key, "prewarmed", 0.0);
+    return 1;
+}
+
+/* The prewarm thread's pixel shader (ID3D11PixelShader *, NULL on
+ * failure); the pump's own build below uses the same arguments. */
+void *d3d8_nv2a_build_ps(const char *hlsl, int len, int *hit)
+{
+    ID3D11Device *dev = d3d8_GetD3D11Device();
+    ID3DBlob *blob = NULL, *err = NULL;
+    ID3D11PixelShader *ps = NULL;
+    HRESULT hr;
+    *hit = 0;
+    if (!dev) return NULL;
+    hr = d3d8_shader_compile(hlsl, (SIZE_T)len, NV_PS_NAME, NULL, "main", NV_PS_PROFILE, NV_PS_FLAGS,
+                             &blob, &err, hit);
+    if (err) ID3D10Blob_Release(err);
+    if (FAILED(hr) || !blob) return NULL;
+    hr = ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(blob),
+                                        ID3D10Blob_GetBufferSize(blob), NULL, &ps);
+    ID3D10Blob_Release(blob);
+    return SUCCEEDED(hr) ? ps : NULL;
 }
 
 /* A key whose shader could not be generated, compiled or
@@ -320,14 +401,20 @@ int d3d8_nv2a_add_ps(unsigned long long key, const char *hlsl, int len)
     ID3D11PixelShader *ps = NULL;
     HRESULT hr;
     static int failures;
+    double t0 = nv_now_ms();
+    int hit = 0;
 
-    if (!dev || g_ps_count >= NV_PS_CACHE) return 0;
+    if (!dev) return 0;
+    if (g_ps_count >= NV_PS_CACHE) {
+        if (!g_ps_full_skips++)
+            fprintf(stderr, "[NV2A-PSH] pixel shader cache full (%d shaders): a draw that needs a new one "
+                    "is skipped (counted in [PUMP] Caches)\n", NV_PS_CACHE);
+        return 0;
+    }
     if (len <= 0) { ps_put(key, NULL); return 0; }
     {
-        double t0 = nv_now_ms();
-        int hit;
-        hr = nv_compile(hlsl, (SIZE_T)len, "ps_nv2a", "ps_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, &blob, &err, &hit);
+        hr = nv_compile(hlsl, (SIZE_T)len, NV_PS_NAME, NV_PS_PROFILE,
+                        NV_PS_FLAGS, &blob, &err, &hit);
         if (!hit) {
             g_nv_compiles++;
             if (g_perf_on) perf_count(PC_COMPILE, 1);
@@ -349,6 +436,7 @@ int d3d8_nv2a_add_ps(unsigned long long key, const char *hlsl, int len)
     ID3D10Blob_Release(blob);
     if (FAILED(hr) || !ps) { ps_put(key, NULL); return 0; }
     ps_put(key, ps);
+    nv_pump_log("ps", key, hit ? "from the cache" : "compiled", nv_now_ms() - t0);
     return 1;
 }
 
@@ -713,17 +801,122 @@ void d3d8_nv2a_memo2_hits(unsigned long long *vsh, unsigned long long *il)
     *il = g_il_memo2_hits;
 }
 
+/* The key of a vertex program in g_vsh: the program, the kind of each input
+ * and the point flag. Also the prewarm thread's. */
+static uint64_t vsh_key(uint64_t prog_hash, const uint8_t kind[16], int pts)
+{
+    uint64_t key = fnv64(prog_hash, kind, 16);
+    if (pts) key = fnv64(key, "pts", 3);
+    return key;
+}
+
+/* A vertex-program recipe for the prewarm thread
+ * (d3d8_shprewarm.h): this head, then prog_len decoded instructions. */
+typedef struct {
+    uint64_t prog_hash;
+    uint16_t inputs;
+    uint8_t  pts, prog_len;
+    uint8_t  kind[16];
+} VshRecipe;
+
+static void vsh_note(const Nv2aVshDraw *d, const uint8_t kind[16], int pts)
+{
+    uint8_t rec[sizeof(VshRecipe) + VSHCPU_SLOTS * sizeof(vshcpu_insn)];
+    VshRecipe h;
+    if (d->prog_len <= 0 || d->prog_len > VSHCPU_SLOTS) return;
+    memset(&h, 0, sizeof h);
+    h.prog_hash = d->prog_hash;
+    h.inputs = d->inputs;
+    h.pts = (uint8_t)(pts != 0);
+    h.prog_len = (uint8_t)d->prog_len;
+    memcpy(h.kind, kind, 16);
+    memcpy(rec, &h, sizeof h);
+    memcpy(rec + sizeof h, d->prog, (size_t)d->prog_len * sizeof(vshcpu_insn));
+    shpw_note(SHPW_VS, rec, (int)(sizeof h + (size_t)d->prog_len * sizeof(vshcpu_insn)));
+}
+
+int d3d8_nv2a_vs_recipe_hlsl(const void *rec, int size, uint64_t *key, char *buf, int cap)
+{
+    VshRecipe h;
+    vshcpu_insn prog[VSHCPU_SLOTS];
+    if (size < (int)sizeof h) return -1;
+    memcpy(&h, rec, sizeof h);
+    if (!h.prog_len || h.prog_len > VSHCPU_SLOTS
+        || size != (int)(sizeof h + (size_t)h.prog_len * sizeof(vshcpu_insn))) return -1;
+    memcpy(prog, (const uint8_t *)rec + sizeof h, (size_t)h.prog_len * sizeof(vshcpu_insn));
+    *key = vsh_key(h.prog_hash, h.kind, h.pts);
+    return nv2a_vsh_hlsl(prog, h.prog_len, h.inputs, h.kind, h.pts, buf, cap);
+}
+
+/* A vertex recipe rebuilt from a program's instruction words (the
+ * shader prewarm thread's given list, d3d8_shprewarm.c): decoded and hashed
+ * as vsh_active (nv2a_pgraph_d3d11.c) does for a drawn one, plus the blend
+ * overlay's instruction if t0z (as the terrain seams' draws). A program that
+ * writes constant registers runs on the CPU there (no shader): none. */
+int d3d8_nv2a_vs_recipe_make(const uint32_t (*words)[4], int count, int t0z, const uint8_t kind[16],
+                             int pts, void *out, int cap, uint64_t *key)
+{
+    uint32_t mem[VSHCPU_SLOTS][4];
+    vshcpu_insn dec[VSHCPU_SLOTS];
+    VshRecipe h;
+    int n, wc, size;
+    if (count <= 0 || count > VSHCPU_SLOTS) return -1;
+    memset(mem, 0, sizeof mem);
+    memcpy(mem, words, (size_t)count * sizeof mem[0]);
+    n = vshcpu_decode((const uint32_t (*)[4])mem, 0, dec);
+    if (n != count) return -1;                                 /* FINAL is the last word given */
+    memset(&h, 0, sizeof h);
+    h.prog_hash = vshcpu_digest(dec, n, &h.inputs, &wc);
+    if (wc) return -1;
+    if (t0z) {                                                 /* as the substituted draws' overlay */
+        if (n >= VSHCPU_SLOTS || (h.inputs & 0x8000u)) return -1;
+        vshcpu_t0z_append(dec, n, &h.inputs, &h.prog_hash);
+        n++;
+    }
+    h.pts = (uint8_t)(pts != 0);
+    h.prog_len = (uint8_t)n;
+    memcpy(h.kind, kind, 16);
+    size = (int)(sizeof h + (size_t)n * sizeof(vshcpu_insn));
+    if (size > cap) return -1;
+    memcpy(out, &h, sizeof h);
+    memcpy((uint8_t *)out + sizeof h, dec, (size_t)n * sizeof(vshcpu_insn));
+    *key = vsh_key(h.prog_hash, h.kind, h.pts);
+    return size;
+}
+
+/* The prewarm thread's vertex program (shader and bytecode, for
+ * the input layouts); the pump's own build below uses the same arguments. */
+int d3d8_nv2a_build_vs(const char *src, int len, void **vs, void **code, int *hit)
+{
+    ID3D11Device *dev = d3d8_GetD3D11Device();
+    ID3D10Blob *c = NULL, *err = NULL;
+    ID3D11VertexShader *v = NULL;
+    HRESULT hr;
+    *hit = 0;
+    if (!dev) return 0;
+    hr = d3d8_shader_compile(src, (SIZE_T)len, NV_VS_NAME, NULL, "main", NV_VS_PROFILE, NV_VS_FLAGS,
+                             &c, &err, hit);
+    if (err) ID3D10Blob_Release(err);
+    if (FAILED(hr) || !c) return 0;
+    hr = ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(c),
+                                         ID3D10Blob_GetBufferSize(c), NULL, &v);
+    if (FAILED(hr) || !v) { ID3D10Blob_Release(c); return 0; }
+    *vs = v;
+    *code = c;
+    return 1;
+}
+
 static int vsh_lookup(const Nv2aVshDraw *d, const uint8_t kind[16])
 {
     static char src[262144];
     ID3D11Device *dev = d3d8_GetD3D11Device();
-    uint64_t key = d->prog_hash;
+    uint64_t key;
     ID3D10Blob *code = NULL, *err = NULL;
     HRESULT hr;
-    int i, len;
+    int i, len, hit = 0, pts = d->topology == D3DPT_POINTLIST;
+    double t0;
 
-    key = fnv64(key, kind, 16);
-    if (d->topology == D3DPT_POINTLIST) key = fnv64(key, "pts", 3);
+    key = vsh_key(d->prog_hash, kind, pts);
     if (d3d8_pump_cache_on()) {
         i = kidx_find(g_vsh_idx, VSH_CACHE * 2, key);
         if (i >= 0) return g_vsh[i].vs ? i : -1;
@@ -736,21 +929,28 @@ static int vsh_lookup(const Nv2aVshDraw *d, const uint8_t kind[16])
     kidx_put(g_vsh_idx, VSH_CACHE * 2, key, i);
     g_vsh[i].vs = NULL;
     g_vsh[i].code = NULL;
-    len = nv2a_vsh_hlsl(d->prog, d->prog_len, d->inputs, kind, d->topology == D3DPT_POINTLIST,
-                        src, (int)sizeof src);
+    {   /* built ahead by the prewarm thread. */
+        void *pv = NULL, *pc = NULL;
+        if (shpw_take_vs(key, &pv, &pc)) {
+            g_vsh[i].vs = (ID3D11VertexShader *)pv;
+            g_vsh[i].code = (ID3D10Blob *)pc;
+            nv_pump_log("vs", key, "prewarmed", 0.0);
+            return i;
+        }
+    }
+    t0 = nv_now_ms();
+    len = nv2a_vsh_hlsl(d->prog, d->prog_len, d->inputs, kind, pts, src, (int)sizeof src);
     if (len <= 0) return -1;
     nv_hlsl_dump("vs_nv2a_prog", key, src, len);
-    /* IEEE strictness keeps the NaN and infinity rules of the CPU path. */
     {
-        double t0 = nv_now_ms();
-        int hit;
-        hr = nv_compile(src, (SIZE_T)len, "vs_nv2a_prog", "vs_5_0",
-                        D3DCOMPILE_IEEE_STRICTNESS, &code, &err, &hit);
+        double tc = nv_now_ms();
+        hr = nv_compile(src, (SIZE_T)len, NV_VS_NAME, NV_VS_PROFILE,
+                        NV_VS_FLAGS, &code, &err, &hit);
         if (!hit) {
             g_nv_compiles++;
             if (g_perf_on) perf_count(PC_COMPILE, 1);
         }
-        g_nv_compile_ms += nv_now_ms() - t0;
+        g_nv_compile_ms += nv_now_ms() - tc;
     }
     if (FAILED(hr)) {
         static int told;
@@ -765,6 +965,8 @@ static int vsh_lookup(const Nv2aVshDraw *d, const uint8_t kind[16])
                                          ID3D10Blob_GetBufferSize(code), NULL, &g_vsh[i].vs);
     if (FAILED(hr)) { ID3D10Blob_Release(code); g_vsh[i].vs = NULL; return -1; }
     g_vsh[i].code = code;
+    nv_pump_log("vs", key, hit ? "from the cache" : "compiled", nv_now_ms() - t0);
+    vsh_note(d, kind, pts);
     {
         static int count;
         if (++count <= 64 || (count % 64) == 0)
@@ -823,14 +1025,27 @@ static ID3D11InputLayout *il_lookup(int vi, const D3D11_INPUT_ELEMENT_DESC *el, 
     } else
     for (i = 0; i < g_nil; i++)
         if (g_il[i].key == key) return g_il[i].il;
-    if (g_nil >= IL_CACHE || !dev) return NULL;
+    if (!dev) return NULL;
+    if (g_nil >= IL_CACHE) {
+        static int told;
+        if (!told++)
+            fprintf(stderr, "[NV2A-VSH] input layout cache full (%d layouts): a draw that needs a new one "
+                    "is dropped (counted in [PUMP] Caches)\n", IL_CACHE);
+        return NULL;
+    }
     i = g_nil++;
     g_il[i].key = key;
     kidx_put(g_il_idx, IL_CACHE * 2, key, i);
     g_il[i].il = NULL;
-    ID3D11Device_CreateInputLayout(dev, el, (UINT)n,
-                                   ID3D10Blob_GetBufferPointer(g_vsh[vi].code),
-                                   ID3D10Blob_GetBufferSize(g_vsh[vi].code), &g_il[i].il);
+    {
+        HRESULT hr = ID3D11Device_CreateInputLayout(dev, el, (UINT)n,
+                                                    ID3D10Blob_GetBufferPointer(g_vsh[vi].code),
+                                                    ID3D10Blob_GetBufferSize(g_vsh[vi].code), &g_il[i].il);
+        static int told;
+        if ((FAILED(hr) || !g_il[i].il) && told++ < 4)       /* kept NULL: its draws are dropped */
+            fprintf(stderr, "[NV2A-VSH] input layout refused (hr %08lX, vertex program %d, %d elements): "
+                    "its draws are dropped (counted in [PUMP] Caches)\n", (unsigned long)hr, vi, n);
+    }
     return g_il[i].il;
 }
 
@@ -1057,7 +1272,9 @@ static uint8_t *vi_ring_map(ID3D11DeviceContext *ctx, UINT size, UINT *off)
  * and longest Maps, at a new lap and elsewhere, the draws larger than the
  * ring; the same for the other Maps (the constant ring, whose wraps are each
  * a DISCARD). With XBOX_FIX_PUMP_RING=0, the previous path's. Test tools read
- * this line: its fields keep their wording, new ones go after them. */
+ * this line: its fields keep their wording, new ones go after them. A second
+ * line, [PUMP] Caches, gives how full the shader and input layout caches are
+ * and the draws lost to them since the start. */
 typedef struct { unsigned n, slow; unsigned long long top; } MapTimes;
 static MapTimes g_mt[4];                /* vertex/index ring: [0] in a lap, [1] a new lap; others: [2], [3] DISCARD */
 static unsigned long long g_mt_slow = ~0ull;    /* 100 us in rdtsc cycles, once measured */
@@ -1103,6 +1320,9 @@ static void map_stats(void)
             (double)g_mt[0].top / k, (double)g_mt[1].top / k, g_vi_refused - r0, g_cbr_gen - cg0, g_mt[2].slow,
             g_mt[3].slow, (double)g_mt[2].top / k, (double)g_mt[3].top / k, g_vi_wraps, g_vi_discards,
             g_vi_fallbacks, g_vi_refused);
+    fprintf(stderr, "[PUMP] Caches: pixel shaders %d / %d, vertex programs %d / %d, input layouts %d / %d | "
+            "since start: %u draws skipped for a full pixel shader cache, %u dropped without an input layout\n",
+            g_ps_count, NV_PS_CACHE, g_nvsh, VSH_CACHE, g_nil, IL_CACHE, g_ps_full_skips, g_il_lost);
     xbox_log_flush();
     memset(g_mt, 0, sizeof g_mt);
     tw = now;
@@ -1182,6 +1402,23 @@ static int gs_init(void)
     if (blob) ID3D10Blob_Release(blob);
     if (err) ID3D10Blob_Release(err);
     return g_gs != NULL;
+}
+
+/* The point geometry shader, compiled by the shader prewarm
+ * thread (d3d8_shprewarm.c) into the disk cache with gs_init's arguments, so
+ * its first point draw -- the particles, sometimes first seen in a race --
+ * reads it back instead of compiling it. */
+void d3d8_nv2a_prewarm_fixed(void)
+{
+    ID3DBlob *blob = NULL, *err = NULL;
+    const char *src;
+    int hit = 0;
+    if (!d3d8_points_gpu_on()) return;
+    src = d3d8_temporal_wanted() ? g_gs_src_jit : g_gs_src;
+    if (SUCCEEDED(d3d8_shader_compile(src, strlen(src), "gs_nv2a_points", NULL, "main", "gs_5_0",
+                                      D3DCOMPILE_IEEE_STRICTNESS, &blob, &err, &hit)) && blob)
+        ID3D10Blob_Release(blob);
+    if (err) ID3D10Blob_Release(err);
 }
 
 /* XBOX_POINTS_CHECK=1 (diagnostic): for each point draw on the
@@ -1596,6 +1833,55 @@ static void zt_draw_indexed(ID3D11DeviceContext *ctx, ID3D11Device *dev, int ras
 }
 
 
+/* The order in which a GPU draw's streams are grouped: its array attributes
+ * (inputs read by the program, not constant) by increasing address, the
+ * lower attribute number first at equal addresses. ord[] receives them in
+ * that order; returns how many.
+ *
+ * stream_order_scan is the previous form: one scan of the 16 attributes per
+ * attribute taken (16 x (n + 1) tests with data-dependent branches, about
+ * 0.1 us per draw). stream_order takes the set bits only, each inserted after
+ * every element whose address is lower or equal: a stable sort on the
+ * address over the attribute numbers taken in increasing order, so the same
+ * sequence, hence the same groups, elements and input slots. */
+static int stream_order_scan(const Nv2aVshDraw *d, int ord[16])
+{
+    uint16_t done = 0;
+    int a, n = 0;
+    for (;;) {
+        int best = -1;
+        for (a = 0; a < 16; a++)
+            if ((d->inputs & (1u << a)) && !(done & (1u << a)) &&
+                (d->attr[a].kind & 0x0F) != NV2A_VSH_IN_CONST &&
+                (best < 0 || d->attr[a].base < d->attr[best].base))
+                best = a;
+        if (best < 0) break;
+        done |= (uint16_t)(1u << best);
+        ord[n++] = best;
+    }
+    return n;
+}
+
+static int stream_order(const Nv2aVshDraw *d, int ord[16])
+{
+    unsigned m = d->inputs;
+    int n = 0;
+    while (m) {
+        int a = __builtin_ctz(m), k;
+        const uint8_t *b = d->attr[a].base;
+        m &= m - 1u;
+        if ((d->attr[a].kind & 0x0F) == NV2A_VSH_IN_CONST) continue;
+        for (k = n++; k > 0 && d->attr[ord[k - 1]].base > b; k--) ord[k] = ord[k - 1];
+        ord[k] = a;
+    }
+    return n;
+}
+
+/* XBOX_FIX_PUMP_GROUP (default 1; =0 the previous scan): stream_order
+ * above. Off with the other optimizations on the XBOX_FIX_PUMP_ALT frames. */
+static int pump_group_on(void) { return (d3d8_pump_flags() & PF_GROUP) != 0; }
+
+
 int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
@@ -1609,7 +1895,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     ID3D11InputLayout *il;
     D3D11_PRIMITIVE_TOPOLOGY topo;
     int vi, a, g, ngrp = 0, nel = 0;
-    uint16_t done = 0;
+    int ord[16], nord, oi;              /* the streams in grouping order (stream_order) */
     struct { float screen[4], fog[4], flags[4], vattr[16][4], point[4], hud[4], jit[4]; } params;
     double pt = 0.0;                    /* XBOX_PERF sub-zones */
     int use_cbr, vsc_changed = 0;       /* constant ring */
@@ -1637,16 +1923,9 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
     /* Streams: attributes interleaved in one array (same stride, within one
      * vertex of each other) share an upload and an input slot. Taken in
      * address order so each group starts at its lowest element. */
-    for (;;) {
-        int best = -1;
-        for (a = 0; a < 16; a++)
-            if ((d->inputs & (1u << a)) && !(done & (1u << a)) &&
-                (d->attr[a].kind & 0x0F) != NV2A_VSH_IN_CONST &&
-                (best < 0 || d->attr[a].base < d->attr[best].base))
-                best = a;
-        if (best < 0) break;
-        done |= (uint16_t)(1u << best);
-        a = best;
+    nord = pump_group_on() ? stream_order(d, ord) : stream_order_scan(d, ord);
+    for (oi = 0; oi < nord; oi++) {
+        a = ord[oi];
         for (g = 0; g < ngrp; g++) {
             if (grp[g].stride == d->attr[a].stride && grp[g].stride &&
                 d->attr[a].base >= grp[g].base &&
@@ -1706,7 +1985,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
         ib_buf = g_vi_ring;
         ib_off = base + ib_rel;
         il = nel ? il_get(vi, el, nel) : NULL;
-        if (nel && !il) return 0;
+        if (nel && !il) { g_il_lost++; return 0; }
     } else {
         {
             UINT total = 0;
@@ -1720,7 +1999,7 @@ int d3d8_nv2a_draw_program_gpu(const Nv2aVshDraw *d)
             strides[g] = grp[g].stride;
         }
         il = nel ? il_get(vi, el, nel) : NULL;
-        if (nel && !il) return 0;
+        if (nel && !il) { g_il_lost++; return 0; }
         ib_off = ib_upload(ctx, d->indices, d->nindices);
         if (ib_off == (UINT)-1) return 0;
         ib_buf = g_ib_ring;

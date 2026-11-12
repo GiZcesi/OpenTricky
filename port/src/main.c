@@ -120,6 +120,7 @@ void fork_riderlist_note(uint32_t kind, uint32_t race, uint32_t tick, uint32_t r
 #include "weather.h"
 #include "hud_anchor.h"
 #include "nv2a/nv2a_hdtex.h"
+#include "d3d/d3d8_shprewarm.h"
 #include "pumplag.h"
 
 /* Host display and EEPROM hooks; see d3d8_device.c and
@@ -321,6 +322,25 @@ static int open_launcher_instead(const char *why)
         MessageBoxA(NULL, msg, "SSX Tricky", MB_ICONWARNING);
     }
     return 0;
+}
+
+/* Direct3D failed for good (d3d8_xbox.h, on the pump thread): no image will
+ * ever come. A report, then the message, here only when no launcher will say
+ * it from the exit code and never in a test run, and the end. */
+static void gpu_failed(int lost, const char *what, unsigned long hr, unsigned long reason)
+{
+    static char details[256];
+    static WCHAR dir[MAX_PATH];
+    int written;
+    if (lost)
+        snprintf(details, sizeof details, "Step:      %s\nResult:    0x%08lX\nReason:    0x%08lX\n", what, hr, reason);
+    else
+        snprintf(details, sizeof details, "Step:      %s\nResult:    0x%08lX\n", what, hr);
+    fprintf(stderr, "[GRAPHICS] %s: %s, 0x%08lX, reason 0x%08lX\n",
+            lost ? "lost while running" : "could not start", what, hr, reason);
+    written = crashreport_on_gpu_failure(lost, details, dir, MAX_PATH);
+    if (s_crash_dialog) crashreport_gpu_dialog(lost, what, hr, reason, written ? dir : NULL);
+    d3d8_HostExitCode(lost ? OT_EXIT_GPU_LOST : OT_EXIT_GPU_START);
 }
 
 /*
@@ -1046,6 +1066,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * pad_sdl.h): their motors stopped when the window closes the game.
      * Off: nothing. */
     if (padsdl_on()) d3d8_SetHostExitHook(ps_pads_exit);
+    d3d8_SetGpuFailHook(gpu_failed);
 
     /* Pass tags (XBOX_PASS_TAGS). Off by default, and then
      * recomp_lookup_manual() hands out none of its hooks. */
@@ -1250,6 +1271,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
+    shpw_set_xbe(xbe_data, xbe_size);       /* the shader list points into it (d3d8_shprewarm.h) */
 
     /*
      * Read the title's own name and ID out of the XBE certificate.

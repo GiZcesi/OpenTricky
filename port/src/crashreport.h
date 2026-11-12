@@ -1,18 +1,19 @@
 /*
- * crashreport.h -- a report folder for crashes and freezes.
+ * crashreport.h -- a report folder for crashes, freezes and lost graphics.
  *
- * When the game crashes (an unhandled exception) or freezes (nothing new
- * reaches the screen for XBOX_HANG_SECONDS), a folder is written under
- * "CrashReports\" beside the executable (or %LOCALAPPDATA%\SSX Tricky\
- * CrashReports\ when that is not writable) with:
+ * When the game crashes (an unhandled exception), freezes (nothing new
+ * reaches the screen for XBOX_HANG_SECONDS) or Direct3D fails for good, a
+ * folder is written under "CrashReports\" beside the executable (or
+ * %LOCALAPPDATA%\SSX Tricky\CrashReports\ when that is not writable) with:
  *
  *   report.txt    what happened, where (module-relative address, guest
  *                 registers), build, Windows version, CPU, GPU, RAM
  *   crash.dmp /   a small minidump: thread list, registers and stack
  *   hang.dmp      pointers only (MiniDumpFilterMemory), module names
  *                 without their folders (MiniDumpFilterModulePaths);
- *                 no game memory, no code, no data segments
- *   log.txt       the last lines the game printed, even with LogFile=0
+ *                 no game memory, no code, no data segments (none for
+ *                 lost graphics: the threads say nothing about them)
+ *   log.txt      the last lines the game printed, even with LogFile=0
  *                 (kept in a ring buffer in memory)
  *   settings.txt  the .ini and the XBOX_* variables in effect
  *
@@ -77,6 +78,19 @@ void crashreport_fatal_overflow(EXCEPTION_POINTERS *ep);
 
 /* The crash message (folder, issues page); Yes opens the folder. */
 void crashreport_crash_dialog(DWORD code, const wchar_t *dir);
+
+/* Direct3D failed for good, any thread but the report's (lost = 0: it could not
+ * start; 1: it was lost while running). details is a short text block added to
+ * report.txt. Returns 1 and the folder when a report was written. No more
+ * freeze reports after it. */
+int crashreport_on_gpu_failure(int lost, const char *details,
+                               wchar_t *dir_out, size_t dir_out_len);
+
+/* What the player reads then, when no launcher will say it: the step and the
+ * codes, what to do, and with a folder (dir, or NULL) the issues page; Yes opens
+ * the folder. */
+void crashreport_gpu_dialog(int lost, const char *what, unsigned long hr, unsigned long reason,
+                            const wchar_t *dir);
 
 /* Opens a report folder in Explorer. */
 void crashreport_open_folder(const wchar_t *dir);

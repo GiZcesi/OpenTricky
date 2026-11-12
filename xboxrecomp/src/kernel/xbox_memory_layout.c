@@ -623,6 +623,8 @@ static double occlw_now_ms(void)
     return (double)t.QuadPart / qpms;
 }
 
+#define SUN_LAST(x) ((void)0)
+
 /* static: the bare loop's time here, from above (ms): 0x100000 rounds at the highest of the last waits' paces that is
  * a pace (over OCCLW_HI_STOP times their median, the thread was stopped in those 1024 rounds), plus the margin. */
 static double occlw_loop_ms(const double *hi, int n, double *top_out)
@@ -679,6 +681,299 @@ static void occlw_live_reached(double since)
     if (since > g_occlw_bound_ms + 2.0 * OCCLW_SLICE_MS) g_ow.live_longer++;
 }
 
+/*
+ * Fork: above 60 fps, the title does not wait for a report.
+ *
+ * The title (LensFX) reads at the start of each image the reports of the image
+ * before, then waits for any still pending. At 60 that wait is nearly never
+ * long. Above 60 every image of the title is rendered, and the report of the
+ * image before is counted only when the pump has translated that whole image
+ * and the GPU has drawn it: the game thread waited for the pump at every image,
+ * the pump then waited for the game thread's next commands, and the two ran in
+ * turn instead of side by side (Aloha's heavy seconds: some 1.6 ms of each
+ * image lost this way; sending the queries early, as the pump did, cost it as
+ * much again in submissions).
+ *
+ * So above 60, when a report is still pending at the title's first read, the
+ * wait hands over the count of the newest report of the same halo (the sun's
+ * flare, a lamp's or a coloured light's glow), one or two images older: at
+ * 240 fps some 4 to 8 ms (the original game at 60 read a test 16.7 ms old).
+ * Which halo a report belongs to is recorded where the title numbers its tests
+ * (see "Whose test is a report" below: a report's address is a rank in the
+ * image, not a halo). A count more than two of the original's frames old
+ * (33.3 ms: a halo back after a pause or a cut, or its first test), or a test
+ * that cannot be paired with its halo for sure, is not handed over: that read
+ * waits as before. At 60 nothing changes; the pump also stops sending the
+ * queries early then (nv2a_pgraph_d3d11.c). The reports only set the halos'
+ * brightness; the simulation never reads them.
+ *
+ * The frame limit turns it on and off (xbox_occl_set_older: on above 60, off at
+ * 60 and when the display brings the game back to 60). Developer builds only:
+ * XBOX_OCCL_OLDER=0, never (comparison).
+ */
+#define OCCL_OLDER_MAX_MS 33.333
+static volatile LONG g_occl_older;
+static int g_occl_own_on = 1;               /* each halo its own count (XBOX_OCCL_OWN=0: off, developer builds) */
+
+void xbox_occl_set_older(int on)
+{
+    if (InterlockedExchange(&g_occl_older, on ? 1 : 0) != (on ? 1 : 0))
+        fprintf(stderr, "[OCCLWAIT] %s\n", on ? "above 60: a report still pending is read as its halo's own newest count"
+                                              : "at 60: the title waits for each report");
+}
+
+int xbox_occl_older_on(void) { return g_occl_older != 0; }
+
+extern __thread uint32_t g_esi;           /* the game thread's esi (port/src/recomp/recomp_types.h) */
+extern ptrdiff_t g_xbox_mem_offset;
+/*
+ * Whose test is a report. The title numbers its visibility tests with a
+ * counter that the frame start sets to 0 or 0x800 (the image's parity) and each
+ * test moves on by one (sub_001000E0); the report of number n is at
+ * page[n >> 8] + (n & 0xFF) * 16 (0x00168FA0). So an address is "the k-th test
+ * of the images of one parity", not a halo: as soon as the number or the order
+ * of the halos tested changes (Snowdream's lamps, ground glows and coloured
+ * lights), the newest value at an address is another halo's count, and a halo
+ * handed that value showed behind the snow and flickered.
+ *
+ * The test's object is not the halo either: it is a visibility rectangle that
+ * the halo takes anew each image (see "Which halo a visibility rectangle belongs
+ * to" below), so its key is the halo behind the rectangle.
+ *
+ * So the halo of each test is recorded where the title gives out its rectangle
+ * and numbers it (fork pass fix_occlemit.py: xbox_occl_rect, xbox_occl_emit,
+ * game thread), the pump pairs each report it translates with that record (the
+ * n-th report at a number is the n-th test numbered so: both in the push
+ * buffer's order; xbox_occl_request), and keeps for each halo the count of its
+ * newest report written (xbox_occl_written). Above 60 a report still pending
+ * at the title's first read is handed the count of its own halo's newest
+ * report, if that halo's last test is this one and the count is less than two
+ * of the original's frames old; otherwise the read waits, as at 60 (each case
+ * counted, [OCCLWAIT] with XBOX_LOG_STATS=1). Never another halo's count. A
+ * rectangle whose halo was not recorded keeps itself as its key (its count is
+ * then one or two images older; counted). Nothing of this changes what the
+ * title reads at 60. Developer builds only: XBOX_OCCL_OWN=0, the newest value
+ * at the address (the old way, for comparison).
+ */
+#define OCCL_NUMBERS 4096       /* the title's test numbers (two parities of up to 0x800) */
+#define OCCL_RING    8          /* the last tests of each number kept */
+#define OCCL_LAG     4          /* a report paired only while at most 4 tests of its number are newer */
+#define OCCL_HALOS   1024       /* halos (open addressing, never removed: a track's halos are a few hundred) */
+#define OCCL_PAGES   16         /* report pages: number >> 8 */
+#define OCCL_DEVICE  0x1776C0u  /* SSX: the D3D device pointer; its report pages at +0x48C + page * 4 (0x00168FA0) */
+#define OCCL_AGE     333u       /* two of the original's frames (33.3 ms), in 0.1 ms */
+static struct { volatile LONG n; uint32_t halo[OCCL_RING]; int16_t slot[OCCL_RING]; } g_oe[OCCL_NUMBERS];
+static LONG g_ot[OCCL_NUMBERS];                 /* pump: reports translated at each number */
+static uint32_t g_oh_halo[OCCL_HALOS];          /* game thread: each slot's halo (its address), 0 = free */
+static volatile LONG64 g_oh_val[OCCL_HALOS];    /* pump: (time in 0.1 ms << 32) | count of the halo's newest report */
+static unsigned long long g_occl_own, g_occl_none, g_occl_old, g_occl_other, g_occl_unknown, g_occl_done;
+static unsigned long long g_occl_paired, g_occl_unpaired[4], g_occl_bignum, g_occl_full;
+
+/* The host address of an Xbox VA (XBOX_PTR's rule, port/src/recomp/recomp_types.h). */
+static uint8_t *occl_host(uint32_t va)
+{
+    if ((va & 0xFC000000u) == 0x80000000u && (va & 0xFFFFF000u) != 0x80010000u) va &= 0x7FFFFFFFu;
+    else if ((va & 0xFC000000u) == 0xF0000000u) va &= 0x03FFFFFFu;
+    return (uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
+}
+
+static uint32_t occl_tenths(void)               /* 0.1 ms, wraps after 5 days: compared by difference */
+{
+    uint32_t t = (uint32_t)(int64_t)(occlw_now_ms() * 10.0);
+    return t ? t : 1u;
+}
+
+/* The test number whose 16-byte report this is, or -1. */
+static int occl_number_of(const volatile void *report)
+{
+    uint32_t dev = *(volatile uint32_t *)occl_host(OCCL_DEVICE);
+    const uint8_t *r = (const uint8_t *)report;
+    int p;
+    if (!dev) return -1;
+    for (p = 0; p < OCCL_PAGES; p++) {
+        uint32_t pg = *(volatile uint32_t *)occl_host(dev + 0x48Cu + (uint32_t)p * 4u);
+        const uint8_t *h;
+        if (!pg) continue;
+        h = occl_host(pg);
+        if (r >= h && r < h + 0x1000) return ((r - h) & 15) ? -1 : p * 256 + (int)((r - h) >> 4);
+    }
+    return -1;
+}
+
+/* Game thread only (it alone adds halos): the halo's slot, added if new; -1 if full. */
+static int occl_halo_slot(uint32_t halo)
+{
+    uint32_t h = ((halo >> 2) * 2654435761u) >> 22, i;
+    for (i = 0; i < OCCL_HALOS; i++) {
+        uint32_t k = (h + i) & (OCCL_HALOS - 1);
+        if (g_oh_halo[k] == halo) return (int)k;
+        if (!g_oh_halo[k]) { g_oh_halo[k] = halo; return (int)k; }
+    }
+    return -1;
+}
+
+/* Which halo a visibility rectangle belongs to. The test's object (the
+ * rectangle) is not the halo: each image the halos take the next rectangles of
+ * defVisibilityRectList's half for that image's parity, in the order they ask
+ * (sub_00100EF2), and a halo keeps the one it got. Generated code
+ * (fix_occlemit.py) calls xbox_occl_rect for each rectangle given out, with the
+ * halo's own rectangle data pointer (the halo + 0x24: one per halo, the same
+ * every image) and the render context. The halo key is that pointer, plus which
+ * of this image's rectangles of that halo it is (0 for the first; a halo that
+ * asks twice in an image has two keys). A rectangle not recorded so (or a
+ * halo's fifth in an image) keeps the rectangle itself as its key, as before:
+ * counted. Game thread only. */
+#define OCCL_RECTS   128        /* defVisibilityRectList: 2 halves of 64 rectangles of 32 bytes */
+#define OCCL_CTX_LIST 0x18E5E8u /* the render context's pointer to the list's first half (0x00104CA0) */
+#define OCCL_CTX_HALF 0x18E5ECu /* ... and to its second, 0x800 bytes further (0x00104F12) */
+#define OCCL_LAMPS   1024
+static uint32_t g_or_key[OCCL_RECTS];           /* each rectangle's halo key, 0 = none recorded */
+static uint32_t g_or_ctx;                       /* the render context of the last rectangle given out */
+static uint32_t g_ol_halo[OCCL_LAMPS], g_ol_frame[OCCL_LAMPS], g_ol_n[OCCL_LAMPS];   /* per halo: image, rectangles */
+static uint32_t g_or_frame = 1;                 /* images seen (a rectangle given out at a half's start) */
+static unsigned long long g_occl_rects, g_occl_rect_far, g_occl_rect_more, g_occl_key_rect, g_occl_lamps_full;
+
+static int occl_rect_index(uint32_t rect)       /* the rectangle's index in the list, or -1 */
+{
+    uint32_t list;
+    if (!g_or_ctx) return -1;
+    list = *(volatile uint32_t *)occl_host(g_or_ctx + OCCL_CTX_LIST);
+    if (!list || rect < list || rect - list >= OCCL_RECTS * 32u || ((rect - list) & 31u)) return -1;
+    return (int)((rect - list) >> 5);
+}
+
+void xbox_occl_rect(uint32_t rect, uint32_t halo, uint32_t ctx)
+{
+    uint32_t h, i, k, n;
+    int r;
+    g_or_ctx = ctx;
+    if (rect == *(volatile uint32_t *)occl_host(ctx + OCCL_CTX_LIST)
+        || rect == *(volatile uint32_t *)occl_host(ctx + OCCL_CTX_HALF))
+        g_or_frame++;                           /* the first rectangle of an image's half: a new image */
+    g_occl_rects++;
+    r = occl_rect_index(rect);
+    if (r < 0) { g_occl_rect_far++; return; }
+    g_or_key[r] = 0;
+    if (!halo || (halo & 3u)) { g_occl_rect_far++; return; }
+    h = ((halo >> 2) * 2654435761u) >> 22;
+    for (i = 0; i < OCCL_LAMPS; i++) {
+        k = (h + i) & (OCCL_LAMPS - 1);
+        if (g_ol_halo[k] == halo || !g_ol_halo[k]) break;
+    }
+    if (i == OCCL_LAMPS) { g_occl_lamps_full++; return; }
+    if (!g_ol_halo[k]) { g_ol_halo[k] = halo; g_ol_frame[k] = 0; }
+    if (g_ol_frame[k] != g_or_frame) { g_ol_frame[k] = g_or_frame; g_ol_n[k] = 0; }
+    n = g_ol_n[k]++;
+    if (n) g_occl_rect_more++;
+    if (n > 3) return;                          /* a fifth rectangle in an image: the rectangle stays its own key */
+    g_or_key[r] = halo | n;                     /* the halo's data pointer is 4-aligned: room for n */
+}
+
+/* The halo key of a rectangle (the test's object): its halo's, or the rectangle itself. */
+static uint32_t occl_key_of(uint32_t rect)
+{
+    int r = occl_rect_index(rect);
+    if (r >= 0 && g_or_key[r]) return g_or_key[r];
+    g_occl_key_rect++;
+    return rect | 2u;                           /* a rectangle is 32-aligned: never a halo key */
+}
+
+/* Generated code (fix_occlemit.py), game thread: the title gave test number
+ * `number` to rectangle `rect`, just before the test; recorded for its halo. */
+void xbox_occl_emit(uint32_t number, uint32_t rect)
+{
+    LONG n;
+    int s;
+    uint32_t halo = rect ? occl_key_of(rect) : 0;
+    if (number >= OCCL_NUMBERS || !halo) { g_occl_bignum++; return; }
+    s = occl_halo_slot(halo);
+    if (s < 0) g_occl_full++;
+    n = g_oe[number].n;
+    g_oe[number].halo[n % OCCL_RING] = halo;
+    g_oe[number].slot[n % OCCL_RING] = (int16_t)s;
+    InterlockedExchange(&g_oe[number].n, n + 1);   /* after the record (the pump reads n first) */
+}
+
+/* Pump: a report (its 16 bytes in memory) asked for, in the push buffer's
+ * order. Its halo's slot, or -1 when the pairing is not sure: no number for
+ * the address, no test numbered so yet, or its record already replaced. */
+int xbox_occl_request(const volatile void *report)
+{
+    int i = occl_number_of(report), s;
+    LONG n, t;
+    if (i < 0) { g_occl_unpaired[0]++; return -1; }
+    n = g_oe[i].n;
+    t = g_ot[i];
+    if (t >= n) { g_occl_unpaired[1]++; return -1; }   /* not a test the title numbered: the count stays */
+    g_ot[i] = t + 1;
+    if (n - t > OCCL_LAG) { g_occl_unpaired[2]++; return -1; }
+    s = g_oe[i].slot[t % OCCL_RING];
+    if (s < 0) { g_occl_unpaired[3]++; return -1; }
+    g_occl_paired++;
+    return s;
+}
+
+/* Pump: the report (its 16 bytes) of a request of halo slot `halo` was written with `count`. */
+void xbox_occl_written(int halo, const volatile void *report, uint32_t count)
+{
+    if (halo < 0 || halo >= OCCL_HALOS) return;
+    InterlockedExchange64(&g_oh_val[halo], (LONG64)(((uint64_t)occl_tenths() << 32) | count));
+    (void)report;
+}
+
+#define OCCL_SUN_GIVE(st, h, c, g, w) ((void)0)
+
+/* The title's first read found the report pending: 1 if a count was handed
+ * over (status set to done). */
+static int occl_older_give(volatile uint32_t *status)
+{
+    volatile uint32_t *report = status - 3;
+    uint32_t halo = occl_key_of(g_esi);          /* sub_000FBEA6: esi is the rectangle being read; its halo */
+    uint64_t v;
+    LONG n;
+    int i, s;
+    if (!g_occl_own_on) {                        /* developer builds, XBOX_OCCL_OWN=0: the newest value at the address */
+        volatile uint64_t *ts = (volatile uint64_t *)(volatile void *)report;
+        uint64_t t = *ts;
+        double age;
+        static double qpms;
+        LARGE_INTEGER now;
+        if (!t) return 0;
+        if (qpms <= 0.0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); qpms = (double)f.QuadPart / 1000.0; }
+        QueryPerformanceCounter(&now);
+        age = (double)((int64_t)now.QuadPart - (int64_t)t) / qpms;
+        if (age < 0.0 || age > OCCL_OLDER_MAX_MS) { g_occl_old++; OCCL_SUN_GIVE(status, halo, report[2], 0, 4); return 0; }
+        *status = 0;
+        g_occl_own++;
+        OCCL_SUN_GIVE(status, halo, report[2], 1, 0);
+        return 1;
+    }
+    i = occl_number_of(report);
+    if (i < 0) { g_occl_unknown++; OCCL_SUN_GIVE(status, halo, 0, 0, 1); return 0; }
+    n = g_oe[i].n;
+    if (!n || g_oe[i].halo[(n - 1) % OCCL_RING] != halo) {   /* this number's last test is not this halo's */
+        g_occl_other++;
+        OCCL_SUN_GIVE(status, halo, 0, 0, 2);
+        return 0;
+    }
+    s = g_oe[i].slot[(n - 1) % OCCL_RING];
+    if (s < 0) { g_occl_unknown++; OCCL_SUN_GIVE(status, halo, 0, 0, 1); return 0; }
+    v = (uint64_t)g_oh_val[s];
+    if (!v) { g_occl_none++; OCCL_SUN_GIVE(status, halo, 0, 0, 3); return 0; }
+    if (occl_tenths() - (uint32_t)(v >> 32) > OCCL_AGE) {
+        g_occl_old++;
+        OCCL_SUN_GIVE(status, halo, (uint32_t)v, 0, 4);
+        return 0;
+    }
+    if (*status != 0xFFFFFFFFu) { g_occl_done++; return 1; }   /* written meanwhile: its own count is there */
+    report[2] = (uint32_t)v;                     /* +8: the halo's own newest count */
+    MemoryBarrier();
+    *status = 0;                                 /* done */
+    g_occl_own++;
+    OCCL_SUN_GIVE(status, halo, (uint32_t)v, 1, 0);
+    return 1;
+}
+
 uint32_t xbox_occl_wait(volatile uint32_t *status, uint32_t rounds)
 {
     static __thread double t_first, t_prev, w_loop, rate[OCCLW_RATES], hi[OCCLW_HI];
@@ -693,6 +988,8 @@ uint32_t xbox_occl_wait(volatile uint32_t *status, uint32_t rounds)
     if (!occ_on) return rounds;                     /* no report is ever written: the bare loop */
     g_ow.calls++;
     if (rounds == OCCLW_BOUND) {                    /* a wait's first round */
+        if (g_occl_older && !g_occlw_count && occl_older_give(status))
+            return rounds;                          /* above 60: the loop rereads the status, done, and leaves */
         if (g_occlw_trace) {                        /* the last wait's line, before this one's clock */
             occlw_trace_put(&rec);
             memset(&rec, 0, sizeof rec);
@@ -709,6 +1006,7 @@ uint32_t xbox_occl_wait(volatile uint32_t *status, uint32_t rounds)
     }
     if (t_first <= 0.0 || rounds > OCCLW_BOUND - OCCLW_STEP) return rounds;
     t = occlw_now_ms();
+    SUN_LAST(t - t_first);                          /* M-SUN */
     if (g_occlw_trace) {
         if (t - t_prev > rec.maxc) rec.maxc = t - t_prev;
         rec.last = t - t_first;
@@ -841,6 +1139,7 @@ uint32_t xbox_occl_wait(volatile uint32_t *status, uint32_t rounds)
             rec.last = t - t_first;
             rec.last_rounds = ret;
         }
+        SUN_LAST(t - t_first);
         return ret;
     }
     if (g_occlw_bound_ms > 0.0)                     /* the console's time, or the estimate if longer (static) */
@@ -885,6 +1184,7 @@ uint32_t xbox_occl_wait(volatile uint32_t *status, uint32_t rounds)
         rec.last_rounds = ret;
         rec.cpu_last = (int)GetCurrentProcessorNumber();
     }
+    SUN_LAST(t - t_first);
     return ret;
 }
 
@@ -919,6 +1219,18 @@ void xbox_occl_wait_report(void)
             "%.2f ms after their start on average\n", g_ow.slept,
             g_ow.slept ? g_ow.slept_ms / (double)g_ow.slept : 0.0, g_ow.woken, g_ow.bound, g_ow.round_ns,
             g_ow.waits, mode, g_ow.bound ? g_ow.bound_ms / (double)g_ow.bound : 0.0);
+    if (g_occl_own || g_occl_none || g_occl_old || g_occl_other || g_occl_unknown || g_occl_done)
+        fprintf(stderr, "[OCCLWAIT] above 60: %llu reads given their halo's own newest count without a wait (%llu written "
+                "meanwhile); waited as at 60: %llu no count of that halo yet, %llu its count older than %.1f ms, %llu "
+                "the number's last test another halo's, %llu not identified\n", g_occl_own, g_occl_done, g_occl_none,
+                g_occl_old, OCCL_OLDER_MAX_MS, g_occl_other, g_occl_unknown);
+    fprintf(stderr, "[OCCLWAIT] reports paired with their halo: %llu; not paired: %llu no test number for the address, "
+            "%llu no test numbered so, %llu more than %d newer tests of the number, %llu no halo slot; %llu tests "
+            "numbered over %d, %llu halos over %d\n", g_occl_paired, g_occl_unpaired[0], g_occl_unpaired[1],
+            g_occl_unpaired[2], OCCL_LAG, g_occl_unpaired[3], g_occl_bignum, OCCL_NUMBERS - 1, g_occl_full, OCCL_HALOS);
+    fprintf(stderr, "[OCCLWAIT] rectangles given out: %llu, %llu outside the list or of no halo, %llu a halo's second or later "
+            "in an image; lookups keyed by the rectangle itself (its halo unknown): %llu; halos over %d: %llu\n",
+            g_occl_rects, g_occl_rect_far, g_occl_rect_more, g_occl_key_rect, OCCL_LAMPS, g_occl_lamps_full);
     fprintf(stderr, "[OCCLWAIT2] static estimate (0x100000 rounds at the high pace %.1f ns, +%.0f %%): %.2f ms on "
             "average, %.2f at most, longer than %.2f ms in %llu of %llu waits; followed bound (slices of %d ms, %llu): "
             "reached by %llu waits, %.2f ms after their start on average, %.2f at most, later than %.2f ms in %llu\n",

@@ -6,8 +6,8 @@
 <head></head>
 <body>
     <div class="side">
-        <img class="emblem" data-if="have_disc" src="ot:emblem/$track$"/>
-        <div class="otb" data-if="!have_disc"><img src="ot:otbadge"/><span>OT</span></div>
+        <img class="emblem" data-if="have_art" src="ot:emblem/$track$"/>
+        <div class="otb" data-if="!have_art"><img src="ot:otbadge"/><span>OT</span></div>
         <div class="nav n1" id="nav-home" data-class-on="page == 'home'" data-event-click="go('home')"><div class="bar"></div><img src="ot:icon/home"/></div>
         <!-- Right of the gear: the page's main action at its left (PLAY, or the disc panel without a disc image). -->
         <div class="nav n2" id="nav-settings" data-class-on="page == 'settings'" data-event-click="go('settings')"

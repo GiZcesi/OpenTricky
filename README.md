@@ -32,14 +32,11 @@ are reimplemented on Direct3D 11, XAudio2 and XInput. OpenTricky continues [**SS
 - **A modern PC release**: Xbox and PlayStation controllers, the original PS2 controls, Xbox, PlayStation and PS2 button styles, full remapping, any resolution, ultrawide and high frame rates, all set up in one launcher.
 - **New options on top**: smoother edges, soft shadows, longer draw distance, HD HUD. The *Original Xbox* preset turns them all off at once.
 
-## Latest: 0.1.5
+## Latest: 0.1.6
 
-- **Faster**: on our test PC, without a frame rate limit, 24 to 31% more frames per second than 0.1.4.
-- **Closer to the original game**: the sun's glare no longer drops out when the graphics card falls behind, and the game's videos play at their own pace.
-- **Fixes**: split screen at *Draw distance Max*, camera cuts above 60 FPS, the scene after the finish line on screens wider than 16:9, and *Find my disc image*.
-- **New settings**: *Weather* (snowfall without the thick fog, as in the PS2 version) and *PlayStation controllers (experimental)*.
-
-Everything else: the [release notes](https://github.com/GiZcesi/OpenTricky/releases) and [CHANGELOG.md](CHANGELOG.md).
+- **A faster graphics pipeline**: above 60 FPS, the light halos no longer make the game wait for the graphics card, and every draw costs the translation less: up to 56% more frames per second than 0.1.5 in the heaviest scenes, without a frame rate limit (your gains depend on your PC).
+- **Steadier**: no more freeze after hours of play without restarting, shaders built before the first race, and no sound crackles when the processor is busy.
+- **Above 60 FPS**, the trail in the snow and the snow sprays stay with the board, and sudden moves no longer slide; **at 60 FPS** on a 60 Hz screen, the controls answer about 5 ms sooner. Keep *VSync* on: the launcher now says why.
 
 ## Install and play
 
@@ -77,6 +74,7 @@ Every setting is explained in the [**Settings guide**](https://opentricky.com/se
 
 | Problem | What to do |
 |---|---|
+| **Without VSync, above 60 FPS, motion is less even** than with *VSync* on, even at a higher frame rate (most of all with *Frame rate limit* at *Unlimited*). | Keep *VSync* on (the default): it adds very little input delay. |
 | **Above 60 FPS, the controls respond one game step later** (about 17 ms). | Set *Frame rate limit* to *60 (Xbox)* for the original game's exact timing. |
 | **Natively, only Xbox-style (XInput) controllers**, and the DualShock 4 and DualSense with *PlayStation controllers (experimental)*. | For other controllers, use Steam Input or DS4Windows. |
 

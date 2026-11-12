@@ -12,7 +12,7 @@
 
 #define OT_VERSION_MAJOR 0
 #define OT_VERSION_MINOR 1
-#define OT_VERSION_PATCH 5
+#define OT_VERSION_PATCH 6
 /* "" for a release; "-dev" for every other build. Only the release tools
  * build with OT_RELEASE (cmake -DOT_RELEASE=ON, see port/CMakeLists.txt). */
 #ifdef OT_RELEASE
@@ -23,7 +23,7 @@
 
 #define OT_STR_(x) #x
 #define OT_STR(x) OT_STR_(x)
-/* "0.1.5" and "0.1.5-dev" */
+/* "0.1.6" and "0.1.6-dev" */
 #define OT_VERSION_NUMBER OT_STR(OT_VERSION_MAJOR) "." OT_STR(OT_VERSION_MINOR) "." OT_STR(OT_VERSION_PATCH)
 #define OT_VERSION        OT_VERSION_NUMBER OT_VERSION_SUFFIX
 
@@ -36,5 +36,11 @@
  * would read "Skip launcher" again and could loop). Below 0xC0000000, so it
  * is never taken for a crash. */
 #define OT_EXIT_DISC_REFUSED 0x0D15C
+
+/* Its exit codes when Direct3D fails for good (main.c, gpu_failed): the game
+ * could not start its graphics, or lost them while running. The launcher,
+ * still waiting for the game, says which. Below 0xC0000000 too. */
+#define OT_EXIT_GPU_START    0x0D3D1
+#define OT_EXIT_GPU_LOST     0x0D3D2
 
 #endif /* OT_VERSION_H */

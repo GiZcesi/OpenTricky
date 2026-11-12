@@ -39,7 +39,13 @@
  * A torn read is possible in principle -- the title could be mid-write when we
  * sample the pointer -- but the pointer is only published *after* the method
  * and its data are stored (the setters write [eax], [eax+4] and only then
- * `mov [esi],eax`), so anything below the sampled pointer is complete.
+ * `mov [esi],eax`), so anything below the sampled pointer is complete. One
+ * writer of the runtime stored the pointer first: the fast path of the simple
+ * render states (0x166FE0), harmless on the console, whose GPU reads only up
+ * to PUT. Sampled between its stores, the last two dwords of a batch were an
+ * older pass of the ring: skipped as "not a command" (or run as a stale
+ * command) while the render state the title sent was lost. The regen pass
+ * port/tools/fork/fix_pushorder.py stores its pointer after its data.
  *
  * ── Gate ────────────────────────────────────────────────────────────────────
  * On by default; set XBOX_LIVE_PB=0 to disable and get the previous
@@ -206,6 +212,8 @@ static int live_pb_bring_up(void)
     if (FAILED(hr) || !dev) {
         fprintf(stderr, "[LIVE-PB] CreateDevice failed: 0x%08lX; live push buffer disabled\n",
                 (unsigned long)hr);
+        /* No image will ever come: said, and the process ends (d3d8_xbox.h). */
+        d3d8_GpuStartFailed((unsigned long)hr);
         return 0;
     }
 

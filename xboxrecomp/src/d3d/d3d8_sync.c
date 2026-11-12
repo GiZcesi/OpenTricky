@@ -53,11 +53,11 @@ static unsigned long long s_gate_resync, s_gate_dn;
 static long long s_gate_dsum;           /* statistics' queue - counted queue, summed (diagnostic) */
 /* Present grid, see pgrid_wait. */
 static struct { int on; double margin, anchor, last_slot; unsigned long long held, late, restart; } G;
-static int s_fc;                        /* the frame timer is on an exact grid (port, frame_clock.c) */
+static void (*s_fc_shift)(double ms);   /* the frame timer is on an exact grid (port, frame_clock.c); moves it */
 
-void d3d8_sync_set_frame_clock(void) { s_fc = 1; }
+void d3d8_sync_set_frame_clock(void (*shift)(double ms)) { s_fc_shift = shift; }
 static void pgrid_init(void);
-static void pgrid_wait(IDXGISwapChain *sc, double t);
+static void pgrid_wait(IDXGISwapChain *sc, double t, int video);
 
 static const char *const k_mode_name[] = { "legacy", "off", "vsync", "adaptive" };
 
@@ -1007,7 +1007,7 @@ static void pgrid_init(void)
     /* With the frame timer on an exact grid (frame_clock.c) the frames
      * arrive ~2.5 ms less scattered: the adaptive margin is let down to 1 ms
      * (it stays the p95 of GPU end - slot + 0.5). */
-    if (!e || !e[0]) e = s_fc ? "3:1:2.5" : "3:3:2.5";
+    if (!e || !e[0]) e = s_fc_shift ? "3:1:2.5" : "3:3:2.5";
     G.on = e[0] == '1' || e[0] == '2' || e[0] == '3' ? e[0] - '0' : 0;
     G.margin = 3.0;
     V.guard = G.on == 3 ? 2.5 : 1.0;
@@ -1019,6 +1019,154 @@ static void pgrid_init(void)
             if (m >= 0.0 && m <= 4.0) V.guard = m;
         }
     }
+}
+
+
+/* ── the frame timer follows the refreshes (XBOX_FCLOCK_FOLLOW=0: off, diagnostic) ──
+ * At the 60 fps limit with VSync on a fixed display (60 Hz, or a multiple of 60 Hz),
+ * each frame has a target (the present grid's slot + margin, the GPU usually done
+ * by then; on a 60 Hz display, its plan) and is shown on a refresh after it. The
+ * frame timer (frame_clock.c, where the controller is read) runs at 60.000 Hz and
+ * the display a little slower (239.98 / 4 = 59.995 Hz; 59.973 Hz): the phase between
+ * them goes round once a minute or so, and with it the time from target to refresh
+ * sweeps the whole refresh period: 2.5 to 10.8 ms at 120 Hz, 1.5 to 18.2 ms at
+ * 60 Hz. The controller is already read during that time. Here the timer's phase
+ * follows the refreshes and holds that time at the room a frame needs: the
+ * controller is read later, and the frame is shown on the same refresh of the same
+ * cadence.
+ * The room (FL.room = guard + FOLLOW_TAIL) is the time a frame must keep before its
+ * refresh: the time a flip needs to be taken (frames presented 0.7 to 2.2 ms before
+ * a refresh missed it 20 to 35 % of the time; the grid's guard keeps 2.5 ms), plus
+ * the time that leaves a frame later than its target as many chances as the sweep
+ * gives on average (the time from the timer's callback to the GPU's end has a tail
+ * of about 1 ms above the grid's margin: 2.1 ms). 4.6 ms. With a refresh period no
+ * longer than the room there is nothing to gain: the sweep's own time from target
+ * to refresh is already about the room on average (4.58 ms at 240 Hz), and a place
+ * held closer to the refresh than the room loses frames (measured at 240 Hz with
+ * 3.9 ms: more frames held a refresh longer in the menus). So the timer follows
+ * only a display whose refresh is longer than the room (60, 120, 180 Hz); at 240 Hz
+ * and above nothing moves. On a 60 Hz display a frame that misses its refresh
+ * repeats the one before: the room there (FOLLOW_ROOM60, from the plan with its own
+ * lead) is a little longer.
+ * When the phase comes to the end of its window the shift goes back by one
+ * refresh, FOLLOW_WRAP_STEP a frame at most: one frame shown for a refresh fewer
+ * once per turn of the phase, as the sweep does; at 60 Hz, one frame left out by
+ * the 60 Hz display path, as it does. Never in one step: the title's callback
+ * counts a tick (app+0x14, 0xAA310) and its main loop (0xAA1A0) runs the ticks
+ * counted, then one render, then waits for the frame event (0xB2750). Two callbacks
+ * within one turn of that loop give two ticks in one image, and that image's
+ * visibility tests and the render of the tick between them never happen. The
+ * loop's turn ends after the frame's Present (the title waits for the pump), which
+ * the present grid may hold to its target, up to ~13 ms after the callback:
+ * callbacks 12.7 ms apart still met in one turn about one wrap in four (measured).
+ * A step of FOLLOW_WRAP_STEP keeps them 16.2 ms apart or more: the loop would have
+ * to take 97 % of a frame, where the title misses ticks with or without the
+ * change. Every tick keeps its own render. The same callbacks run in the same
+ * order and each does the same; only their instants move. Only with the frames flipped on their own (media
+ * statistics: an overlay plane). Anywhere else (VSync off, VRR, no statistics, a
+ * composed window, not a multiple of 60 Hz), and while too many frames miss their
+ * target, the shift stays where it is: any phase suits the grid, which works as it
+ * did. */
+#define FOLLOW_TAIL     2.1     /* ms over the guard: a late frame's share of the room (see above) */
+#define FOLLOW_ROOM60   5.0     /* ms from plan to refresh on a 60 Hz display */
+#define FOLLOW_HIGH     2.0     /* ms: the highest shift; 11.7 ms of a stall from the title's catch-up */
+#define FOLLOW_WRAP_STEP 0.5    /* ms of a wrap per frame at most (see above) */
+#define FOLLOW_GAIN     0.1
+#define FOLLOW_SLEW     0.02    /* ms per frame at most: below the grid's own scatter */
+#define FOLLOW_DEAD     0.1     /* ms: the target's own jitter */
+#define FOLLOW_LATE     13      /* frames of 128 past their target (10 %): the target means little */
+static struct {
+    int tried, off, on;
+    double room, room60;        /* ms a frame keeps from its target to its refresh (above 60 Hz: also the shortest
+                                   refresh period followed), on a 60 Hz display */
+    int said_short;             /* a refresh no longer than the room was logged */
+    double shift;               /* asked of the timer (ms) */
+    double move[2];             /* asked and not yet in the frames' arrivals: a shift asked during a frame is
+                                   taken at the next callback, and moves the one after */
+    int n, late, still;         /* this window of 128 frames, those late; the last window was over FOLLOW_LATE */
+    double owe;                 /* what is left of a wrap (ms), paid FOLLOW_WRAP_STEP a frame at most */
+    unsigned long long frames, wraps, stills;
+} FL;
+
+static void follow_init(void)
+{
+    const char *e = getenv("XBOX_FCLOCK_FOLLOW");
+    FL.tried = 1;
+    FL.off = !s_fc_shift || (e && e[0] == '0' && !e[1]);
+    FL.room = V.guard + FOLLOW_TAIL;
+    FL.room60 = FOLLOW_ROOM60;
+    if (FL.off && s_fc_shift) fprintf(stderr, "D3D8: the frame timer does not follow the refreshes (diagnostic)\n");
+}
+
+/* The grid's slots move with the arrivals of the frames (pgrid_wait, s60_wait):
+ * what the timer was asked two frames ago reaches this one. */
+static void follow_grid(void)
+{
+    G.anchor += FL.move[1];
+    G.last_slot += FL.move[1];
+    FL.move[1] = FL.move[0];
+    FL.move[0] = 0.0;
+}
+
+static void follow_shift(double s)
+{
+    FL.move[0] += s - FL.shift;
+    FL.shift = s;
+    s_fc_shift(s);
+}
+
+/* 1: this frame paid part of a wrap (nothing else moves the shift meanwhile). */
+static int follow_owed(void)
+{
+    double d = FL.owe;
+    if (d == 0.0) return 0;
+    if (d > FOLLOW_WRAP_STEP) d = FOLLOW_WRAP_STEP;
+    if (d < -FOLLOW_WRAP_STEP) d = -FOLLOW_WRAP_STEP;
+    FL.owe -= d;
+    if (fabs(FL.owe) < 1e-9) FL.owe = 0.0;
+    follow_shift(FL.shift + d);
+    return 1;
+}
+
+/* y: ms from this frame's target to the refresh it is planned on; per: the
+ * refresh period; ahead: the time wanted (the room); late: the frame is past its
+ * target. */
+static void follow_refresh(double y, double per, double ahead, int late)
+{
+    double e, s;
+    if (FL.off) return;
+    if (per <= FL.room) {                       /* nothing to gain there (see above) */
+        if (!FL.said_short) {
+            FL.said_short = 1;
+            fprintf(stderr, "D3D8: the frame timer does not follow the refreshes: a refresh of %.2f ms is not longer than "
+                    "the %.1f ms a frame keeps before it\n", per, FL.room);
+        }
+        return;
+    }
+    FL.frames++;
+    FL.late += late;
+    if (++FL.n >= 128) {
+        FL.still = FL.late > FOLLOW_LATE;
+        if (FL.still) FL.stills++;
+        FL.n = FL.late = 0;
+    }
+    if (FL.still || s_comp_mode != DXGI_FRAME_PRESENTATION_MODE_OVERLAY) return;
+    if (follow_owed()) return;                  /* a wrap begun is ended first */
+    if (!FL.on) {
+        FL.on = 1;
+        fprintf(stderr, "D3D8: the frame timer follows the refreshes (refresh %.4f ms, %.1f ms from a frame's target to its refresh)\n",
+                per, ahead);
+    }
+    e = y - ahead;
+    e -= per * floor(e / per + 0.5);            /* to the nearest refresh; > 0: the timer can fire later */
+    if (fabs(e) < FOLLOW_DEAD) return;
+    e *= FOLLOW_GAIN;
+    if (e > FOLLOW_SLEW) e = FOLLOW_SLEW;
+    if (e < -FOLLOW_SLEW) e = -FOLLOW_SLEW;
+    s = FL.shift + e;
+    if (s > FOLLOW_HIGH) { FL.owe -= per; FL.wraps++; }
+    else if (s < FOLLOW_HIGH - per - 0.5) { FL.owe += per; FL.wraps++; }
+    follow_shift(s);
 }
 
 
@@ -1046,6 +1194,9 @@ static void pgrid_init(void)
  * display at 59-61 Hz with a fixed refresh in the frame statistics; anywhere
  * else (VRR, no statistics: Deck / DXVK without them, a window behind) the
  * previous presentation is kept (2-frame queue), and one log line says so.
+ * The frame timer's phase follows the refreshes here too (follow_refresh): frames
+ * no longer sweep the refresh, and the meeting of two frames becomes the shift's
+ * wrap, the timer's callback coming right after the one before.
  * A frame of the title's video player (d3d8_sync_video_frame) is
  * not one of those 60 Hz frames. The player presents once per frame of its
  * file, at 29.97 fps: every second refresh, and in a burst of 3 to 6 frames
@@ -1115,15 +1266,20 @@ static int s60_wait(IDXGISwapChain *sc, double t, int video)
 {
     double k, slot, margin, plan, s, per, hold;
     DXGI_FRAME_STATISTICS fs;
+    int on_plan = 1;
     S6.frames++;
     if (video) S6.vframes++;
+    if (!FL.tried) follow_init();
     pgrid_gpu_wait(sc);
     per = V.vper;
     /* the present grid's slot (as pgrid_wait), its margin from the GPU end */
     if (G.anchor <= 0.0 || t - G.last_slot > 4.0 * PGRID_PERIOD || t < G.last_slot) {
         G.anchor = G.last_slot = slot = t;
         G.restart++;
+        FL.move[0] = FL.move[1] = 0.0;
+        on_plan = 0;
     } else {
+        follow_grid();
         k = floor((t - G.anchor) / PGRID_PERIOD + 0.5);
         slot = G.anchor + k * PGRID_PERIOD;
         if (slot < G.last_slot + 0.5 * PGRID_PERIOD) slot = G.last_slot + PGRID_PERIOD;
@@ -1133,9 +1289,10 @@ static int s60_wait(IDXGISwapChain *sc, double t, int video)
     t = now_ms();
     margin = pgrid_margin3(t - slot, video);
     plan = slot + margin;
-    if (plan - t > margin + 0.5 * PGRID_PERIOD) plan = t;        /* never planned more than ~half a frame + margin ahead */
+    if (plan - t > margin + 0.5 * PGRID_PERIOD) { plan = t; on_plan = 0; }  /* never planned more than ~half a frame + margin ahead */
     s = pgrid_next_blank(sc, plan + S60_LEAD);                   /* the refresh it is planned on */
     if (s <= 0.0) { S6.s_prev = 0.0; return 1; }
+    if (on_plan && !video) follow_refresh(s - plan, per, FL.room60, t >= plan);
     /* The latest frame shown, by the statistics (updated at each flip): shown
      * on another refresh than planned (a refresh missed unseen) -> the frames
      * planned after it move as much, so that the next one meets them and is
@@ -1207,17 +1364,22 @@ static int s60_wait(IDXGISwapChain *sc, double t, int video)
                     "%llu shown off plan by the statistics, refresh %.4f ms, margin now %.2f ms; "
                     "%llu video frames, none left out, %llu on the refresh after an occupied one\n",
                     S6.frames, S6.drops, S6.late, S6.recover, per, V.mcur, S6.vframes, S6.vnext);
+        if (S6.t_log > 0.0 && xbox_log_stats())
+            fprintf(stderr, "D3D8: frame timer: shift %.2f ms, %llu frames, %llu wraps, %llu windows of 128 too late\n",
+                    FL.shift, FL.frames, FL.wraps, FL.stills);
         S6.t_log = t;
     }
     return 1;
 }
 
 /* Holds the calling (presenting) thread until this frame's slot + margin
- * (mode 2: GPU done first, then off the blank's guard band). */
-static void pgrid_wait(IDXGISwapChain *sc, double t)
+ * (mode 2: GPU done first, then off the blank's guard band). video: a frame of
+ * the title's video player, whose pace is not the frame timer's. */
+static void pgrid_wait(IDXGISwapChain *sc, double t, int video)
 {
     double k, slot, target, margin;
     long hz = s_hz, cap = s_pace_fps;
+    int on_plan = 1;
     static double last_log;
     if (!G.on || cap != 60 || (s_mode != D3D8_SYNC_VSYNC && s_mode != D3D8_SYNC_ADAPTIVE)) {
         return;
@@ -1233,16 +1395,21 @@ static void pgrid_wait(IDXGISwapChain *sc, double t)
                 fprintf(stderr, "D3D8: present grid %d: GPU wait %.2f ms avg (%llu over 25 ms), %llu frames moved past a blank, blank known %llu, period %.4f ms, guard %.1f ms, margin now %.2f ms\n",
                         G.on, V.gpu_frames ? V.gpu_ms / (double)V.gpu_frames : 0.0, V.gpu_slow, V.guarded, V.vbl_ok, V.vper, V.guard,
                         G.on == 3 ? V.mcur : G.margin);
+            fprintf(stderr, "D3D8: frame timer: shift %.2f ms, %llu frames, %llu wraps, %llu windows of 128 too late\n",
+                    FL.shift, FL.frames, FL.wraps, FL.stills);
         }
         last_log = t;
     }
+    if (!FL.tried) follow_init();
     if (G.on >= 2) pgrid_gpu_wait(sc);
     if (G.anchor <= 0.0 || t - G.last_slot > 4.0 * PGRID_PERIOD || t < G.last_slot) {
         /* start, load, stall: the grid starts again on this frame */
         G.anchor = G.last_slot = t;
         G.restart++;
+        FL.move[0] = FL.move[1] = 0.0;
         return;
     }
+    follow_grid();
     k = floor((t - G.anchor) / PGRID_PERIOD + 0.5);
     slot = G.anchor + k * PGRID_PERIOD;
     if (slot < G.last_slot + 0.5 * PGRID_PERIOD) slot = G.last_slot + PGRID_PERIOD;   /* one frame per slot */
@@ -1253,10 +1420,13 @@ static void pgrid_wait(IDXGISwapChain *sc, double t)
     margin = G.on == 3 ? pgrid_margin3(t - slot, 0) : G.margin;
     target = slot + margin;
     if (t >= target) G.late++;
-    else if (target - t > margin + 0.5 * PGRID_PERIOD) target = t;   /* never hold more than ~half a frame + margin */
+    else if (target - t > margin + 0.5 * PGRID_PERIOD) { target = t; on_plan = 0; }  /* never hold more than ~half a frame + margin */
     else G.held++;
     if (G.on >= 2) {
         double b = pgrid_next_blank(sc, target);
+        /* before the guard: from the target to the refresh this frame will be shown on */
+        if (b > 0.0 && on_plan && !video)
+            follow_refresh(b - target < V.guard ? b - target + V.vper : b - target, V.vper, FL.room, t >= target);
         if (b > 0.0 && b - target < V.guard) {                  /* the flip may or may not catch this blank */
             target = b + 0.3;
             V.guarded++;
@@ -1447,7 +1617,7 @@ HRESULT d3d8_sync_present(IDXGISwapChain *sc, double *dxgi_ms)
              * display turned off must not freeze the presenting thread. */
             if (WaitForSingleObjectEx(s_wait, 100, TRUE) == WAIT_TIMEOUT) M.waits_to++;
         }
-        pgrid_wait(sc, now_ms());
+        pgrid_wait(sc, now_ms(), video);
     }
     if (s_before_present) s_before_present();   /* the reports done during the waits (O-B) */
     t1 = now_ms();

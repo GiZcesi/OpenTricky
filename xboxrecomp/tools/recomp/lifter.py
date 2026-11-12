@@ -1127,7 +1127,10 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
+                # bp and sp were missing, so `movsx ecx, bp` zero-extended
+                # (sub_00011BE0). Same fix as xboxrecomp v0.15.0 / v0.17.0
+                # (sp00nznet/xboxrecomp #186, #244, MIT).
                 src = f"SX16({src})"
         return [_fmt_operand_write(ops[0], src)]
 
@@ -2265,6 +2268,7 @@ _SETCC = frozenset({"sete", "setne", "setb", "setae", "setbe", "seta", "setl",
                     "setc", "setnc", "setnae", "setnb", "setna", "setnbe",
                     "setnge", "setnl", "setng", "setnle"})
 _CF_CONSUMERS = frozenset({"sbb", "adc", "rcl", "rcr"})
+_CF_SHIFTS = frozenset({"shl", "sal", "shr", "sar"})
 # Instructions whose first operand is read, not written.
 _NO_DST_WRITE = frozenset({
     "cmp", "test", "bt", "nop", "push", "jmp", "prefetchnta", "prefetcht0",
@@ -2481,6 +2485,110 @@ def _make_cf_expr(setter, ops):
     return None
 
 
+# ── CF of a shift or an adc / sbb, for the adc / sbb that reads it ──
+#
+# A shift's CF is the last bit it shifted out, and an adc / sbb's is its own
+# carry out; only the operands *before* the instruction hold them, so
+# _make_cf_expr cannot rebuild them at the consumer from the setter's operands
+# the way it does for cmp / sub / add. They were never computed at all: `_cf`
+# kept its initial 0 after a shift, and its carry *in* after an adc / sbb.
+# MSVC's fill idiom
+#
+#     shr ecx, 1 / rep stosd / adc ecx, ecx / rep stosw
+#
+# never wrote the last 16-bit word of an odd count (sub_00014610,
+# sub_00150122, sub_0015DAB5), and _ftol2's 64-bit rounding step
+# (`adc eax, 0 / adc edx, 0`, sub_0015CA8B, and its sbb twin sub_0015CAAF)
+# added the low word's carry in to the high word instead of its carry out.
+# Both instructions now set `_cf` themselves when an adc / sbb later in the
+# block reads it. Same rule as xboxrecomp v0.17.0, where every setter
+# publishes CF for the reader after it (sp00nznet/xboxrecomp #276, #277, #278,
+# MIT). `sbb r, r` leaves CF as it found it, so it needs nothing.
+#
+# Readers in another block are not modelled; the reader is then marked
+# (_CF_NOT_MODELLED) and the regen guard check_deadflags.py fails on it.
+# `shr ; rcr` pairs are left to fixscalar.py, which rewrites them together.
+
+_CF_NOT_MODELLED = "from another block: not modelled"
+
+
+def _writes_cf(ins):
+    """True if `ins` changes CF (or leaves it undefined)."""
+    m = ins.mnemonic
+    if m in ("inc", "dec", "not") or m.startswith("j") or m.startswith("set") \
+            or m.startswith("cmov"):
+        return False
+    if m.startswith("rep"):
+        return "cmps" in m or "scas" in m
+    if m in FLAG_SETTERS or m in _EFLAGS_SETTERS or m in _FLAGS_UNDEFINED:
+        return True
+    return m in ("call", "sahf", "popfd", "popf", "stc", "clc", "cmc",
+                 "fcomi", "fcomip", "fucomi", "fucomip", "fcompi", "fucompi")
+
+
+def _cf_read_later(insns, i):
+    """True if an adc / sbb after insns[i], in this block, reads the CF it
+    produces."""
+    for ins in insns[i + 1:]:
+        if ins.mnemonic in ("adc", "sbb"):
+            return True
+        if _writes_cf(ins):
+            return False
+    return False
+
+
+def _shift_cf_stmt(insn):
+    """`_cf = <last bit shifted out>;`, from the operand before the shift.
+    A count of 0 leaves CF as it was; a byte or word shifted by its width or
+    more has an undefined CF on x86 (the expression gives 0 for shl / shr)."""
+    m, ops = insn.mnemonic, insn.operands
+    if len(ops) < 2:
+        return None
+    size = _op_size(ops[0]) or 4
+    bits = 8 * size
+    dst = _fmt_operand_read(ops[0])
+    sx = {1: "int8_t", 2: "int16_t"}.get(size, "int32_t")
+
+    def bit(n):
+        if m in ("shl", "sal"):
+            return f"(int)(((((uint64_t)(uint32_t)({dst})) << ({n})) >> {bits}) & 1u)"
+        if m == "shr":
+            return f"(int)((((uint64_t)(uint32_t)({dst})) >> (({n}) - 1u)) & 1u)"
+        return f"(int)(((uint64_t)((int64_t)({sx})({dst}) >> (({n}) - 1u))) & 1u)"
+
+    if ops[1].type == "imm":
+        n = ops[1].imm & 31
+        if n == 0:
+            return None
+        return f"_cf = {bit(str(n) + 'u')}; /* CF from {m}: last bit shifted out */"
+    cnt = _fmt_operand_read(ops[1])
+    return (f"{{ uint32_t _sn = (uint32_t)({cnt}) & 31u; if (_sn) _cf = {bit('_sn')}; }}"
+            f" /* CF from {m}: last bit shifted out */")
+
+
+def _is_self_sbb(insn):
+    ops = insn.operands
+    return (insn.mnemonic == "sbb" and len(ops) >= 2 and ops[0].type == "reg"
+            and ops[1].type == "reg" and ops[0].reg == ops[1].reg)
+
+
+def _carry_out_expr(insn):
+    """The carry (adc) or borrow (sbb) out of `insn`, from its operands and
+    `_cf` before it runs, at the operand's width (a narrow immediate counts
+    at that width too). None for `sbb r, r`, whose CF out is its CF in."""
+    m, ops = insn.mnemonic, insn.operands
+    if len(ops) < 2 or _is_self_sbb(insn):
+        return None
+    size = _op_size(ops[0]) or 4
+    bits = 8 * size
+    mask = {1: "0xFFu", 2: "0xFFFFu"}.get(size, "0xFFFFFFFFu")
+    a = f"(uint64_t)((uint32_t)({_fmt_operand_read(ops[0])}) & {mask})"
+    b = f"(uint64_t)((uint32_t)({_fmt_operand_read(ops[1])}) & {mask})"
+    if m == "adc":
+        return f"(int)((({a} + {b} + (uint64_t)(_cf != 0)) >> {bits}) & 1u)"
+    return f"(int)({a} < {b} + (uint64_t)(_cf != 0))"
+
+
 def lift_basic_block(lifter, bb, flag_state=None, live_out=True):
     """
     Lift a basic block to C statements.
@@ -2506,6 +2614,9 @@ def lift_basic_block(lifter, bb, flag_state=None, live_out=True):
     else:
         last_flag_setter = None
         last_flag_ops = []
+    # True while `_cf` holds the CF of the last CF writer lifted in this block,
+    # when that writer is a shift or an adc / sbb (see _shift_cf_stmt).
+    cf_valid = False
 
     # Flags that arrived from a predecessor are rebuilt from the setter's
     # operands; if this block overwrites them before consuming, copy them
@@ -2600,10 +2711,34 @@ def lift_basic_block(lifter, bb, flag_state=None, live_out=True):
             cf = _make_cf_expr(last_flag_setter, last_flag_ops)
             if cf is not None:
                 stmts.append(f"_cf = {cf}; /* CF from {last_flag_setter} */")
+            elif ((last_flag_setter in _CF_SHIFTS or last_flag_setter in ("adc", "sbb"))
+                  and not cf_valid
+                  and not (last_flag_setter == "sbb" and len(last_flag_ops) >= 2
+                           and last_flag_ops[0].type == "reg" and last_flag_ops[1].type == "reg"
+                           and last_flag_ops[0].reg == last_flag_ops[1].reg)):
+                stmts.append(f"/* CF of {last_flag_setter} {_CF_NOT_MODELLED} */")
+
+        # A shift or an adc / sbb whose CF an adc / sbb below reads sets `_cf`
+        # (see _shift_cf_stmt): a shift before it runs, an adc / sbb after it
+        # has used its carry in.
+        shift_cf = carry_out = None
+        if _cf_read_later(insns, i):
+            if curr.mnemonic in _CF_SHIFTS:
+                shift_cf = _shift_cf_stmt(curr)
+                if shift_cf:
+                    stmts.append(shift_cf)
+            elif curr.mnemonic in ("adc", "sbb"):
+                carry_out = _carry_out_expr(curr)
+                if carry_out:
+                    stmts.append(f"{{ int _co = {carry_out};")
 
         # Lift the instruction normally
         results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
+        if carry_out:
+            stmts.append(f"_cf = _co; }} /* CF from {curr.mnemonic}: carry out */")
+        if _writes_cf(curr):
+            cf_valid = bool(shift_cf or carry_out or _is_self_sbb(curr))
 
         if snap_post:
             snap_stmts, snap_ops = _emit_flag_snapshot(curr.operands)

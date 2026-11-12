@@ -19,6 +19,7 @@ void sub_00151D07(void);    /* WaitForSingleObject (stdcall, ret 8) */
 unsigned d3d8_PresentSeq(void);
 double d3d8_display_rate(LONG *gen);       /* d3d8_sync.h: the game window's display, exact rate */
 void d3d8_sync_set_pace(int fps);          /* d3d8_sync.h */
+void xbox_occl_set_older(int on);          /* xbox_memory_layout.h: above 60, the title does not wait for a report */
 
 int g_fps_cap_on;
 static int s_in_extra;          /* an extra render is in progress */
@@ -52,7 +53,7 @@ static struct {
     int      tick_fresh;            /* the event was seen signaled while waiting (tick produced ~ now) */
     int      from_wait;             /* the next tick follows a return of the frame wait */
     double   next_render;
-    double   avg_render;
+    double   avg_render;            /* running average of a render (ms; normal and extra, see render_time) */
     int      grid;                  /* XBOX_FPS_CAP_GRID (default 1): continuous render grid */
     double   last_tick_sig;         /* time the last tick's event was seen signaled (or released, if unknown) */
     /* The instant each render shows (interpolation): its slot, see
@@ -61,13 +62,14 @@ static struct {
      * the release of the frame wait and taken by that render. */
     double   frame_t, render_slot;
     int      slot_due;
-    unsigned dump_from;             /* XBOX_D3D_DUMP_FROM (duplicate log, T4) */            /* running average of an extra render (ms) */
+    unsigned dump_from;             /* XBOX_D3D_DUMP_FROM (duplicate log, T4) */
     /* The limit follows the display ("Match screen", or a limit lowered to it
      * under VSync / Adaptive): see match_fps. */
     int      follow, follow_monitor;
     double   req_fps;               /* limit asked (0 = none / the display) */
     double   margin;                /* fraction under the display's exact rate */
     LONG     rate_gen;              /* d3d8_display_rate's count when last read */
+    int      at60;                  /* the display followed went to 61 Hz or less: as at 60, see follow_display */
 } s;
 
 static struct {
@@ -110,7 +112,25 @@ static double now_ms(void)
  * while the cut from an intro shot to the start camera (A pressed during the
  * intro) moves it 279 units in one tick, under TELEPORT. */
 #define CAM_CUT_ACCEL 100.0f
-#define BONE_CUT_COS 0.0f           /* bone turned by > 180 deg: quaternions, cos(half angle) < 0 -> 90 deg */
+/* No bone is cut for its turn: rot_lerp takes the nearer of the two
+ * quaternions (cos(half angle) >= 0, a turn of at most 180 deg), so a minimum
+ * of 0 never cuts; a bone stays at tick N only when a matrix is not a
+ * rotation (rot_ok). */
+#define BONE_CUT_COS 0.0f
+/* A rider whose body (the hips, bone 14) changes its step by more than this
+ * in one tick was moved by the game at once (a push up a rail, a knock back, a
+ * fall off the course under TELEPORT): shown at tick N for that tick, as the
+ * camera's cuts. Natural motion of the hips: at most 49 units per tick per
+ * tick on 7 traces at 240 (Race, Showoff, Pipedream); the game's
+ * moves: 130 and more. The rider's position +0x170 is not the body: it can
+ * jump alone (94 units per tick per tick, the body joining it in 0.75 s). */
+#define RIDER_CUT_ACCEL 100.0f
+/* A pose whose feet or board turn around the hips (bone 14) by more than this
+ * in one tick snapped there (a trick's start or end): for that tick, the
+ * skeleton of tick N placed at the interpolated hips. Natural: at most 26 deg
+ * (Showoff); snaps: 40 deg and more. Bones 16, 19, 20 (feet, board). */
+#define POSE_CUT_COS 0.81915f       /* cos(35 deg) */
+#define POSE_HIPS    14u
 
 enum { SP_VIEW, SP_POS, SP_POSE };
 typedef struct { uint32_t va, len, kind, off; } Span;
@@ -139,13 +159,26 @@ static struct {
      * (tick N - tick N-1), whether it is known, and whether tick N was a cut */
     float cam_step[NV_MAX][3];
     int cam_step_ok[NV_MAX], cam_cut[NV_MAX];
+    /* per rider of the layout (its SP_POS / SP_POSE pairs, in order): the
+     * rider, its position and hips steps of the last tick, whether they are
+     * known, and whether tick N is shown at once (r_cut) or with its skeleton
+     * of tick N at the interpolated hips (p_cut) */
+    uint32_t r_va[NR_MAX];
+    float r_step[NR_MAX][3], h_step[NR_MAX][3];
+    int r_step_ok[NR_MAX], r_cut[NR_MAX], p_cut[NR_MAX];
+    unsigned long long n_cut_accel, n_cut_pose;
 } I;
 
 static unsigned long long s_outliers;
 static int s_measured;           /* duration already counted by hook_AB610 */
+static double s_var_render;      /* running variance of the render durations, same weights as s.avg_render */
 static void render_time(double d)
 {
     if (d > RENDER_OUTLIER_MS) { s_outliers++; return; }
+    if (s.avg_render > 0.0) {    /* exponentially weighted variance, before the mean moves */
+        double dev = d - s.avg_render;
+        s_var_render = 0.9 * (s_var_render + 0.1 * dev * dev);
+    }
     s.avg_render = s.avg_render > 0.0 ? s.avg_render * 0.9 + d * 0.1 : d;
 }
 
@@ -592,10 +625,11 @@ static int gameplay_frozen(uint32_t st)
 
 static void report(int force)
 {
-    double t = now_ms(), el = (t - P.t0) / 1000.0;
-    uint32_t race = race_ptr(), rt = race ? MEM32(race + 0x18u) : 0;
-    double race_tps = -1.0;
-    if (!s.log && !s.check) return;
+    double t, el, race_tps = -1.0;
+    uint32_t race, rt;
+    if (!s.log && !s.check) return;     /* before the clock and the race are read */
+    t = now_ms(); el = (t - P.t0) / 1000.0;
+    race = race_ptr(); rt = race ? MEM32(race + 0x18u) : 0;
     if (!force && el < 2.0) return;
     if (race && race == P.race0 && rt >= P.race_tick0) race_tps = (rt - P.race_tick0) / el;
     fprintf(stderr,
@@ -867,15 +901,106 @@ static void cam_cut_reset(void)
 {
     uint32_t k;
     for (k = 0; k < NV_MAX; k++) I.cam_step_ok[k] = I.cam_cut[k] = 0;
+    for (k = 0; k < NR_MAX; k++) { I.r_va[k] = 0; I.r_step_ok[k] = I.r_cut[k] = I.p_cut[k] = 0; }
 }
 
-/* Rider: position + 21 bones. Teleport (root bone) -> state N. */
-static int rider_lerp(const float *pa, const float *pb, const float *ka, const float *kb, float t, float *po, float *ko)
+/* Largest turn in one tick (cosine) of the feet and the board around the hips,
+ * world space, from the poses of ticks N-1 (ka) and N (kb); 1 if unknown. */
+static float pose_turn_cos(const float *ka, const float *kb)
+{
+    static const uint32_t bones[3] = { 16u, 19u, 20u };
+    float worst = 1.0f;
+    uint32_t i;
+    for (i = 0; i < 3; i++) {
+        const float *ha = ka + 16u * POSE_HIPS + 12, *hb = kb + 16u * POSE_HIPS + 12;
+        const float *xa = ka + 16u * bones[i] + 12, *xb = kb + 16u * bones[i] + 12;
+        float u[3], v[3], lu, lv, c;
+        int j;
+        for (j = 0; j < 3; j++) { u[j] = xa[j] - ha[j]; v[j] = xb[j] - hb[j]; }
+        lu = sqrtf(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+        lv = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (!(lu > 10.0f) || !(lv > 10.0f) || !isfinite(lu) || !isfinite(lv)) continue;
+        c = (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (lu * lv);
+        if (c < worst) worst = c;
+    }
+    return worst;
+}
+
+
+/* After each tick (prev = N-1, cur = N valid), per rider: a step of its
+ * hips (bone 14) that differs from the step of the tick before by more than
+ * RIDER_CUT_ACCEL is a move of the game at once:
+ * the rider is shown at tick N for this tick, as a teleport (the tick after
+ * is not compared). Else, feet or board that turn around the hips by more
+ * than 35 deg: the skeleton of tick N, placed at the interpolated hips. */
+static void rider_cut_update(void)
+{
+    uint32_t k, j = 0;
+    for (k = 0; k + 1 < I.cur.n && j < NR_MAX; k++) {
+        const Span *p = &I.cur.sp[k], *q = &I.cur.sp[k + 1];
+        const float *x = &I.prev.w[p->off], *y = &I.cur.w[p->off];
+        const float *ka = &I.prev.w[q->off], *kb = &I.cur.w[q->off];
+        const float *ha = ka + 16u * POSE_HIPS + 12, *hb = kb + 16u * POSE_HIPS + 12;
+        float d[3], h[3], acc = -1.0f, hacc = -1.0f, tc = 1.0f;
+        uint32_t va = p->va - POS_OFF;
+        int i;
+        if (p->kind != SP_POS) continue;
+        if (I.r_va[j] != va) { I.r_va[j] = va; I.r_step_ok[j] = 0; }
+        I.r_cut[j] = I.p_cut[j] = 0;
+        for (i = 0; i < 3; i++) { d[i] = y[i] - x[i]; h[i] = hb[i] - ha[i]; }
+        if (!(dist3(x, y) < TELEPORT) || !(dist3(ka + 12, kb + 12) < TELEPORT) || !(dist3(ha, hb) < TELEPORT)) {
+            I.r_step_ok[j] = 0;             /* rider_lerp's cut */
+        } else {
+            if (I.r_step_ok[j]) { acc = dist3(d, I.r_step[j]); hacc = dist3(h, I.h_step[j]); }
+            (void)acc;                      /* the position's own: traced only (developer tools) */
+            if (I.r_step_ok[j] && !(hacc <= RIDER_CUT_ACCEL)) {
+                I.r_cut[j] = 1;
+                I.r_step_ok[j] = 0;
+                I.n_cut_accel++;
+            } else {
+                memcpy(I.r_step[j], d, sizeof d);
+                memcpy(I.h_step[j], h, sizeof h);
+                I.r_step_ok[j] = 1;
+                tc = pose_turn_cos(ka, kb);
+                if (tc < POSE_CUT_COS) { I.p_cut[j] = 1; I.n_cut_pose++; }
+            }
+        }
+        j++; k++;
+    }
+    for (; j < NR_MAX; j++) { I.r_va[j] = 0; I.r_step_ok[j] = I.r_cut[j] = I.p_cut[j] = 0; }
+}
+
+/* The cut decided for rider va at the last tick: 1 shown at N, 2 pose at N, 0 none. */
+static int rider_cut_of(uint32_t va)
+{
+    uint32_t j;
+    if (!I.ok || va < 0x1000u) return 0;
+    for (j = 0; j < NR_MAX; j++) if (I.r_va[j] == va) return I.r_cut[j] ? 1 : I.p_cut[j] ? 2 : 0;
+    return 0;
+}
+
+/* Rider: position + 21 bones. Teleport (root bone) -> state N. pose: the
+ * skeleton of tick N (21 bones, as the game posed them) moved back by the part
+ * of the hips' step not yet shown, (1 - t) * (hips N - hips N-1): a pose that
+ * snapped shows at once, where the interpolated rider is, without a chord
+ * through the body. */
+static int rider_lerp(const float *pa, const float *pb, const float *ka, const float *kb, float t, float *po, float *ko, int pose)
 {
     uint32_t b;
     int i;
     if (!(dist3(pa, pb) < TELEPORT) || !(dist3(ka + 12, kb + 12) < TELEPORT)) return -1;
     for (i = 0; i < 3; i++) po[i] = pa[i] + (pb[i] - pa[i]) * t;
+    if (pose) {
+        const float *ha = ka + 16u * POSE_HIPS + 12, *hb = kb + 16u * POSE_HIPS + 12;
+        float d[3];
+        for (i = 0; i < 3; i++) d[i] = (ha[i] - hb[i]) * (1.0f - t);
+        for (b = 0; b < POSE_N; b++) {
+            float *o = ko + 16 * b;
+            memcpy(o, kb + 16 * b, 16 * sizeof(float));
+            for (i = 0; i < 3; i++) o[12 + i] += d[i];
+        }
+        return 1;
+    }
     for (b = 0; b < POSE_N; b++) {
         const float *x = ka + 16 * b, *y = kb + 16 * b;
         float *o = ko + 16 * b;
@@ -901,11 +1026,11 @@ static int interp_begin(uint32_t st, double ts)
 {
     double a;
     float t;
-    uint32_t k;
+    uint32_t k, j = 0;
     VS *o = &I.out;
     I.written = 0;
     I.mode = 3; I.alpha = 0.0f; I.ts = ts;
-    if (!I.on || !I.ok || I.cur.st != st || GetCurrentThreadId() != s.tid) return 0;
+    if (!I.on || s.at60 || !I.ok || I.cur.st != st || GetCurrentThreadId() != s.tid) return 0;
     if (!vs_equals_mem(&I.cur)) { I.n_mismatch++; I.mode = 2; return 0; }
     a = (ts - I.t_tick) / TICK_MS;
     if (I.synth && s.dup > 0) a = (double)s_dup_k / (s.dup + 1);   /* DUP test: synthetic time */
@@ -925,10 +1050,12 @@ static int interp_begin(uint32_t st, double ts)
             }
         } else if (p->kind == SP_POS) {
             const Span *q = &I.cur.sp[k + 1];
-            if (rider_lerp(x, y, &I.prev.w[q->off], &I.cur.w[q->off], t, &o->w[p->off], &o->w[q->off]) < 0) {
-                I.n_cut_rider++; cut_note("rider", p->va, x, y);
+            int cut = j < NR_MAX && I.r_va[j] == p->va - POS_OFF ? (I.r_cut[j] ? 1 : I.p_cut[j] ? 2 : 0) : 0;
+            if (cut == 1 || rider_lerp(x, y, &I.prev.w[q->off], &I.cur.w[q->off], t, &o->w[p->off], &o->w[q->off], cut == 2) < 0) {
+                I.n_cut_rider++; cut_note(cut == 1 ? "rider (acceleration)" : "rider", p->va, x, y);
                 memcpy(&o->w[p->off], y, p->len); memcpy(&o->w[q->off], &I.cur.w[q->off], q->len);
             }
+            j++;
             k++;
         }
     }
@@ -992,8 +1119,10 @@ static void interp_end(void)
  * against a smooth rider (ghosting).
  * Fix: the anchors of each indicator are kept for the last two ticks; around
  * 0x43690, in a render that interpolates (I.written), the anchor shown is
- * lerp(N-1, N, t), written back bit exact after the call. Nothing changes at
- * 60 (no interpolation) nor in the logic (the tick never sees the lerp). */
+ * lerp(N-1, N, t), written back bit exact after the call; when the render
+ * shows the icon's rider at tick N (an acceleration cut), the anchor of tick
+ * N is left as it is. Nothing changes at 60 (no interpolation) nor in the
+ * logic (the tick never sees the lerp). */
 #define MK_MAX      16u
 #define MK_SLOTS    2u
 #define MK_COUNT    0x40u           /* indicator: number of player slots */
@@ -1003,8 +1132,9 @@ static struct {
     int on;
     uint32_t seq;                   /* race ticks seen by hook_AD4A0 */
     int in_tick;
-    struct { uint32_t ind, seq, n; int has_prev; float prev[MK_SLOTS][4], cur[MK_SLOTS][4]; } e[MK_MAX];
-    unsigned long long n_tick, n_outside, n_full, n_lerp, n_cut, n_stale, n_kept;
+    /* rider: the rider the tick computed the anchors for (0x43340's argument) */
+    struct { uint32_t ind, rider, seq, n; int has_prev; float prev[MK_SLOTS][4], cur[MK_SLOTS][4]; } e[MK_MAX];
+    unsigned long long n_tick, n_outside, n_full, n_lerp, n_cut, n_stale, n_kept, n_rider_cut;
 } M;
 
 static uint32_t mk_count(uint32_t ind)
@@ -1018,7 +1148,7 @@ void sub_00043690(void);    /* indicator: draw (thiscall) */
 
 void hook_fps_00043340(void)
 {
-    uint32_t ind = g_ecx, k, i, slot = MK_MAX, n;
+    uint32_t ind = g_ecx, rider = MEM32(g_esp + 4u), k, i, slot = MK_MAX, n;
     sub_00043340();
     if (!M.on || !I.on || ind < 0x1000u) return;
     if (!M.in_tick) { M.n_outside++; return; }      /* only the tick's anchors are kept */
@@ -1035,6 +1165,7 @@ void hook_fps_00043340(void)
         M.e[slot].has_prev = 1;
     }   /* same tick again: only cur is refreshed */
     M.e[slot].seq = M.seq;
+    M.e[slot].rider = rider;
     for (k = 0; k < n; k++) memcpy(M.e[slot].cur[k], (const void *)XBOX_PTR(ind + MK_ANCHOR + k * MK_STRIDE), 16);
 }
 
@@ -1046,7 +1177,12 @@ void hook_fps_00043690(void)
     if (M.on && I.written && ind >= 0x1000u) {
         for (i = 0; i < MK_MAX; i++) if (M.e[i].ind == ind) break;
         if (i < MK_MAX && M.e[i].seq == M.seq && M.e[i].has_prev && M.e[i].n == mk_count(ind)) {
-            for (k = 0; k < M.e[i].n; k++) {
+            uint32_t n = M.e[i].n;
+            /* Its rider is shown at tick N for this tick (an acceleration
+             * cut, rider_cut_update): so is the icon, as the legs and the
+             * rider's effects. */
+            if (rider_cut_of(M.e[i].rider) == 1) { M.n_rider_cut++; n = 0; }
+            for (k = 0; k < n; k++) {
                 float *m = (float *)XBOX_PTR(ind + MK_ANCHOR + k * MK_STRIDE);
                 const float *a = M.e[i].prev[k], *b = M.e[i].cur[k];
                 int j;
@@ -1061,6 +1197,12 @@ void hook_fps_00043690(void)
         }
     }
     sub_00043690();
+    if (M.on && s.log) {            /* XBOX_FPS_CAP_LOG=1: the counters now and then (a game closed by a tool has no exit report) */
+        static unsigned nc;
+        if ((++nc & 8191u) == 0u)
+            fprintf(stderr, "[MARKER] draws lerped=%llu rider cut=%llu cut=%llu stale=%llu kept=%llu tick writes=%llu outside tick=%llu table full=%llu\n",
+                    M.n_lerp, M.n_rider_cut, M.n_cut, M.n_stale, M.n_kept, M.n_tick, M.n_outside, M.n_full);
+    }
     if (!any) return;
     for (k = 0; k < MK_SLOTS; k++) {
         float *m;
@@ -1234,7 +1376,7 @@ static void legs_tick(void)
         uint32_t va = i < nr ? MEM32(race + 0xC4u + 4u * i) : 0, had;
         const float *pose;
         LegBone cur[LEG_N];
-        int ok, raw_ok, jump = 0;
+        int ok, raw_ok, jump = 0, snap;
         if (va < 0x1000u) { r->va = 0; r->n = 0; r->fade = 0; r->shown_ok = 0; continue; }
         if (va != r->va) { r->va = va; r->n = 0; r->fade = 0; r->shown_ok = 0; }
         if (r->fade) r->fade--;
@@ -1253,15 +1395,18 @@ static void legs_tick(void)
             }
         }
         if (raw_ok && r->shown_ok && dist3(pose + 12, r->raw + 12) > TELEPORT) jump = 1;
-        if (ok && r->n && jump) { r->n = 0; L.n_reset++; }
+        /* the pose snapped at this tick (rider_cut_update): shown at once, as
+         * the game does, neither averaged nor faded */
+        snap = I.on && rider_cut_of(va) == 2;
+        if (ok && r->n && (jump || snap)) { r->n = 0; L.n_reset++; }
         if (!ok) { if (r->n) L.n_reset++; r->n = 0; }
         /* the average stops showing at this tick: fade out the offset it had
          * from the game's pose at the tick before (shown and rawl: tick N-1) */
-        if (had >= 2u && r->n == 0 && raw_ok && r->shown_ok && !jump) {
+        if (had >= 2u && r->n == 0 && raw_ok && r->shown_ok && !jump && !snap) {
             for (b = 0; b < LEG_N; b++) leg_delta(&r->shown[b], &r->rawl[b], r->fade_q[b], r->fade_t[b]);
             r->fade = LEG_FADE_N;
         }
-        if (!raw_ok || jump) r->fade = 0;
+        if (!raw_ok || jump || snap) r->fade = 0;
         if (ok) {
             memmove(&r->h[1], &r->h[0], (LEG_HIST - 1u) * sizeof r->h[0]);
             memcpy(r->h[0], cur, sizeof cur);
@@ -1291,7 +1436,8 @@ static void legs_begin(void)
         LegRider *r = &L.r[i];
         float *pose;
         uint32_t cnt;
-        float t = I.written ? I.alpha : 1.0f;
+        /* a rider shown at tick N for this tick (cut): the averages of tick N */
+        float t = I.written && rider_cut_of(r->va) != 1 ? I.alpha : 1.0f;
         if ((r->n < 2u && !r->fade) || r->va != MEM32(race + 0xC4u + 4u * i)) continue;
         pose = (float *)XBOX_PTR(r->va + POSE_OFF);
         /* without interpolation, memory must still be tick N */
@@ -1355,6 +1501,507 @@ static void legs_end(void)
         if (!r->written) continue;
         memcpy((void *)XBOX_PTR(r->va + POSE_OFF + 0x40u * LEG_FIRST), r->save, sizeof r->save);
         r->written = 0;
+    }
+}
+
+/* ── Board trail tip (above 60 fps; always on there) ─────────────────
+ * The trail a board leaves in the snow is part of the effects of the rider's
+ * visual object (+0x3F0 of it; + 0x50E0). Its tick 0x41DA0 (called by 0x44B40,
+ * with the rider as argument, at the end of the rider's tick 0x36990: board
+ * node 0x3BC30, then effects 0x455B0) lays a
+ * ring of 100 slices (+0x40 + k*0x40: A at +0x00, B at +0x10; the next slot
+ * at +0x1940, the count at +0x1944) and recomputes, at every tick, a live
+ * slice at the board's contact (rider +0x300) and across its corners (+0x00 /
+ * +0x10, drawn while the byte +0x1950 is set). Its draw 0x44A30 (two passes
+ * of 0x42B10) builds one strip from the live slice to the oldest slice and
+ * copies its vertices at once. Above 60 the board is drawn at
+ * lerp(N-1, N, alpha), with leg smoothing also with its averaged local pose
+ * (bones 14-20), the trail at tick N: its tip runs ahead of the board by up
+ * to one tick of travel (about 30 units in a race) and moves at 60 Hz under
+ * a board that moves at the display's rate.
+ * Fix (display only): around the draw, the slices of tick N -- the live
+ * slice, and the newest slice of the ring when the tick laid it at tick N --
+ * are carried with the board as it is shown: the rigid motion from the
+ * board's bone (pose bone 20) at tick N to that bone in memory, less its part
+ * along the ground's normal (rider +0x2D0), so the tip stays on the snow.
+ * Written back bit exact after the draw; the tick never sees it. Above 60
+ * only: at 60 nothing changes (no interpolation; with leg smoothing at 60 the
+ * legs' own small gap stays as in 0.1.5). */
+#define TT_OFF       0x50E0u        /* the trail in the rider's effects object */
+#define TT_FX        0x3F0u         /* a rider's visual object: its effects object */
+#define TT_VISUAL    0x58E0u        /* rider: [+0x58E0] + 0x30 = its visual object (diagnostics only) */
+#define TT_NEXT      0x1940u        /* ring slot the next slice goes to (0..99) */
+#define TT_COUNT     0x1944u        /* slices in the ring (<= 100) */
+#define TT_LIVE      0x1950u        /* byte: the live slice is drawn */
+#define TT_RING      0x40u
+#define TT_SLICE     0x40u
+#define TT_SLOTS     100u
+#define TT_MAX       16u
+#define TT_PUT       4u             /* points moved at most: live A, B, newest A, B */
+#define BOARD_BONE   20u            /* pose bone of the board */
+#define GROUND_N     0x2D0u         /* rider: the ground's normal */
+#define TT_CONTACT   0x300u         /* rider: the board's contact */
+#define TT_CORNERS   0x5570u        /* rider: the board's 4 corners (4 f each) */
+
+typedef struct { uint32_t t, rider, seq, next, count, next0, count0; int has_prev; } TrailTick;
+static struct {
+    int on;
+    TrailTick e[TT_MAX];
+    unsigned long long n_tick, n_outside, n_full, n_draw, n_moved, n_newest, n_kept, n_norider, n_bad;
+} TT;
+
+void sub_00041DA0(void);    /* board trail: tick (thiscall, trail; rider; ret 4) */
+void sub_00044A30(void);    /* board trail: draw (thiscall, trail) */
+
+/* After the trail's tick: its rider (the tick's argument: the rider of the race's
+ * list, whose pose the interpolation writes), its ring position at this race
+ * tick and at the one before. */
+void hook_fps_00041DA0(void)
+{
+    uint32_t t = g_ecx, rider = MEM32(g_esp + 4u), i, slot = TT_MAX;
+    TrailTick *e;
+    sub_00041DA0();
+    if (!TT.on || t < 0x1000u) return;
+    if (!M.in_tick) { TT.n_outside++; return; }     /* only the race tick's slices are known */
+    TT.n_tick++;
+    for (i = 0; i < TT_MAX; i++) if (TT.e[i].t == t) { slot = i; break; }
+    for (i = 0; i < TT_MAX && slot == TT_MAX; i++)
+        if (!TT.e[i].t || M.seq - TT.e[i].seq > 2u) slot = i;      /* free, or not refreshed for 2 ticks */
+    if (slot == TT_MAX) { TT.n_full++; return; }
+    e = &TT.e[slot];
+    if (e->t != t || (e->seq != M.seq && e->seq + 1u != M.seq)) {
+        e->t = t; e->has_prev = 0;
+    } else if (e->seq + 1u == M.seq) {
+        e->next0 = e->next; e->count0 = e->count; e->has_prev = 1;
+    }   /* same race tick again: only the current position is refreshed */
+    e->seq = M.seq;
+    e->rider = rider;
+    e->next = MEM32(t + TT_NEXT);
+    e->count = MEM32(t + TT_COUNT);
+}
+
+/* The board's bone at tick N when the render in progress shows rider i
+ * otherwise (the interpolation's copy of tick N, or the leg smoothing's);
+ * NULL when memory holds tick N. */
+static const float *tt_tick_board(uint32_t i, uint32_t r)
+{
+    uint32_t k;
+    if (I.written) {
+        for (k = 0; k < I.cur.n; k++)
+            if (I.cur.sp[k].kind == SP_POSE && I.cur.sp[k].va == r + POSE_OFF)
+                return &I.cur.w[I.cur.sp[k].off + 16u * BOARD_BONE];
+        return NULL;
+    }
+    if (i < NR_MAX && L.r[i].written && L.r[i].va == r)
+        return L.r[i].raw + 16u * (1u + BOARD_BONE - LEG_FIRST);
+    return NULL;
+}
+
+/* Rotation rows orthogonal (any common scale), translation finite. */
+static int tt_frame_ok(const float *m)
+{
+    float n[3];
+    int i;
+    if (rot_ok(m, n) != 1) return 0;
+    for (i = 0; i < 3; i++) if (!isfinite(m[12 + i]) || fabsf(n[i] - n[0]) > 0.02f * n[0]) return 0;
+    return 1;
+}
+
+/* p (3 f) carried rigidly from the board's frame a to b (rows: axes, row 3:
+ * place), then its step along the unit normal n taken out: o (3 f). */
+static void tt_carry(const float *a, const float *b, const float *n, const float *p, float *o)
+{
+    float x[3], q[3], d;
+    int j, c;
+    for (j = 0; j < 3; j++) {
+        const float *ax = a + 4 * j;
+        x[j] = ((p[0] - a[12]) * ax[0] + (p[1] - a[13]) * ax[1] + (p[2] - a[14]) * ax[2])
+             / (ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+    }
+    for (c = 0; c < 3; c++) q[c] = b[12 + c] + x[0] * b[c] + x[1] * b[4 + c] + x[2] * b[8 + c];
+    d = (q[0] - p[0]) * n[0] + (q[1] - p[1]) * n[1] + (q[2] - p[2]) * n[2];
+    for (c = 0; c < 3; c++) o[c] = q[c] - d * n[c];
+}
+
+
+/* Carries the slices of tick N with the board as shown; returns the points
+ * written (addresses, values before, values written). */
+static uint32_t tt_begin(uint32_t t, uint32_t *va, float (*save)[4], float (*put)[4])
+{
+    uint32_t race = race_ptr(), nr, i, r = 0, n = 0, k, s;
+    const float *a, *b;
+    float nm[3], l;
+    int newest = 0, live;
+    TrailTick *e = NULL;
+    if (!race) return 0;
+    for (k = 0; k < TT_MAX; k++) if (TT.e[k].t == t) { e = &TT.e[k]; break; }
+    /* the rider: the one the trail's last tick was given (the game's own
+     * argument), if it is in the race's list (whose poses are interpolated) */
+    nr = MEM32(race + 0x88u); if (nr > NR_MAX) nr = NR_MAX;
+    for (i = 0; e && i < nr; i++)
+        if (MEM32(race + 0xC4u + 4u * i) == e->rider && e->rider >= 0x1000u) { r = e->rider; break; }
+    /* else the rider whose visual object ([rider+0x58E0] + 0x30, its render 0x44FD0) holds these effects
+     * (only then: i must stay the index found above) */
+    if (!r)
+        for (i = 0; i < nr; i++) {
+            uint32_t x = MEM32(race + 0xC4u + 4u * i), v = x >= 0x1000u ? MEM32(x + TT_VISUAL) : 0;
+            if (v >= 0x1000u && MEM32(v + 0x30u + TT_FX) + TT_OFF == t) { r = x; break; }
+        }
+    if (!r) { TT.n_norider++; return 0; }
+    TT.n_draw++;
+    if (!(a = tt_tick_board(i, r))) return 0;
+    b = (const float *)XBOX_PTR(r + POSE_OFF + 0x40u * BOARD_BONE);
+    if (!memcmp(a, b, 0x40u)) return 0;                   /* the board as at tick N */
+    memcpy(nm, (const void *)XBOX_PTR(r + GROUND_N), sizeof nm);
+    l = sqrtf(nm[0] * nm[0] + nm[1] * nm[1] + nm[2] * nm[2]);
+    if (!tt_frame_ok(a) || !tt_frame_ok(b) || !(dist3(a + 12, b + 12) < TELEPORT) || !(l > 0.5f && l < 2.0f)) {
+        TT.n_bad++;
+        return 0;
+    }
+    for (k = 0; k < 3; k++) nm[k] /= l;
+    live = MEM8(t + TT_LIVE) != 0;
+    if (live) { va[n++] = t; va[n++] = t + 0x10u; }
+    /* the newest slice was laid at tick N: the ring moved on by one slot at this tick */
+    if (e && e->seq == M.seq && e->has_prev && e->next < TT_SLOTS && e->count >= 2u && e->count <= TT_SLOTS
+        && e->next == (e->next0 + 1u) % TT_SLOTS && MEM32(t + TT_NEXT) == e->next && MEM32(t + TT_COUNT) == e->count) {
+        s = t + TT_RING + ((e->next + TT_SLOTS - 1u) % TT_SLOTS) * TT_SLICE;
+        va[n++] = s; va[n++] = s + 0x10u;
+        newest = 1;
+    }
+    for (k = 0; k < n; k++) {
+        float *m = (float *)XBOX_PTR(va[k]);
+        memcpy(save[k], m, 16);
+        memcpy(put[k], m, 16);
+        tt_carry(a, b, nm, save[k], put[k]);
+    }
+    for (k = 0; k < n; k++) memcpy((void *)XBOX_PTR(va[k]), put[k], 16);
+    if (n) TT.n_moved++;
+    if (newest) TT.n_newest++;
+    return n;
+}
+
+void hook_fps_00044A30(void)
+{
+    uint32_t t = g_ecx, va[TT_PUT], n = 0, k;
+    float save[TT_PUT][4], put[TT_PUT][4];
+    if (TT.on && t >= 0x1000u && (I.written || (L.on && !s.at60))) n = tt_begin(t, va, save, put);
+    sub_00044A30();
+    for (k = 0; k < n; k++) {
+        float *m = (float *)XBOX_PTR(va[k]);
+        if (memcmp(m, put[k], 16)) { TT.n_kept++; continue; }   /* written by the draw: kept */
+        memcpy(m, save[k], 16);
+    }
+    if (TT.on && s.log) {           /* XBOX_FPS_CAP_LOG=1: the counters now and then (a game closed by a tool has no exit report) */
+        static unsigned nc;
+        if ((++nc & 8191u) == 0u)
+            fprintf(stderr, "[TRAILTIP] draws=%llu moved=%llu newest laid at N=%llu kept=%llu no rider=%llu refused=%llu tick writes=%llu outside tick=%llu\n",
+                    TT.n_draw, TT.n_moved, TT.n_newest, TT.n_kept, TT.n_norider, TT.n_bad, TT.n_tick, TT.n_outside);
+    }
+}
+
+/* ── Rider effects at the shown time (above 60 fps; always on there) ──────
+ * A rider's effects object ([[rider+0x58E0] + 0x420]: its visual object + 0x3F0)
+ * holds rings of effects the rider's tick fills (0x44B40, at the end of the
+ * rider's tick, after the board's node) and its render draws (0x44BB0, from
+ * the rider's render 0x44FD0). Rings (sub-object: tick / draw; slots):
+ *   +0x0000 0x3FB70 / 0x3FE90  surface puffs, 16 x 0x70 at +0x10: drawn at
+ *           origin +0x20 + direction +0x30 * f(age +0x00); born at the board
+ *           (+0x48A0) at the end of the live slots (count +0x710, start +0x714)
+ *   +0x0720 0x443E0 / 0x408C0  powder ribbon, 75 slices x 0xA0 at +0x60 (4
+ *           points +0x00..+0x30, drifting at their speed, age +0x94; count
+ *           +0x50, start +0x54 = the newest, re-laid at every tick at the
+ *           contact, age 0) and its head +0x20 (contact, every tick): a fan
+ *           from the head to the newest slice, then strips to the oldest
+ *   +0x3660 0x40ED0 / 0x41CC0  snow spray emitters, 20 x 0x150 at +0x40 (the
+ *           GPU draws the particles from the record: start position +0xA0,
+ *           from the board +0x48A0 or the contact +0x300; emission time +0x08;
+ *           count +0x00, start +0x04)
+ *   +0x6A70 0x3F750 / 0x3F960  friction cue, 8 x 0x50 at +0x00: origin +0x00 +
+ *           direction +0x10 * g(age +0x40) (count +0x280, start +0x284)
+ *   +0x6D00 0x3EBD0 / 0x3EFB0  (+0x290 of the friction cue) snow bursts, 5 x
+ *           0x3C0 at +0x20: centre +0x320 laid at the contact and moving at
+ *           its speed +0x330, drawn at centre + 25 offsets +0x00.. + their
+ *           directions +0x190.. by the age +0x3B8 (0x3D4C0); count +0x18,
+ *           start +0x1C = the newest
+ *   +0x7FE0 0x40060 / 0x40520  surface spray, 8 x 0x34 at +0x50 (age +0x00;
+ *           count +0x1F0, start +0x1F4), placed from the emitter frame the
+ *           tick rewrites: origin +0x00 (contact +0x300 or rider +0x170) plus
+ *           three directions
+ *   +0x50E0 the board trail (section above).
+ * Above 60 the rider is drawn at lerp(N-1, N, alpha) (and its legs with leg
+ * smoothing), all of these at tick N: what the tick laid from the board runs
+ * ahead of the drawn board by up to a tick of travel (10-13 units on average,
+ * 28-31 p95 at 240), and what moves steps at 60 Hz.
+ * Fix (display only), around the draw: what tick N laid -- the slots born at
+ * N and the newest ribbon slice -- is carried with the board as drawn (the
+ * rigid motion of pose bone 20 from tick N to memory); the heads the tick
+ * re-lays (ribbon head, surface spray's origin) and what was alive at N-1 and
+ * N are shown at the render's instant: lerp(N-1, N, alpha) of points and age
+ * (a slot whose age did not grow by 0 to 0.1 is left at N). Words written back bit exact after the draw (kept if
+ * the draw wrote them); the tick never sees them. Above 60 only (with the
+ * interpolation; at 60 nothing changes); a rider shown at tick N (cut) keeps
+ * its effects at N. */
+#define FX_RINGS     6u
+#define FX_SLOTS     75u
+#define FX_POOL      1047u          /* words of points of all the rings (sum of n * npt * 3) */
+#define FX_NO_HEAD   0xFFFFFFFFu
+#define FX_EFFECTS   0x420u         /* [rider+0x58E0] + 0x420 = the effects object */
+#define FX_SPAN      0x8200u        /* bytes of the effects object the rings use */
+#define FX_WMAX      2048u
+typedef struct {
+    uint32_t sub, cnt, start, slot0, stride, n, age;
+    int fifo;                       /* 1: born at the end of the live slots; 0: the newest at the start */
+    uint32_t npt, pt0, pts;         /* points of a slot (3 f each): pt0 + p * pts */
+    uint32_t head;                  /* point of the ring itself re-laid by the tick (3 f) */
+} FxRing;
+static const FxRing k_fx[FX_RINGS] = {
+    { 0x0000u, 0x710u, 0x714u, 0x010u, 0x070u, 16u, 0x000u, 1,  1u, 0x20u, 0x00u, FX_NO_HEAD },
+    { 0x0720u, 0x050u, 0x054u, 0x060u, 0x0A0u, 75u, 0x094u, 0,  4u, 0x00u, 0x10u, 0x20u },
+    { 0x3660u, 0x000u, 0x004u, 0x040u, 0x150u, 20u, 0x008u, 1,  1u, 0xA0u, 0x00u, FX_NO_HEAD },
+    { 0x6A70u, 0x280u, 0x284u, 0x000u, 0x050u,  8u, 0x040u, 1,  1u, 0x00u, 0x00u, FX_NO_HEAD },
+    { 0x7FE0u, 0x1F0u, 0x1F4u, 0x050u, 0x034u,  8u, 0x000u, 1,  0u, 0x00u, 0x00u, 0x00u },
+    { 0x6D00u, 0x018u, 0x01Cu, 0x020u, 0x3C0u,  5u, 0x3B8u, 0,  1u, 0x320u, 0x00u, FX_NO_HEAD },
+};
+typedef struct {
+    int32_t cnt, start;
+    uint32_t age[FX_SLOTS];
+    uint32_t head[3];
+} FxRingSnap;
+typedef struct { uint32_t fx, rider; int ok; FxRingSnap r[FX_RINGS]; uint32_t pt[FX_POOL]; } FxSnap;
+static struct {
+    int on;
+    uint32_t off_pt[FX_RINGS];      /* each ring's first word in FxSnap.pt */
+    FxSnap pre[NR_MAX], prev[NR_MAX], cur[NR_MAX];
+    uint32_t nw, wva[FX_WMAX], wold[FX_WMAX], wput[FX_WMAX];
+    unsigned long long n_draw, n_moved, n_born[FX_RINGS], n_bornold[FX_RINGS], n_lerp[FX_RINGS], n_head, n_stale, n_kept, n_full, n_norider, n_bad;
+} FX;
+
+/* Point p of slot s of ring k in a snapshot (3 words). */
+static uint32_t *fx_pt(FxSnap *o, uint32_t k, uint32_t s, uint32_t p)
+{
+    return &o->pt[FX.off_pt[k] + 3u * (s * k_fx[k].npt + p)];
+}
+
+static void fx_layout(void)
+{
+    uint32_t k, w = 0;
+    for (k = 0; k < FX_RINGS; k++) { FX.off_pt[k] = w; w += 3u * k_fx[k].n * k_fx[k].npt; }
+    if (w > FX_POOL) FX.on = 0;     /* cannot happen (FX_POOL is the sum) */
+}
+
+/* The effects object of rider r, 0 if none (or not a plausible guest block). */
+static uint32_t fx_object(uint32_t r)
+{
+    uint32_t v, e;
+    if (r < 0x1000u) return 0;
+    v = MEM32(r + TT_VISUAL);
+    if (v < 0x1000u || (v & 3u)) return 0;
+    e = MEM32(v + FX_EFFECTS);
+    if (e < 0x10000u || (e & 3u) || (e & 0x7FFFFFFFu) + FX_SPAN >= 0x04000000u
+        || ((e & 0x80000000u) && (e & 0xFC000000u) != 0x80000000u))
+        return 0;
+    return e;
+}
+
+static void fx_read(FxSnap *o, uint32_t r)
+{
+    uint32_t e = fx_object(r), k, s, p;
+    o->rider = r; o->fx = e; o->ok = 0;
+    if (!e) return;
+    for (k = 0; k < FX_RINGS; k++) {
+        const FxRing *g = &k_fx[k];
+        FxRingSnap *q = &o->r[k];
+        uint32_t base = e + g->sub;
+        q->cnt = (int32_t)MEM32(base + g->cnt); q->start = (int32_t)MEM32(base + g->start);
+        if (q->cnt < 0 || q->cnt > (int32_t)g->n || q->start < 0 || q->start >= (int32_t)g->n) { q->cnt = -1; continue; }
+        for (s = 0; s < g->n; s++) {
+            uint32_t a = base + g->slot0 + s * g->stride;
+            q->age[s] = MEM32(a + g->age);
+            for (p = 0; p < g->npt; p++) memcpy(fx_pt(o, k, s, p), (const void *)XBOX_PTR(a + g->pt0 + p * g->pts), 12);
+        }
+        if (g->head != FX_NO_HEAD) memcpy(q->head, (const void *)XBOX_PTR(base + g->head), 12);
+    }
+    o->ok = 1;
+}
+
+/* Before the race tick: every rider's effects (tick N-1). */
+static void fx_pre(void)
+{
+    uint32_t race = race_ptr(), n, i;
+    for (i = 0; i < NR_MAX; i++) FX.pre[i].ok = 0;
+    if (!FX.on || !race) return;
+    n = MEM32(race + 0x88u); if (n > NR_MAX) n = NR_MAX;
+    for (i = 0; i < n; i++) fx_read(&FX.pre[i], MEM32(race + 0xC4u + 4u * i));
+}
+
+/* After it (tick N); a pair only if the rider and its effects object did not change. */
+static void fx_post(int ok)
+{
+    uint32_t race = race_ptr(), n = 0, i;
+    if (!FX.on) return;
+    if (race) { n = MEM32(race + 0x88u); if (n > NR_MAX) n = NR_MAX; }
+    for (i = 0; i < NR_MAX; i++) {
+        FX.cur[i].ok = 0;
+        if (!ok || i >= n || !FX.pre[i].ok || MEM32(race + 0xC4u + 4u * i) != FX.pre[i].rider) continue;
+        fx_read(&FX.cur[i], FX.pre[i].rider);
+        if (!FX.cur[i].ok || FX.cur[i].fx != FX.pre[i].fx) { FX.cur[i].ok = 0; continue; }
+        FX.prev[i] = FX.pre[i];
+    }
+}
+
+/* p (3 f) carried rigidly from the board's frame a to b: o (3 f). */
+static void fx_carry(const float *a, const float *b, const float *p, float *o)
+{
+    float x[3];
+    int j, c;
+    for (j = 0; j < 3; j++) {
+        const float *ax = a + 4 * j;
+        x[j] = ((p[0] - a[12]) * ax[0] + (p[1] - a[13]) * ax[1] + (p[2] - a[14]) * ax[2])
+             / (ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+    }
+    for (c = 0; c < 3; c++) o[c] = b[12 + c] + x[0] * b[c] + x[1] * b[4 + c] + x[2] * b[8 + c];
+}
+
+/* One word written for the draw (its value of tick N kept to write it back). */
+static int fx_put(uint32_t va, uint32_t now, float v)
+{
+    uint32_t w;
+    if (FX.nw >= FX_WMAX) { FX.n_full++; return 0; }
+    memcpy(&w, &v, 4);
+    if (w == now) return 1;
+    FX.wva[FX.nw] = va; FX.wold[FX.nw] = now; FX.wput[FX.nw] = w; FX.nw++;
+    MEM32(va) = w;
+    return 1;
+}
+
+/* A point of tick N (3 words at va, values c) moved to o; 0 if memory is not tick N. */
+static int fx_point(uint32_t va, const uint32_t *c, const float *o)
+{
+    int j;
+    if (memcmp((const void *)XBOX_PTR(va), c, 12)) { FX.n_stale++; return 0; }
+    for (j = 0; j < 3; j++) if (!fx_put(va + 4u * (uint32_t)j, c[j], o[j])) return 0;
+    return 1;
+}
+
+static float fx_f(uint32_t w) { float f; memcpy(&f, &w, 4); return f; }
+
+/* Writes the effects of the effects object e as shown; returns 1 if any. */
+static int fx_begin(uint32_t e)
+{
+    uint32_t race = race_ptr(), nr, i, r = 0, k;
+    const float *a, *b;
+    float t;
+    int any = 0;
+    FX.nw = 0;
+    if (!race) return 0;
+    nr = MEM32(race + 0x88u); if (nr > NR_MAX) nr = NR_MAX;
+    for (i = 0; i < nr; i++)
+        if (FX.cur[i].ok && FX.cur[i].fx == e && MEM32(race + 0xC4u + 4u * i) == FX.cur[i].rider) { r = FX.cur[i].rider; break; }
+    if (!r) { FX.n_norider++; return 0; }
+    FX.n_draw++;
+    if (rider_cut_of(r) == 1) return 0;                      /* the rider is shown at tick N: so are its effects */
+    if (!(a = tt_tick_board(i, r))) return 0;                 /* memory holds tick N */
+    b = (const float *)XBOX_PTR(r + POSE_OFF + 0x40u * BOARD_BONE);
+    if (!tt_frame_ok(a) || !tt_frame_ok(b) || !(dist3(a + 12, b + 12) < TELEPORT)) { FX.n_bad++; return 0; }
+    t = I.written ? I.t : 1.0f;
+    for (k = 0; k < FX_RINGS; k++) {
+        const FxRing *g = &k_fx[k];
+        FxSnap *SP = &FX.prev[i], *SC = &FX.cur[i];
+        const FxRingSnap *P = &SP->r[k], *C = &SC->r[k];
+        uint32_t base = e + g->sub, j, s, p, born = 0;
+        if (C->cnt < 0 || P->cnt < 0) continue;
+        if (MEM32(base + g->cnt) != (uint32_t)C->cnt || MEM32(base + g->start) != (uint32_t)C->start) { FX.n_stale++; continue; }
+        if (g->fifo) {                                        /* born at N: the last (count N - count N-1 + retired) */
+            uint32_t ret = ((uint32_t)C->start + g->n - (uint32_t)P->start) % g->n;
+            int32_t nb = C->cnt - P->cnt + (int32_t)ret;
+            born = nb < 0 ? 0u : nb > C->cnt ? (uint32_t)C->cnt : (uint32_t)nb;
+        }
+        for (j = 0; j < (uint32_t)C->cnt; j++) {
+            uint32_t sa;
+            int laid;
+            s = ((uint32_t)C->start + j) % g->n;
+            sa = base + g->slot0 + s * g->stride;
+            /* newest at the start: laid at N when pushed at N (the start moved) or re-laid (age 0) */
+            laid = g->fifo ? j >= (uint32_t)C->cnt - born : (j == 0 && (C->age[s] == 0u || C->start != P->start));
+            if (laid) {                                       /* laid at tick N: with the board as drawn */
+                for (p = 0; p < g->npt; p++) {
+                    const uint32_t *c = fx_pt(SC, k, s, p);
+                    float x[3], o[3];
+                    memcpy(x, c, 12);
+                    fx_carry(a, b, x, o);
+                    if (!fx_point(sa + g->pt0 + p * g->pts, c, o)) break;
+                    any = 1;
+                }
+                FX.n_born[k]++;
+                if (!(fx_f(C->age[s]) <= 0.05f)) FX.n_bornold[k]++;     /* not young: the ring's bookkeeping is not as read */
+            } else if (((s + g->n - (uint32_t)P->start) % g->n) < (uint32_t)P->cnt && t < 1.0f) {
+                /* alive at N-1 and N: at the render's instant */
+                float ap = fx_f(P->age[s]), ac = fx_f(C->age[s]);
+                if (!(ac - ap > 0.0f) || !(ac - ap < 0.1f) || MEM32(sa + g->age) != C->age[s]) continue;
+                if (!fx_put(sa + g->age, C->age[s], ap + (ac - ap) * t)) break;
+                for (p = 0; p < g->npt; p++) {
+                    const uint32_t *c = fx_pt(SC, k, s, p);
+                    float x[3], y[3], o[3];
+                    int q;
+                    memcpy(x, fx_pt(SP, k, s, p), 12); memcpy(y, c, 12);
+                    if (!memcmp(x, y, 12)) continue;          /* a fixed origin */
+                    if (!(dist3(x, y) < TELEPORT)) break;
+                    for (q = 0; q < 3; q++) o[q] = x[q] + (y[q] - x[q]) * t;
+                    if (!fx_point(sa + g->pt0 + p * g->pts, c, o)) break;
+                }
+                FX.n_lerp[k]++;
+                any = 1;
+            }
+        }
+        /* the ring's head, when tick N re-laid it (from the contact or the
+         * rider's position, which the board's rotation would swing): at the
+         * render's instant, lerp(N-1, N, t); with the board as drawn when only
+         * the legs move it (t = 1) */
+        if (g->head != FX_NO_HEAD && memcmp(P->head, C->head, 12)) {
+            float x[3], y[3], o[3];
+            int q;
+            memcpy(x, P->head, 12); memcpy(y, C->head, 12);
+            if (t < 1.0f) { if (!(dist3(x, y) < TELEPORT)) continue; for (q = 0; q < 3; q++) o[q] = x[q] + (y[q] - x[q]) * t; }
+            else fx_carry(a, b, y, o);
+            memcpy(x, y, 12);
+            if (fx_point(base + g->head, C->head, o)) {
+                FX.n_head++; any = 1;
+            }
+        }
+    }
+    if (any) FX.n_moved++;
+    return any;
+}
+
+/* After the draw: tick N, bit exact (a word the draw wrote is kept). */
+static void fx_end(void)
+{
+    uint32_t k;
+    for (k = FX.nw; k-- > 0;) {
+        if (MEM32(FX.wva[k]) != FX.wput[k]) { FX.n_kept++; continue; }
+        MEM32(FX.wva[k]) = FX.wold[k];
+    }
+    FX.nw = 0;
+}
+
+
+void sub_00044BB0(void);    /* rider effects: draw (thiscall, effects object) */
+
+void hook_fps_00044BB0(void)
+{
+    uint32_t e = g_ecx;
+    if (FX.on && e >= 0x1000u && (I.written || (L.on && !s.at60))) fx_begin(e);
+    sub_00044BB0();
+    if (FX.nw) fx_end();
+    if (FX.on && s.log) {           /* XBOX_FPS_CAP_LOG=1: now and then (a game closed by a tool has no exit report) */
+        static unsigned nc;
+        if ((++nc & 8191u) == 0u)
+            fprintf(stderr, "[FXSHOWN] draws=%llu moved=%llu born(+0/+720/+3660/+6A70/+7FE0/+6D00)=%llu/%llu/%llu/%llu/%llu/%llu lerped=%llu/%llu/%llu/%llu/%llu/%llu"
+                    " born not young=%llu/%llu/%llu/%llu/%llu/%llu heads=%llu stale=%llu kept=%llu full=%llu no rider=%llu refused=%llu\n",
+                    FX.n_draw, FX.n_moved, FX.n_born[0], FX.n_born[1], FX.n_born[2], FX.n_born[3], FX.n_born[4], FX.n_born[5],
+                    FX.n_lerp[0], FX.n_lerp[1], FX.n_lerp[2], FX.n_lerp[3], FX.n_lerp[4], FX.n_lerp[5],
+                    FX.n_bornold[0], FX.n_bornold[1], FX.n_bornold[2], FX.n_bornold[3], FX.n_bornold[4], FX.n_bornold[5], FX.n_head, FX.n_stale,
+                    FX.n_kept, FX.n_full, FX.n_norider, FX.n_bad);
     }
 }
 
@@ -1596,7 +2243,7 @@ static int render_gate(void)
     int gate = d3d8_sync_gate(), pb, q;
     uint32_t ctx;
     double t0, t, lim;
-    if (!gate || !g_fps_cap_on || s.cap == 60 || !s.tid || GetCurrentThreadId() != s.tid) return 0;
+    if (!gate || !g_fps_cap_on || s.cap == 60 || s.at60 || !s.tid || GetCurrentThreadId() != s.tid) return 0;
     /* The display takes no frame (2 timeouts in a row: hidden, off, mode
      * change): the gate stands aside until a frame leaves the queue again,
      * rather than costing its full wait on every render. */
@@ -1834,9 +2481,19 @@ static void grid_wait(uint32_t app, uint32_t handle)
         if (I.clock && I.on && I.t_est > 0.0 && t - I.t_est < 10.0 * TICK_MS) expected_tick = I.t_est + TICK_MS;
         k = ceil((expected_tick - slot) / s.period_ms);
         tick_slot = slot + (k < 1.0 ? 1.0 : k) * s.period_ms;
-        /* An extra render that would end after the tick's slot would push the
-         * tick (and the slots after it): this slot stays free. */
-        if (!s.noskip && s.avg_render > 0.0 && slot + s.avg_render > tick_slot && t < expected_tick + TICK_MS) {
+        /* An extra render that would make the tick's slot drop would push the
+         * tick (and the slots after it) one period later: this slot stays
+         * free. The tick's slot drops when the render, from its real start
+         * (this slot, or now if later), ends more than half a period after
+         * it: grid_catch_up's threshold when the wait returns. Before that
+         * point the tick's render keeps its slot (at most half a period
+         * late) and the extra image is not lost. (Freeing this slot as soon
+         * as the render would end after the tick's slot cost an image where
+         * the render exceeds a period; after a slot dropped by a late render,
+         * it left ~10 ms without one: three refreshes at 240 Hz.) */
+        if (!s.noskip && s.avg_render > 0.0
+            && (t > slot ? t : slot) + s.avg_render > tick_slot + 0.5 * s.period_ms
+            && t < expected_tick + TICK_MS) {
             P.skip_tick++;
             guest_wait(handle, 0xFFFFFFFFu);
             sig = now_ms(); pending = fresh = 1;
@@ -1903,16 +2560,33 @@ static double follow_fps(double rate)
     return s.req_fps;
 }
 
+
 /* Game thread, at every frame wait: the window's display changed rate (window
- * created on another display, moved, mode changed): the limit follows. */
+ * created on another display, moved, mode changed): the limit follows. At 61
+ * Hz or less (59.94 included) the limit is 60 (match_fps) and the game is
+ * then run as at 60, where nothing is hooked (s.at60, hook_B2750): rendering
+ * between the ticks there showed each tick up to one tick late, with no image
+ * in exchange. Back above 61 Hz, the renders above 60 resume (the state of
+ * every tick was kept). The other way, a game started at 60 is not followed:
+ * nothing is hooked at 60. */
 static void follow_display(void)
 {
     LONG gen;
     double rate = d3d8_display_rate(&gen), f, p;
+    int at60;
     if (gen == s.rate_gen) return;
     s.rate_gen = gen;
     if (rate <= 0.0) return;
     f = follow_fps(rate);
+    at60 = f < 60.5;
+    if (at60 != s.at60) {
+        s.at60 = at60;
+        xbox_occl_set_older(s.cap != 60 && !at60);
+        fprintf(stderr, "[FPSCAP] display %.3f Hz: %s\n", rate, at60
+                ? "as at 60 (the game's own frame wait, nothing interpolated, no extra render)"
+                : "above 60 again");
+        fflush(stderr);
+    }
     p = 1000.0 / f;
     if (fabs(p - s.period_ms) < 1e-6) return;
     fprintf(stderr, "[FPSCAP] display %.3f Hz: cap %.3f fps (was %.3f)\n", rate, f, 1000.0 / s.period_ms);
@@ -1948,6 +2622,15 @@ static void hook_B2750(void)
     s.slot_due = 0;       /* a slot the previous release gave and no render took */
     s.frame_t = 0.0;
     if (s.follow) follow_display();
+    /* The display followed at 61 Hz or less: as at 60 -- the game's own wait,
+     * its render right after the tick, nothing interpolated (interp_begin),
+     * no extra render, the trail and the effects as the tick left them, no
+     * render gate. */
+    if (s.at60) {
+        g_ecx = self;
+        sub_000B2750();
+        return;
+    }
     handle = MEM32(self + 4u);
     if (s.grid) {
         grid_wait(app, handle);
@@ -1959,7 +2642,7 @@ static void hook_B2750(void)
 
     s.tick_fresh = 0;
     for (;;) {
-        double expected_tick = s.last_tick_ret + TICK_MS, wait_until, rem;
+        double expected_tick = s.last_tick_ret + TICK_MS, wait_until, rem, end, may, est;
         t = now_ms();
         /* The next tick is produced by the game's 60 Hz timer one period
          * after the previous one, whenever it was consumed (a late consumption
@@ -1970,8 +2653,42 @@ static void hook_B2750(void)
          * unknown): tick now, not fresh. */
         if (guest_wait(handle, 0) == WAIT_OBJ_0) goto tick;
         wait_until = s.next_render;
-        /* An extra render ending after the expected tick would delay the logic: wait for the tick. */
-        if (!s.noskip && s.avg_render > 0.0 && wait_until + s.avg_render > expected_tick && t < expected_tick + TICK_MS) {
+        /* An extra render ending after the expected tick delays the moment
+         * the tick runs by as much. With a limit (this loop:
+         * XBOX_FPS_CAP_GRID=0, the comparison), such a render is not done:
+         * wait for the tick.
+         * Without a limit there is no slot (next_render is never ahead of
+         * now): the renders follow one another from now, and the last one
+         * before the tick either leaves the game thread idle until the tick,
+         * with no image meanwhile, or delays the tick by as much as it ends
+         * after it. The render is the better choice when that delay is
+         * smaller than the idle time it saves, the time left to the tick
+         * (r): when it lasts at most 2r. Its duration is not known before
+         * it runs; the running mean m and variance v of the durations are.
+         * The render is done when, for every duration law of that mean and
+         * variance, it is the better choice at least half of the time. The
+         * one-sided Chebyshev bound P(D >= 2r) <= v / (v + (2r - m)^2) is
+         * attained by some law of that mean and variance: it is at most one
+         * half when 2r >= m + sqrt(v). So the render is done when it would
+         * end, lasting m + sqrt(v), at most half of that after the tick.
+         * With durations that never vary (v = 0) this is half a render (the
+         * idle time before a tick and a tick's delay then both at most half
+         * a render). With varied ones, the mean alone let renders much
+         * longer than it delay a tick by 2-4 ms in the heavy passages.
+         * The ticks are the same (the timer reads the pad at its own point,
+         * frame_clock.c); only the tick's image moves. (Waiting as soon as
+         * the render would end after the tick left up to a whole render
+         * without an image before the tick: the longest frames without a
+         * limit were those of the ticks, after 2-3.5 ms idle.) */
+        if (s.period_ms > 0.0) {
+            end = wait_until + s.avg_render;
+            may = 0.0;
+        } else {
+            est = s.avg_render + sqrt(s_var_render);
+            end = t + est;
+            may = 0.5 * est;
+        }
+        if (!s.noskip && s.avg_render > 0.0 && end > expected_tick + may && t < expected_tick + TICK_MS) {
             wait_until = 1e300;
             P.skip_tick++;
         }
@@ -2059,6 +2776,7 @@ static void hook_AD4A0(void)
     int pre = 0;
     if (I.written) interp_end();     /* to be safe: never a tick on an interpolated state */
     if (I.on && vs_layout(&I.pre, st)) { vs_read(&I.pre); pre = 1; }
+    if (FX.on) fx_pre();
     M.seq++;
     M.in_tick = 1;
     sub_000AD4A0();
@@ -2070,9 +2788,11 @@ static void hook_AD4A0(void)
             memcpy(&I.prev, &I.pre, sizeof I.prev);
             I.ok = 1;
             cam_cut_update();
+            rider_cut_update();
         } else {
             cam_cut_reset();
         }
+        fx_post(I.ok);
         /* Old clock: tick start = return of the frame wait if this tick
          * follows it by less than a tick, else now. A tick consumed late
          * (after a slow render, or the 2nd tick of a catch-up) then gets a
@@ -2139,8 +2859,23 @@ static void fps_cap_atexit(void)
     if (L.on && (s.log || s.check))
         fprintf(stderr, "[LEGS] renders=%llu resets=%llu skipped(memory!=tick)=%llu\n", L.n_render, L.n_reset, L.n_skip);
     if (M.on && (s.log || s.check))
-        fprintf(stderr, "[MARKER] tick writes=%llu outside tick=%llu table full=%llu draws lerped=%llu cut=%llu stale=%llu kept=%llu\n",
-                M.n_tick, M.n_outside, M.n_full, M.n_lerp, M.n_cut, M.n_stale, M.n_kept);
+        fprintf(stderr, "[MARKER] tick writes=%llu outside tick=%llu table full=%llu draws lerped=%llu cut=%llu stale=%llu kept=%llu"
+                " rider cut=%llu\n",
+                M.n_tick, M.n_outside, M.n_full, M.n_lerp, M.n_cut, M.n_stale, M.n_kept, M.n_rider_cut);
+    if (I.on && (s.log || s.check))
+        fprintf(stderr, "[INTERP] rider cuts: acceleration=%llu pose=%llu\n", I.n_cut_accel, I.n_cut_pose);
+    if (FX.on && (s.log || s.check))
+        fprintf(stderr, "[FXSHOWN] draws=%llu moved=%llu born(+0/+720/+3660/+6A70/+7FE0/+6D00)=%llu/%llu/%llu/%llu/%llu/%llu"
+                " lerped=%llu/%llu/%llu/%llu/%llu/%llu born not young=%llu/%llu/%llu/%llu/%llu/%llu heads=%llu stale=%llu kept=%llu"
+                " full=%llu no rider=%llu refused=%llu\n",
+                FX.n_draw, FX.n_moved, FX.n_born[0], FX.n_born[1], FX.n_born[2], FX.n_born[3], FX.n_born[4], FX.n_born[5],
+                FX.n_lerp[0], FX.n_lerp[1], FX.n_lerp[2], FX.n_lerp[3], FX.n_lerp[4], FX.n_lerp[5],
+                FX.n_bornold[0], FX.n_bornold[1], FX.n_bornold[2], FX.n_bornold[3], FX.n_bornold[4], FX.n_bornold[5], FX.n_head, FX.n_stale,
+                FX.n_kept, FX.n_full, FX.n_norider, FX.n_bad);
+    if (TT.on && (s.log || s.check))
+        fprintf(stderr, "[TRAILTIP] tick writes=%llu outside tick=%llu table full=%llu draws=%llu moved=%llu newest laid at N=%llu"
+                " kept=%llu no rider=%llu refused=%llu\n", TT.n_tick, TT.n_outside, TT.n_full, TT.n_draw, TT.n_moved,
+                TT.n_newest, TT.n_kept, TT.n_norider, TT.n_bad);
 }
 
 void fps_cap_init(void)
@@ -2220,6 +2955,9 @@ void fps_cap_init(void)
     e = getenv("XBOX_FPS_INTERP"); I.on = e && *e ? e[0] == '1' : 1;     /* default 1 when cap != 60 */
     if (cap == 60) I.on = 0;            /* 60: no interpolation, no extra frame */
     e = getenv("XBOX_FIX_MARKER_INTERP"); M.on = I.on && !(e && e[0] == '0');   /* default 1 */
+    TT.on = I.on;                       /* board trail tip: above 60 only, no option */
+    FX.on = I.on;                       /* rider effects at the shown time: above 60 only, no option */
+    fx_layout();
     e = getenv("XBOX_FPS_INTERP_SYNTH"); I.synth = e && e[0] == '1';   /* DUP test: alpha = k / (DUP + 1) */
     e = getenv("XBOX_FPS_INTERP_LOG");
     if (e && *e) { I.log = atoi(e); e = strchr(e, '@'); I.log_from = e ? (uint32_t)atoi(e + 1) : 0; }
@@ -2247,6 +2985,7 @@ void fps_cap_init(void)
     if (s.check) s_pg = (uint64_t *)calloc(PG_MAX, sizeof(uint64_t));
     P.t0 = s_t0_run = now_ms();
     g_fps_cap_on = 1;
+    xbox_occl_set_older(s.cap != 60 && !s.at60);
     atexit(fps_cap_atexit);
     fprintf(stderr, "[FPSCAP] cap %d%s, period %.4f ms%s (%s; logic 60 Hz)%s%s\n",
             cap, cap ? " fps" : " = no limit", s.period_ms, s.follow ? ", follows the display" : "",
@@ -2266,5 +3005,10 @@ void (*fps_cap_lookup(unsigned int xbox_va))(void)
      * both hooks pass straight through when the marker fix is off (60, M.on = 0) */
     if (xbox_va == 0x00043340u) return hook_fps_00043340;
     if (xbox_va == 0x00043690u) return hook_fps_00043690;
+    /* the board trail's tick and draw: they only call the game's when the fix is off (60) */
+    if (xbox_va == 0x00041DA0u) return hook_fps_00041DA0;
+    if (xbox_va == 0x00044A30u) return hook_fps_00044A30;
+    /* the rider effects' draw: it always calls the game's; when the fix is off (60), nothing else */
+    if (xbox_va == 0x00044BB0u) return hook_fps_00044BB0;
     return 0;
 }

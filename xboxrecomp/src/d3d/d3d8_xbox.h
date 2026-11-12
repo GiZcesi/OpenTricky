@@ -918,8 +918,16 @@ int  d3d8_HostIsWidescreen(void);
 void d3d8_HostSetClientSize(unsigned w, unsigned h);
 void d3d8_HostToast(const wchar_t *text);
 void d3d8_HostExit(void);
+void d3d8_HostExitCode(unsigned code);         /* the same, with this exit code */
 void d3d8_SetHostExitHook(void (*fn)(void));   /* adds one (at most 4), run by d3d8_HostExit first
                                                  * (PlayStation pads: motors off; optional modules) */
+/* Direct3D failed for good: the device could not be made (lost = 0) or was
+ * lost while running (lost = 1). what: the step, in words; hr: its result;
+ * reason: GetDeviceRemovedReason's (lost only). The hook says so and ends the
+ * process (port/src/main.c). */
+typedef void (*D3D8GpuFailFn)(int lost, const char *what, unsigned long hr, unsigned long reason);
+void d3d8_SetGpuFailHook(D3D8GpuFailFn fn);
+void d3d8_GpuStartFailed(unsigned long hr);    /* after a failed CreateDevice, with its result */
 /* Occlusion queries for the NV2A zpass counter (fork), pump thread only. */
 int   d3d8_OcclusionBegin(void);                         /* handle, -1 on failure */
 void  d3d8_OcclusionEnd(int h);

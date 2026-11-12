@@ -12,6 +12,10 @@
  *   [PROFILE]   31.2%  exe+0x0012A4F0
  *   [PROFILE]   12.0%  nvwgf2umx.dll
  *
+ * A busy thread lists its 60 hottest addresses; XBOX_PROFILE=START,SECONDS,full
+ * lists every one (thousands for the pump: its own code is spread thin), so
+ * that the per-function totals cover the whole thread.
+ *
  * Addresses inside the executable are module offsets; resolve them with
  *   addr2line -f -e "SSX Tricky.exe" 0x14012A4F0   (image base 0x140000000)
  * Addresses in other modules are reported by module name only.
@@ -38,6 +42,7 @@ typedef struct {
     ULONGLONG cpu0, cpu1;          /* 100 ns units, user + kernel */
     unsigned samples;
     unsigned nsites;
+    unsigned dropped;              /* samples of sites past MAX_SITES (not listed) */
     struct { DWORD64 key; unsigned n; } site[MAX_SITES];
 } ProfThread;
 
@@ -87,6 +92,7 @@ static void scan_threads(DWORD self)
 #define VIA_TAG (1ull << 62)   /* with MOD_TAG: system code reached from exe+low bits */
 static int s_via = 0;
 static int s_all = 0;     /* XBOX_PROFILE=...,all: idle threads too */
+static int s_full = 0;    /* XBOX_PROFILE=...,full: every site of a busy thread, not the first 60 */
 static struct { DWORD64 lo, hi; } s_mods[512];
 static int s_nmods;
 
@@ -151,7 +157,8 @@ static void record(ProfThread *t, DWORD64 key)
         t->site[t->nsites].key = key;
         t->site[t->nsites].n = 1;
         t->nsites++;
-    }
+    } else
+        t->dropped++;
 }
 
 static int by_count(const void *a, const void *b)
@@ -177,6 +184,7 @@ static DWORD WINAPI prof_main(LPVOID arg)
         const char *v = strstr(e, ",via");
         s_via = v ? (v[4] >= '1' && v[4] <= '9' ? v[4] - '0' : 1) : 0;
         s_all = strstr(e, ",all") != NULL;
+        s_full = strstr(e, ",full") != NULL;
         s_stall = strstr(e, ",stall") != NULL;
         if (s_stall) s_trace = (TraceSample *)malloc(TRACE_MAX * sizeof *s_trace);
     }
@@ -204,11 +212,13 @@ static DWORD WINAPI prof_main(LPVOID arg)
         for (i = 0; i < s_nthreads; i++) {
             CONTEXT c;
             ProfThread *t = &s_threads[i];
+            DWORD64 key = 0;
+            int got = 0;
             if (SuspendThread(t->h) == (DWORD)-1) continue;
             memset(&c, 0, sizeof c);
             c.ContextFlags = s_via ? CONTEXT_FULL : CONTEXT_CONTROL;
             if (GetThreadContext(t->h, &c)) {
-                DWORD64 key = site_key(c.Rip, exe_lo, exe_hi);
+                key = site_key(c.Rip, exe_lo, exe_hi);
                 /* Inside Windows or a driver: also name the executable's code
                  * that led there, by unwinding the suspended thread's stack
                  * with the x64 unwind tables (both the system DLLs and this
@@ -239,9 +249,13 @@ static DWORD WINAPI prof_main(LPVOID arg)
                         }
                     }
                 }
-                record(t, key);
+                got = 1;
             }
             ResumeThread(t->h);
+            /* Counted once the thread runs again: with ,full a busy thread
+             * has thousands of sites, and the search in record() would
+             * otherwise keep it suspended. */
+            if (got) record(t, key);
         }
         Sleep(1);
     }
@@ -251,7 +265,7 @@ static DWORD WINAPI prof_main(LPVOID arg)
         /* Rebuild every thread's histogram from the samples inside stalls. */
         unsigned k;
         LONG nw = s_nstall < STALL_MAX ? s_nstall : STALL_MAX;
-        for (i = 0; i < s_nthreads; i++) { s_threads[i].samples = 0; s_threads[i].nsites = 0; }
+        for (i = 0; i < s_nthreads; i++) { s_threads[i].samples = 0; s_threads[i].nsites = 0; s_threads[i].dropped = 0; }
         s_stall = 0;
         for (k = 0; k < s_ntrace; k++) {
             LONG w;
@@ -277,7 +291,10 @@ static DWORD WINAPI prof_main(LPVOID arg)
             if (cpu < 2.0 && !s_all) continue;             /* idle threads, unless ,all */
             fprintf(stderr, "[PROFILE] thread %lu  cpu %.1f%%  samples %u\n",
                     (unsigned long)t->tid, cpu, t->samples);
-            rows = (unsigned (*)[3])malloc(t->nsites * sizeof *rows);
+            if (t->dropped)
+                fprintf(stderr, "[PROFILE]   (%u samples at sites past the %u kept, not listed)\n",
+                        t->dropped, (unsigned)MAX_SITES);
+            rows =(unsigned (*)[3])malloc(t->nsites * sizeof *rows);
             if (!rows) continue;
             for (k = 0; k < t->nsites; k++) {
                 rows[k][0] = (unsigned)(t->site[k].key & 0xFFFFFFFFu);
@@ -285,7 +302,7 @@ static DWORD WINAPI prof_main(LPVOID arg)
                 rows[k][2] = t->site[k].n;
             }
             qsort(rows, t->nsites, sizeof *rows, by_count);
-            for (k = 0; k < t->nsites && shown < (cpu < 2.0 ? 8u : 60u); k++, shown++) {
+            for (k = 0; k < t->nsites && shown < (cpu < 2.0 ? 8u : s_full ? MAX_SITES : 60u); k++, shown++) {
                 DWORD64 key = ((DWORD64)rows[k][1] << 32) | rows[k][0];
                 double pct = 100.0 * rows[k][2] / t->samples;
                 if ((key & MOD_TAG) && (key & VIA_TAG)) {

@@ -170,6 +170,7 @@ void otlog(const char *fmt, ...)
     if (g_pages.log_line) g_pages.log_line(buf);
 }
 
+
 std::string hex_rgb(uint32_t argb)
 {
     char b[16];
@@ -292,7 +293,9 @@ struct App {
     Rml::String prev_label;           /* the value the picture shows, written on it */
     Rml::String ini_note;             /* above the rows: settings.ini was not read as written (empty: it was) */
     bool deck_note = false;           /* ini_note says "Steam Deck detected": until the settings page is left or saved */
-    bool help_pending = false, pad_active = false, have_disc = false;
+    bool help_pending = false, pad_active = false;
+    bool have_disc = false;           /* the disc image is verified: PLAY */
+    bool have_art = false;            /* and its pictures were read: the track cards, the emblem */
     Rml::String disc_state, disc_title, disc_note, track_name, version_text;
     Rml::String ver_num, ver_note;    /* the version label: "v0.1.4" and its state word (Latest, Available, ...) */
     /* the home page's disc panel (no good disc image) */
@@ -341,7 +344,7 @@ struct App {
     Rml::String conf_kind, conf_line, conf_swap;
     int conf_ctl = -1, conf_col = 0, conf_other = -1;
     std::string conf_value;
-    Rml::String crash_head, crash_when, crash_version;
+    Rml::String crash_head, crash_text, crash_when, crash_version;
     std::string crash_dir;
     Rml::String notice_kick, notice_head, notice_text;
     std::string notice_file;
@@ -356,6 +359,7 @@ struct App {
     float stage_w = 1280;
     bool rescaled = false;         /* the window's scale changed: texts are sized again (fit_window) */
     bool focus_in_view = false;    /* laid out at a new scale: the focus shown is brought back into view */
+    int note_in_view = -1;         /* a setting just changed: its row and the note under it, brought into view */
 
     /* game process */
     SDL_Process *game = nullptr;
@@ -543,7 +547,8 @@ bool hd_pack_found(const std::string &folder)
 }
 
 /* The short line under a row when, with the other settings or this PC, its
- * value does not do what it says. Shown only: the value stays as it is. */
+ * value does not do what it says (or, for VSync Off, what it costs). Shown
+ * only: the value stays as it is. */
 std::string row_note(int id)
 {
     switch (id) {
@@ -583,6 +588,12 @@ std::string row_note(int id)
         return "Your screen runs at " + std::to_string(whole) + " Hz: with VSync the game shows at most " +
                std::to_string(whole) + ".";
     }
+    case S_VSYNC:
+        /* Off: each frame goes to the screen as soon as it is drawn, not on a refresh,
+         * so frames reach it unevenly and the picture tears. A warning only: the value
+         * stays the player's. On is every preset's value. */
+        if (SDL_strcasecmp(settings_get(g.set, S_VSYNC), "off") != 0) return "";
+        return "Off: uneven motion and tearing. On is recommended: it adds very little input delay.";
     case S_PS_CONTROLLERS:
         return "DualShock 4 and DualSense only.";
     case S_SHOW_FPS:
@@ -782,6 +793,7 @@ void step_value(int id, int dir)
      * so it is written at Save like any setting. */
     if (id == S_ASPECT && !resolution_matches_shape()) settings_set(g.set, S_RESOLUTION, "auto");
     settings_changed(id);
+    g.note_in_view = id;   /* a note the new value brings under the row is seen, not left below the list's edge */
 }
 
 bool save_settings_file()
@@ -1801,7 +1813,12 @@ void load_disc()
         otlog("timing disc_load_ms=%.1f ok=%d", now_ms() - t0, (int)g.have_assets);
         load_hd_cards();
     }
-    g.have_disc = g.have_assets;
+    /* PLAY follows the disc check: the game doesn't need the launcher's
+     * pictures, which only this page's looks depend on. */
+    g.have_disc = g.disc.status == OT_DISC_OK;
+    g.have_art = g.have_assets;
+    if (g.have_disc && !g.have_art)
+        otlog("disc image verified, but its pictures could not be read: PLAY works, no track pictures here");
     g.disc_path = g.iso;
     switch (g.disc.status) {
     case OT_DISC_OK:
@@ -2289,12 +2306,26 @@ void set_crash(const OtCrashReport &r, int code)
 {
     g.crash_dir = r.found ? r.dir : "";
     bool freeze = r.kind == "freeze";
-    g.crash_head = freeze ? "THE GAME FROZE" : "THE GAME CLOSED UNEXPECTEDLY";
+    if (code == OT_EXIT_GPU_START) {
+        g.crash_head = "THE GAME COULDN'T START ITS GRAPHICS";
+        g.crash_text = "SSX Tricky needs a graphics card with Direct3D 11 (feature level 11_0) and an up-to-date driver. "
+                       "Update your graphics driver, then press PLAY again. If it still happens, a bug report helps: "
+                       "a zip with the logs and your settings, never your disc image or your saves.";
+    } else if (code == OT_EXIT_GPU_LOST) {
+        g.crash_head = "THE GRAPHICS DRIVER STOPPED RESPONDING";
+        g.crash_text = "Your graphics driver stopped responding or was reset while you played, so the game had to close. "
+                       "Update your graphics driver if this happens again. A bug report helps: "
+                       "a zip with the logs and your settings, never your disc image or your saves.";
+    } else {
+        g.crash_head = freeze ? "THE GAME FROZE" : "THE GAME CLOSED UNEXPECTEDLY";
+        g.crash_text = "Sorry about that. A bug report helps fix it: it is a zip with the logs, your settings and a crash file. "
+                       "It never contains your disc image or your saves.";
+    }
     SDL_Time t = r.found ? r.time : 0;
     if (!t) SDL_GetCurrentTime(&t);
     g.crash_when = "When: " + ot_when(t);
     g.crash_version = "Version: v" + std::string(OT_VERSION);      /* the code and the graphics card: in the bug report */
-    for (const char *v : { "crash_head", "crash_when", "crash_version" }) g.model.DirtyVariable(v);
+    for (const char *v : { "crash_head", "crash_text", "crash_when", "crash_version" }) g.model.DirtyVariable(v);
 }
 
 /* A PlayStation controller the game reads with its PlayStation controllers
@@ -2518,9 +2549,10 @@ void game_ended(int code)
     /* A report folder written since the launch, or an exception code. */
     OtCrashReport r = ot_find_crash_report(g.base, g.launch_time - 2 * SDL_NS_PER_SECOND);
     bool exception = (unsigned)code >= 0xC0000000u;
-    if (r.found || exception) {
+    bool graphics = code == OT_EXIT_GPU_START || code == OT_EXIT_GPU_LOST;     /* said even if no report could be written */
+    if (r.found || exception || graphics) {
         otlog("crash screen: %s", r.found ? r.name.c_str() : "(no report folder)");
-        set_crash(r, exception ? code : 0);
+        set_crash(r, exception || graphics ? code : 0);
         if (!g.shown) {
             g.shown = true;
             g.skip_mode = false;
@@ -3208,6 +3240,7 @@ bool build_model()
     c.Bind("pad_active", &g.pad_active);
     c.Bind("page", &g.page);              /* the sidebar's icon and the hints follow it (tpl_*.rml) */
     c.Bind("have_disc", &g.have_disc);
+    c.Bind("have_art", &g.have_art);
     c.Bind("disc_state", &g.disc_state);
     c.Bind("disc_title", &g.disc_title);
     c.Bind("disc_note", &g.disc_note);
@@ -3247,6 +3280,7 @@ bool build_model()
     c.Bind("conf_line", &g.conf_line);
     c.Bind("conf_swap", &g.conf_swap);
     c.Bind("crash_head", &g.crash_head);
+    c.Bind("crash_text", &g.crash_text);
     c.Bind("crash_when", &g.crash_when);
     c.Bind("crash_version", &g.crash_version);
     c.Bind("notice_kick", &g.notice_kick);
@@ -3998,6 +4032,21 @@ void refit_texts()
     g.focus_in_view = true;
 }
 
+/* What stops the launcher before it has a page. It has no console and its log
+ * is off by default: Windows' own box, which needs nothing of SDL (SDL's fails
+ * silently under a video driver that has none). */
+void fatal_box(const std::string &text)
+{
+#ifdef _WIN32
+    int n = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    std::wstring w(n > 0 ? n : 1, L'\0');
+    if (n > 0 && MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &w[0], n))
+        MessageBoxW(nullptr, w.c_str(), L"OpenTricky", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+#else
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenTricky", text.c_str(), nullptr);
+#endif
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -4049,10 +4098,26 @@ int main(int argc, char **argv)
         return 3;
     }
 
+    /* What stops the launcher before it has a page is said to the player,
+     * except in the tools' runs, which read the log and the exit code. */
+    const auto fatal = [&](const std::string &text, const char *detail) {
+        std::string m = text;
+        if (detail && *detail) m += std::string("\n\nDetails: ") + detail;
+        if (!no_activate() && g.script.empty() && quit_after < 0) fatal_box(m);
+        return 1;
+    };
+    const std::string game_itself = std::string("Update your graphics driver, then try again. You can also start the game itself: \xE2\x80\x9C") +
+                                    k_game_exe + "\xE2\x80\x9D in the bin folder.";
+    const std::string no_window = "OpenTricky couldn't open its window.\n\n" + game_itself;
+    const std::string no_gl = "OpenTricky draws its window with OpenGL 3.3, which this computer doesn't offer. "
+                              "This can happen without a graphics driver, in a remote desktop session or in a virtual machine.\n\n" + game_itself;
+    /* OpenGL 3.3 is there, but the interface's shaders were refused: not a missing OpenGL. */
+    const std::string no_renderer = "OpenTricky couldn't start its renderer.\n\n" + game_itself;
+
     double t0 = now_ms();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         otlog("error: SDL_Init: %s", SDL_GetError());
-        return 1;
+        return fatal(no_window, SDL_GetError());
     }
     double t_sdl = now_ms();
     const char *bp = SDL_GetBasePath();
@@ -4180,7 +4245,7 @@ int main(int argc, char **argv)
     g.window = SDL_CreateWindow("OpenTricky", ww, wh, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
     if (!g.window) {
         otlog("error: window: %s", SDL_GetError());
-        return 1;
+        return fatal(no_window, SDL_GetError());
     }
     /* The window resizes only into shapes the page is drawn for, 16:10
      * (1280 x 800, the Steam Deck) to 2:1 (the widest stage, 1600 dp), and
@@ -4198,20 +4263,38 @@ int main(int argc, char **argv)
         else otlog("window: %s: a window", why.c_str());
     }
     g.gl = SDL_GL_CreateContext(g.window);
+    if (!g.gl) {
+        otlog("error: OpenGL 3.3: %s", SDL_GetError());
+        return fatal(no_gl, SDL_GetError());
+    }
     SDL_GL_MakeCurrent(g.window, g.gl);
     SDL_GL_SetSwapInterval(1);
     Rml::String gl_message;
     if (!RmlGL3::Initialize(&gl_message)) {
         otlog("error: OpenGL 3.3: %s", gl_message.c_str());
-        return 1;
+        return fatal(no_gl, gl_message.c_str());
     }
     otlog("%s", gl_message.c_str());
     if (const GLubyte *r = glGetString(GL_RENDERER)) g.gl_renderer = (const char *)r;
+    /* Without a driver, Windows' own OpenGL 1.1 comes back from SDL as a good
+     * context: the renderer's functions below would be missing, and called. */
+    bool gl_ok = GLAD_GL_VERSION_3_3 != 0;
+    if (!gl_ok) {
+        const GLubyte *v = glGetString(GL_VERSION);
+        std::string found = "OpenGL " + std::string(v ? (const char *)v : "?") + ", " + g.gl_renderer;
+        otlog("error: OpenGL 3.3: found %s", found.c_str());
+        return fatal(no_gl, found.c_str());
+    }
     double t_gl = now_ms();
 
     /* RmlUi. */
     OtSystemInterface system(g.window);
     OtRenderInterface render;
+    bool render_ok = (bool)render;
+    if (!render_ok) {
+        otlog("error: renderer: the interface's shaders were refused (%s)", g.gl_renderer.c_str());
+        return fatal(no_renderer, g.gl_renderer.c_str());
+    }
     g.render = &render;
     render.maker = make_texture;
     Rml::SetSystemInterface(&system);
@@ -4251,6 +4334,12 @@ int main(int argc, char **argv)
     rebuild_ctls();
     g.page = page;
     load_documents();
+    if (!g.home || !g.settings || !g.dialog) {
+        int code = fatal("OpenTricky's interface files are missing or damaged.\n\nUnzip the whole release into one folder again.", nullptr);
+        g.ctx = nullptr;
+        Rml::Shutdown();
+        return code;
+    }
     double t_docs = now_ms();
 
     if (!crash_test.empty()) {
@@ -4386,6 +4475,18 @@ int main(int argc, char **argv)
             Rml::Element *f = g.ctx->GetFocusElement();
             if (f && f->IsPseudoClassSet("focus-visible")) {   /* the keyboard's or a controller's (refit_texts) */
                 f->ScrollIntoView(Rml::ScrollAlignment::Nearest);
+                g.ctx->Update();
+            }
+        }
+        if (g.note_in_view >= 0) {
+            /* the row and its note share one line of the list (settings.rml): laid out by the
+             * Update above, that line is scrolled into view only if a part of it is out */
+            Rml::Element *r = g.page == "settings" && g.settings ?
+                g.settings->GetElementById("r" + std::to_string(g.note_in_view)) : nullptr;
+            Rml::Element *line = r ? r->GetParentNode() : nullptr;
+            g.note_in_view = -1;
+            if (line && !in_view(line)) {
+                line->ScrollIntoView(Rml::ScrollAlignment::Nearest);
                 g.ctx->Update();
             }
         }

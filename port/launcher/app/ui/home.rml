@@ -9,7 +9,7 @@
 <body data-model="ot" class="home">
     <div class="bg">
         <img class="grad" src="ot:bg/$track$"/>
-        <div class="carpet" data-if="have_disc"><span data-for="c : carpet"><img data-attr-src="'ot:carpet/' + c"/></span></div>
+        <div class="carpet" data-if="have_art"><span data-for="c : carpet"><img data-attr-src="'ot:carpet/' + c"/></span></div>
         <div class="shade"></div>
         <div class="shade2"></div>
     </div>
@@ -30,7 +30,7 @@
 
         <!-- With a good disc image: what's new in this version (built into the launcher), or in a newer one. -->
         <div class="news" data-if="have_disc">
-            <img class="badge" src="ot:badge/$track$"/>
+            <img class="badge" data-if="have_art" src="ot:badge/$track$"/>
             <div class="in">
                 <div class="k">WHAT'S NEW IN <span class="v">v{{notes_version}}</span></div>
                 <h3>{{notes_title}}</h3>

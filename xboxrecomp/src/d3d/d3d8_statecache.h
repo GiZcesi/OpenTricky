@@ -50,6 +50,7 @@ void sc_OMSetRenderTargetsAndUnorderedAccessViews(ID3D11DeviceContext *c, UINT n
                                                   ID3D11DepthStencilView *dsv, UINT uav_start, UINT nuav,
                                                   ID3D11UnorderedAccessView *const *uav, const UINT *counts);
 void sc_ForgetTextures(void);
+int  sc_PSSRVBound(UINT slot, ID3D11ShaderResourceView *v);   /* the bind of v there would be skipped */
 void sc_ForgetAll(void);                /* after direct context calls (the tuning panel, Present) */
 
 #undef ID3D11DeviceContext_OMSetBlendState

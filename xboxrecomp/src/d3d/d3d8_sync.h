@@ -83,8 +83,10 @@ void d3d8_sync_set_pace(int fps);
 
 /* The title's frame timer is on an exact grid (frame_clock.c). Set
  * once at start-up when that clock is on; the present grid then needs a
- * smaller margin (its frames arrive on an exact grid). */
-void d3d8_sync_set_frame_clock(void);
+ * smaller margin (its frames arrive on an exact grid), and the timer's phase
+ * can follow the display's refreshes: shift moves its grid against the title's
+ * own points (ms), from the timer's next callback on. */
+void d3d8_sync_set_frame_clock(void (*shift)(double ms));
 
 /* Refresh rate (Hz, integer) of the display holding hwnd, or of the primary
  * display if hwnd is NULL; 0 if unknown. */

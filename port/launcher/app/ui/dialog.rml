@@ -38,8 +38,7 @@
         <div class="box wide sec" data-if="modal == 'crash'">
             <div class="kick">LAST SESSION</div>
             <div class="dh">{{crash_head}}</div>
-            <p>Sorry about that. A bug report helps fix it: it is a zip with the logs, your settings and a crash file.
-               It never contains your disc image or your saves.</p>
+            <p>{{crash_text}}</p>
             <div class="mono"><div>{{crash_when}}</div><div>{{crash_version}}</div></div>
             <div class="btns">
                 <span class="mbtn pri" id="crash-report" data-event-click="dlg('report')"><span>Prepare a bug report</span></span>

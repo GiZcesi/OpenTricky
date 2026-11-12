@@ -27,8 +27,10 @@
  *   copy of tick N is written back (bit exact). Whole riders restored as they
  *   were after an extra render. Teleport (> 400 units in one tick) or camera
  *   cut (> 60 deg): state N (duplicate).
- *   Still at tick rate: HUD (see below), particles, crowd, animated scenery, pose values
- *   derived by the render (+0x4DF0.., they follow the interpolated pose).
+ *   Still at tick rate: HUD (see below), the particles that are not the rider
+ *   effects below (among the riders': the Uber glow, the boost ribbons), crowd,
+ *   animated scenery, pose values derived by the render (+0x4DF0.., they follow
+ *   the interpolated pose).
  *   XBOX_FPS_INTERP=0      duplicates (no interpolation)
  *   XBOX_FPS_INTERP_LOG=N[@t]  N race renders logged ([INTERP]) from race tick t
  *   XBOX_FPS_INTERP_SYNTH=1    (test, with XBOX_FPS_CAP_DUP) alpha = k / (DUP + 1)
@@ -44,6 +46,24 @@
  *                              render and tick hooks are installed). Launcher: ADVANCED >
  *                              EXPERIMENTAL "Smoother legs in turns" ([Advanced] SmoothLegs)
  *   XBOX_FPS_INTERP_TRACE=file (test) per render: time, tick, alpha, camera / rider 0 positions
+ *   Board trail (always on above 60): the slices of tick N (the live slice at the
+ *   board's contact, and the newest one when laid at N) drawn with the board as
+ *   shown (interpolated, leg smoothed), on the snow; see fps_cap.c. Developer tools:
+ *   XBOX_TRAIL_TIP=0 (comparison; diagnostics `set trailtip 0|1`),
+ *   XBOX_TRAIL_TRACE=file (per draw of the player's trail: the gaps it closes),
+ *   XBOX_FPS_HOLD_ALPHA=a (0..0.99: the held frame shows lerp(N-1, N, a)).
+ *   Rider effects (always on above 60): what tick N laid from the board (sprays,
+ *   puffs, bursts, the powder ribbon's newest slice and head, the surface spray's emitter)
+ *   drawn with the board as shown, what lives on shown at the render's instant (age
+ *   and points between ticks N-1 and N). Riders: a step of the hips that
+ *   accelerates by more than 100 units per tick in one tick (the game moved the
+ *   rider at once) shown at tick N for that tick, as the camera's cuts; a pose
+ *   whose feet or board turn around the hips by more than 35 deg in one tick shown
+ *   as the skeleton of tick N at the interpolated hips (no chord through the
+ *   body). Developer tools:
+ *   XBOX_FX_SHOWN=0 / XBOX_FPS_RIDER_CUT=0 (comparison; diagnostics `set fxshown`,
+ *   `set ridercut`), XBOX_FX_TRACE=file (what the player's effects were moved by),
+ *   XBOX_FPS_CUT_TRACE=file (per race tick and rider: step, acceleration, turn, cut).
  *
  * Pacing: the average render duration is measured over normal renders
  * (InGameState 0xAB610, menus 0x7CBD0) and extra ones; durations > 50 ms
@@ -75,8 +95,14 @@
  * Rules:
  *   - a due tick always goes first (wait on the event with a timeout, poll
  *     at 0 right before each render);
- *   - no extra render that would end after the next expected tick (estimate:
- *     average render duration): ticks are not delayed;
+ *   - an extra render that would end after the next expected tick (estimate:
+ *     average render duration) delays the moment the tick runs, not what it
+ *     does (the timer reads the pad at its own point); it is done only
+ *     within a bound: with the render grid, while the tick's render keeps
+ *     its slot (at most half a period late); without a limit, while,
+ *     lasting the average render duration plus one standard deviation, it
+ *     would end at most half of that after the tick (see fps_cap.c); with
+ *     XBOX_FPS_CAP_GRID=0 (comparison), never;
  *   - never more than one render late (no catch-up on the render side);
  *   - only on the call at 0xAA296 (edi = 0, esi = Application,
  *     ecx = [esi+0x2C]); the boot wait 0xAA1D0 (edi = 3) keeps the

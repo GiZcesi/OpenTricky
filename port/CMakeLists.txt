@@ -66,6 +66,43 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options($<$<COMPILE_LANGUAGE:C>:-ffp-contract=off>)
 endif()
 
+# Link-time optimisation (GCC only; OFF by default, the game's code is the same
+# either way). It changes no floating-point result: no -ffast-math or other
+# value-changing option comes with it, and -ffp-contract=off above holds for
+# every function at link time too.
+#   -DSSX_LTO=ON                link-time optimisation of the game and the
+#                               runtime as one program (-flto)
+#   -DSSX_LTO_JOBS=8            parallel link-time jobs (default: auto, every
+#                               thread of the machine)
+set(SSX_LTO OFF CACHE BOOL "Link-time optimisation (GCC)")
+set(SSX_LTO_JOBS "auto" CACHE STRING "Parallel link-time optimisation jobs (a number, or auto)")
+if(SSX_LTO)
+    if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR "SSX_LTO: GCC only")
+    endif()
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-flto=${SSX_LTO_JOBS}>
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-fno-fat-lto-objects>)
+    add_link_options(-flto=${SSX_LTO_JOBS} -ffp-contract=off)
+    # The code (and the late debug information) is made at link time, and the
+    # game links as C++, whose flags have neither -g nor the
+    # C flags' path maps: keep them there too, or a crash report's addresses
+    # lose their lines and the executable names the folder it was built in.
+    if(CMAKE_C_FLAGS_RELEASE MATCHES "(^| )-g( |$)")
+        add_link_options($<$<CONFIG:Release>:-g>)
+    endif()
+    string(REGEX MATCHALL "-f(file|debug)-prefix-map=[^ ]+" _ssx_lto_path_maps "${CMAKE_C_FLAGS}")
+    if(_ssx_lto_path_maps)
+        add_link_options(${_ssx_lto_path_maps})
+    endif()
+    # The runtime's static libraries hold LTO objects: archive them with GCC's
+    # wrappers (they load the LTO plugin).
+    if(CMAKE_C_COMPILER_AR AND CMAKE_C_COMPILER_RANLIB)
+        set(CMAKE_AR "${CMAKE_C_COMPILER_AR}")
+        set(CMAKE_RANLIB "${CMAKE_C_COMPILER_RANLIB}")
+    endif()
+    message(STATUS "Link-time optimisation (SSX_LTO): ON, -flto=${SSX_LTO_JOBS}")
+endif()
+
 # The PS2 button style (XBOX_BUTTON_ICONS=ps2, assets/btnicons/ps2/):
 # built in by default; OFF leaves its pictures out of the executable (a
 # saved "ps2" then reads as auto).

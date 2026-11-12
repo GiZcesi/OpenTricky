@@ -2912,14 +2912,27 @@ static void bridge_KeStallExecutionProcessor(void)
 }
 
 /* ── KeSetBasePriorityThread (ordinal 143, 2 args = 8 bytes) ──
- * Thread is an Xbox VA dispatcher object, not a native pointer; the HLE
- * only uses it as an opaque key, so pass it straight through. */
+ * Thread is the object ObReferenceObjectByHandle returned: a thread's token,
+ * mapped back here to the host thread (see "Thread priorities" below). Each
+ * request is logged (the title makes two). */
+static int    threadprio_fix_on(void);
+static HANDLE bridge_thread_handle(uint32_t token);
+
 static void bridge_KeSetBasePriorityThread(void)
 {
     uint32_t thread_va = STACK_ARG(0);
     int32_t  increment = (int32_t)STACK_ARG(1);
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread((PVOID)(uintptr_t)thread_va,
-                                                   (LONG)increment);
+    static volatile LONG logged = 0;
+    HANDLE h = threadprio_fix_on() ? bridge_thread_handle(thread_va)
+                                   : (HANDLE)(uintptr_t)thread_va;
+    g_eax = (uint32_t)xbox_KeSetBasePriorityThread((PVOID)h, (LONG)increment);
+    if (InterlockedIncrement(&logged) <= 16) {
+        fprintf(stderr, "  [KERNEL] KeSetBasePriorityThread: object 0x%08X -> host thread %lu, increment %d, "
+                "host priority now %d (caller thread %lu)\n", thread_va,
+                h ? (unsigned long)GetThreadId(h) : 0ul, (int)increment,
+                h ? GetThreadPriority(h) : 0, (unsigned long)GetCurrentThreadId());
+        xbox_log_flush();
+    }
 }
 
 /* ── MmLockUnlockBufferPages (ordinal 175, 3 args = 12 bytes) ──
@@ -3148,6 +3161,36 @@ static void bridge_ExQueryNonVolatileSetting(void)
     g_eax = 0xC0000034u;  /* STATUS_OBJECT_NAME_NOT_FOUND */
 }
 
+/* ── Thread priorities ────────────────────────────────────
+ * The title asks for thread priorities through XAPI SetThreadPriority
+ * (0x1542C7): ObReferenceObjectByHandle(h, PsThreadObjectType, &thread),
+ * KeSetBasePriorityThread(thread, increment), ObfDereferenceObject(thread).
+ * The object used to come back as 0 for every handle, so the request reached
+ * Windows as SetThreadPriority(NULL) and failed: every title thread ran at
+ * normal priority, among them the audio streaming thread (0x151F0) that the
+ * title creates TIME_CRITICAL, and the EA worker (0x14D850) it creates one
+ * step above normal. Now a thread handle comes back as its own token, and
+ * KeSetBasePriorityThread maps it back to the host thread, so the priority
+ * the title asks for is the one the thread gets (the title only passes the
+ * object on to those two calls; it never reads it). Other object types are
+ * unchanged (object 0). */
+static int threadprio_fix_on(void) { return 1; }
+
+/* A thread handle or token as the title holds it -> the host thread handle,
+ * or NULL. 0xFFFFFFFE is the current-thread pseudo-handle (NtCurrentThread,
+ * and what PsCreateSystemThreadEx hands the title's main thread); worker
+ * thread handles are stored raw (untagged), as PsCreateSystemThreadEx writes
+ * them. Only a handle that really names a thread is accepted. */
+static HANDLE bridge_thread_handle(uint32_t token)
+{
+    HANDLE h;
+    if (token == 0) return NULL;
+    if (token == 0xFFFFFFFEu) return GetCurrentThread();
+    h = bridge_read_handle(token);
+    if (!h || h == INVALID_HANDLE_VALUE) return NULL;
+    return GetThreadId(h) ? h : NULL;
+}
+
 /* ── ObReferenceObjectByHandle (ordinal 246) ─────────────── */
 static void bridge_ObReferenceObjectByHandle(void)
 {
@@ -3156,7 +3199,11 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+    uint32_t object = 0;
+    if (obj_type == XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE && threadprio_fix_on() &&
+        bridge_thread_handle(handle))
+        object = handle;        /* the thread's own token (see above) */
+    if (object_ptr) BRIDGE_MEM32(object_ptr) = object;
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
@@ -3747,12 +3794,43 @@ static void bridge_KeSaveFloatingPointState(void)     /* 142, 1 arg */
         XBOX_TO_NATIVE(STACK_ARG(0)));
 }
 
+/* KeSynchronizeExecution(Interrupt, SynchronizeRoutine, SynchronizeContext)
+ * runs a guest routine (BOOLEAN __stdcall routine(PVOID context)) and returns
+ * its result. The routine is guest code -- DSOUND passes 0x0017E872 -- so it
+ * runs through the dispatch table with the caller's registers given back,
+ * exactly as bridge_KeInsertQueueDpc runs a DPC routine. It used to go to
+ * xbox_KeSynchronizeExecution, which called the guest address as a host
+ * function pointer. The kernel raises IRQL to the interrupt's level around
+ * the call; IRQL is not modelled on this path, as for the inline DPCs. The
+ * same fix as xboxrecomp v0.15.0, where guest callbacks run inside a kernel
+ * call give the caller its registers back (sp00nznet/xboxrecomp, MIT). */
 static void bridge_KeSynchronizeExecution(void)       /* 153, 3 args */
 {
-    g_eax = xbox_KeSynchronizeExecution(
-        (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(STACK_ARG(0)),
-        XBOX_TO_NATIVE(STACK_ARG(1)),
-        XBOX_TO_NATIVE(STACK_ARG(2))) ? 1u : 0u;
+    uint32_t routine_va = STACK_ARG(1);
+    uint32_t context_va = STACK_ARG(2);
+    recomp_func_t fn = routine_va ? recomp_lookup(routine_va) : NULL;
+    if (!fn && routine_va) fn = recomp_lookup_manual(routine_va);
+    if (!fn) {
+        fprintf(stderr, "  [KERNEL] KeSynchronizeExecution: routine 0x%08X not found in dispatch!\n",
+                routine_va);
+        g_eax = 0;  /* FALSE: the routine did not run */
+        return;
+    }
+    {
+        uint32_t save_ecx = g_ecx, save_edx = g_edx;
+        uint32_t save_ebx = g_ebx, save_esi = g_esi, save_edi = g_edi;
+        uint32_t save_esp = g_esp, save_ebp = g_seh_ebp;
+        uint32_t result;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = context_va;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* dummy return address */
+        g_seh_ebp = g_esp;
+        run_thread_start_routine(fn);
+        result = g_eax & 0xFFu;  /* BOOLEAN */
+        g_ecx = save_ecx; g_edx = save_edx;
+        g_ebx = save_ebx; g_esi = save_esi; g_edi = save_edi;
+        g_esp = save_esp; g_seh_ebp = save_ebp;
+        g_eax = result;
+    }
 }
 
 /* ── Mm* ───────────────────────────────────────────────────── */
@@ -4410,6 +4488,7 @@ static void trap_nan_check_path(const char *path)
     }
 }
 
+
 static void kernel_thunk_dispatch(void)
 {
     if (g_trap_nan_armed && !t_trap_nan_on) {
@@ -4716,3 +4795,4 @@ void xbox_kernel_bridge_init(void)
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 
 }
+

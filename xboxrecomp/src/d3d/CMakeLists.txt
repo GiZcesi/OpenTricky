@@ -20,6 +20,7 @@ if(WIN32)
         d3d8_nv2a.c
         d3d8_shcache.c
         d3d8_shcompile.c
+        d3d8_shprewarm.c
         d3d8_nv2a_vsh.c
         d3d8_vsh.c
     )
